@@ -6,7 +6,7 @@ import time
 # -------------------------------------------------
 # Open a serial port
 ser = serial.Serial(
-    port='ttyUSB0',        # Windows example; use '/dev/ttyUSB0' on Linux/macOS
+    port='/dev/ttyUSB0',        # Windows example; use '/dev/ttyUSB0' on Linux/macOS
     baudrate=9600,
     bytesize=serial.EIGHTBITS,
     parity=serial.PARITY_NONE,
