@@ -17,7 +17,7 @@ ser = serial.Serial(
 # -------------------------------------------------
 # Write data
 msg = b"Hello, device!\n"
-ser.write(b"0xC1 05 01")  # send bytes
+ser.write(b"0xC10501")  # send bytes
 print(f"Sent: {msg}")
 
 # -------------------------------------------------
