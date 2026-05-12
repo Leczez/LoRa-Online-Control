@@ -1,29 +1,33 @@
 // sx126x/src/uart.rs
 
+use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
-use embedded_io::{Read, Write};
+use embedded_io::{Error as _, Read, ReadExactError, Write};
 use heapless::Vec;
 
 use crate::{Config, LoraRadio, ReceivedPacket, Sx126xError};
 
-pub struct Sx126xUart<UART, M0, M1> {
+pub struct Sx126xUart<UART, M0, M1, DELAY> {
     pub(crate) serial: UART,
     pub(crate) m0: M0,
     pub(crate) m1: M1,
+    pub(crate) delay: DELAY,
     pub(crate) config: Config,
 }
 
-impl<UART, M0, M1> Sx126xUart<UART, M0, M1>
+impl<UART, M0, M1, DELAY> Sx126xUart<UART, M0, M1, DELAY>
 where
     UART: Read + Write,
     M0: OutputPin,
     M1: OutputPin,
+    DELAY: DelayNs,
 {
-    pub fn new(serial: UART, m0: M0, m1: M1) -> Self {
+    pub fn new(serial: UART, m0: M0, m1: M1, delay: DELAY) -> Self {
         Self {
             serial,
             m0,
             m1,
+            delay,
             config: Config {
                 freq_mhz: 868,
                 addr: 0,
@@ -40,21 +44,24 @@ where
     fn enter_config_mode(&mut self) -> Result<(), Sx126xError<UART::Error>> {
         self.m0.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
         self.m1.set_high().map_err(|_| Sx126xError::InvalidConfig)?;
+        self.delay.delay_ms(100);
         Ok(())
     }
 
     fn enter_normal_mode(&mut self) -> Result<(), Sx126xError<UART::Error>> {
         self.m0.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
         self.m1.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
+        self.delay.delay_ms(100);
         Ok(())
     }
 }
 
-impl<UART, M0, M1> LoraRadio for Sx126xUart<UART, M0, M1>
+impl<UART, M0, M1, DELAY> LoraRadio for Sx126xUart<UART, M0, M1, DELAY>
 where
     UART: Read + Write,
     M0: OutputPin,
     M1: OutputPin,
+    DELAY: DelayNs,
 {
     type Error = Sx126xError<UART::Error>;
 
@@ -71,9 +78,10 @@ where
             .map_err(Sx126xError::Transport)?;
 
         let mut ack = [0u8; 12];
-        self.serial
-            .read(&mut ack)
-            .map_err(Sx126xError::Transport)?;
+        self.serial.read_exact(&mut ack).map_err(|e| match e {
+            ReadExactError::UnexpectedEof => Sx126xError::Timeout,
+            ReadExactError::Other(inner) => Sx126xError::Transport(inner),
+        })?;
 
         if ack[0] != 0xC1 {
             return Err(Sx126xError::Timeout);
@@ -106,9 +114,15 @@ where
 
     fn receive(&mut self) -> Result<Option<ReceivedPacket>, Self::Error> {
         let mut header = [0u8; 3];
-        let n = self.serial.read(&mut header).map_err(Sx126xError::Transport)?;
-        if n == 0 {
-            return Ok(None);
+        match self.serial.read_exact(&mut header) {
+            Err(ReadExactError::Other(e))
+                if e.kind() == embedded_io::ErrorKind::TimedOut =>
+            {
+                return Ok(None);
+            }
+            Err(ReadExactError::UnexpectedEof) => return Ok(None),
+            Err(ReadExactError::Other(e)) => return Err(Sx126xError::Transport(e)),
+            Ok(()) => {}
         }
 
         let src_addr = ((header[0] as u16) << 8) | header[1] as u16;
@@ -145,6 +159,12 @@ mod tests {
     use super::*;
     use crate::config::*;
     use embedded_hal_mock::eh1::pin::{Mock as PinMock, State, Transaction as PinTx};
+
+    struct NoopDelay;
+
+    impl embedded_hal::delay::DelayNs for NoopDelay {
+        fn delay_ns(&mut self, _ns: u32) {}
+    }
 
     struct MockSerial {
         write_buf: std::vec::Vec<u8>,
@@ -210,7 +230,7 @@ mod tests {
         let m0 = PinMock::new(&m0_expects);
         let m1 = PinMock::new(&m1_expects);
 
-        let mut radio = Sx126xUart::new(serial, m0, m1);
+        let mut radio = Sx126xUart::new(serial, m0, m1, NoopDelay);
         radio.configure(&config()).unwrap();
 
         let expected_regs = config().to_registers();
@@ -226,7 +246,7 @@ mod tests {
         let m0 = PinMock::new(&[PinTx::set(State::Low)]);
         let m1 = PinMock::new(&[PinTx::set(State::Low)]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
         radio.send(1, b"hello").unwrap();
 
         let freq_off = config().freq_offset_byte();
@@ -244,7 +264,7 @@ mod tests {
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
         let result = radio.receive().unwrap();
         assert!(result.is_none());
 
@@ -260,7 +280,7 @@ mod tests {
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
         let pkt = radio.receive().unwrap().unwrap();
 
         assert_eq!(pkt.src_addr, 1);
@@ -280,7 +300,7 @@ mod tests {
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, config: cfg };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: cfg };
         let pkt = radio.receive().unwrap().unwrap();
 
         assert_eq!(pkt.src_addr, 2);

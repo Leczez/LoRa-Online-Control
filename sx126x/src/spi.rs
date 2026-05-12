@@ -171,24 +171,10 @@ where
 mod tests {
     extern crate std;
     use super::*;
-    use crate::config::*;
     use embedded_hal_mock::eh1::{
         pin::{Mock as PinMock, State, Transaction as PinTx},
         spi::{Mock as SpiMock, Transaction as SpiTx},
     };
-
-    fn config() -> Config {
-        Config {
-            freq_mhz: 868,
-            addr: 0,
-            net_id: 0,
-            power: TxPower::Dbm22,
-            air_speed: AirSpeed::Bps2400,
-            buffer_size: BufferSize::Bytes240,
-            rssi: true,
-            crypt: 0,
-        }
-    }
 
     fn busy_ready() -> PinMock {
         PinMock::new(&[PinTx::get(State::Low)])

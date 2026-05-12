@@ -5,6 +5,14 @@ use sx126x::{Config, NoPin, ReceivedPacket, Sx126xUart, LoraRadio};
 
 use crate::Args;
 
+struct StdDelay;
+
+impl embedded_hal::delay::DelayNs for StdDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+    }
+}
+
 /// Wraps serialport to implement embedded_io::Read + Write.
 ///
 /// `embedded_io::ErrorType::Error` must implement `embedded_io::Error`, which
@@ -106,7 +114,7 @@ pub fn run(args: Args) -> Result<()> {
 
 fn run_desktop(args: Args, config: Config) -> Result<()> {
     let serial = open_serial(&args.port)?;
-    let mut driver = Sx126xUart::new(serial, NoPin, NoPin);
+    let mut driver = Sx126xUart::new(serial, NoPin, NoPin, StdDelay);
     driver.configure(&config)?;
     crate::ui::run_app(&args.port, args.dest, config, Box::new(driver))
 }
@@ -138,7 +146,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
     let m1 = gpio.get(args.m1_pin.unwrap())?.into_output();
     let uart = Uart::with_path(&args.port, 9600, Parity::None, 8, 1)?;
 
-    let mut driver = Sx126xUart::new(RppalSerial(uart), m0, m1);
+    let mut driver = Sx126xUart::new(RppalSerial(uart), m0, m1, StdDelay);
     driver.configure(&config)?;
     crate::ui::run_app(&args.port, args.dest, config, Box::new(driver))
 }

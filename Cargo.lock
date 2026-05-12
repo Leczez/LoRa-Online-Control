@@ -476,6 +476,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "embedded-hal 1.0.0",
  "embedded-io",
  "ratatui",
  "rppal",
