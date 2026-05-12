@@ -125,3 +125,8 @@ fn rssi_color(dbm: i16) -> Color {
         Color::Red
     }
 }
+
+/// Temporary stub — full implementation added in Task 9.
+pub fn run_app(_port: &str, _dest_addr: u16, _config: sx126x::Config, _radio: Box<dyn crate::backend::Radio>) -> anyhow::Result<()> {
+    Ok(())
+}

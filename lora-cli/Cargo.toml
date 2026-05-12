@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.28"
 crossterm = "0.28"
 serialport = "4"
-embedded-io = "0.6"
+embedded-io = { version = "0.6", features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.19", optional = true }
