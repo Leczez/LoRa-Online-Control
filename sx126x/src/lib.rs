@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(feature = "std")]
+extern crate std;
+
 pub mod config;
 pub use config::{AirSpeed, BufferSize, Config, TxPower};
 
