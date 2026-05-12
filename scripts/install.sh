@@ -8,13 +8,17 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
+TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 
 echo "Building lora-cli (desktop)..."
+# The rpi feature (rppal GPIO) is opt-in; the default build is the desktop variant.
 cd "$WORKSPACE_ROOT"
 cargo build --release -p lora-cli
 
 mkdir -p "$HOME/.local/bin"
-cp target/release/lora-cli "$HOME/.local/bin/lora-cli"
+cp "$TARGET_DIR/release/lora-cli" "$HOME/.local/bin/lora-cli.tmp"
+mv "$HOME/.local/bin/lora-cli.tmp" "$HOME/.local/bin/lora-cli"
+chmod +x "$HOME/.local/bin/lora-cli"
 echo "Installed to $HOME/.local/bin/lora-cli"
 
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
