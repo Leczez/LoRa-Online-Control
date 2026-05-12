@@ -27,6 +27,7 @@ cd "$WORKSPACE_ROOT"
 cross build --release -p lora-cli --features rpi --target aarch64-unknown-linux-gnu
 
 BINARY="$TARGET_DIR/aarch64-unknown-linux-gnu/release/lora-cli"
+[[ -f "$BINARY" ]] || { echo "error: expected binary not found at $BINARY" >&2; exit 1; }
 
 echo "Copying binary to $TARGET_HOST..."
 scp "$BINARY" "$TARGET_HOST:/tmp/lora-cli"
@@ -36,6 +37,7 @@ ssh "$TARGET_HOST" bash <<'REMOTE'
 set -euo pipefail
 
 sudo install -m 755 /tmp/lora-cli /usr/local/bin/lora-cli
+rm /tmp/lora-cli
 echo "Binary installed to /usr/local/bin/lora-cli"
 
 if [[ ! -f /etc/lora-cli/env ]]; then
@@ -64,19 +66,23 @@ After=multi-user.target
 [Service]
 EnvironmentFile=/etc/lora-cli/env
 ExecStart=/usr/local/bin/lora-cli \
-  --port $LORA_PORT --freq $LORA_FREQ --addr $LORA_ADDR \
-  --dest $LORA_DEST --power $LORA_POWER \
-  --m0-pin $LORA_M0_PIN --m1-pin $LORA_M1_PIN
+  --port ${LORA_PORT} --freq ${LORA_FREQ} --addr ${LORA_ADDR} \
+  --dest ${LORA_DEST} --power ${LORA_POWER} \
+  --m0-pin ${LORA_M0_PIN} --m1-pin ${LORA_M1_PIN}
 StandardInput=tty
 TTYPath=/dev/tty1
 Restart=on-failure
+RestartSec=5
+TTYVHangup=yes
+TTYReset=yes
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now lora-cli
+sudo systemctl enable lora-cli
+sudo systemctl restart lora-cli
 echo "lora-cli service enabled and started"
 REMOTE
 
