@@ -1,0 +1,3 @@
+[workspace]
+members = ["sx126x", "lora-cli"]
+resolver = "2"
