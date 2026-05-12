@@ -6,6 +6,9 @@ pub use config::{AirSpeed, BufferSize, Config, TxPower};
 pub mod uart;
 pub use uart::Sx126xUart;
 
+pub mod spi;
+pub use spi::Sx126xSpi;
+
 use heapless::Vec;
 
 /// A packet received from the radio.
