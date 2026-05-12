@@ -1,14 +1,23 @@
 // lora-cli/src/ui.rs
 
+use std::time::{Duration, Instant};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
-    Frame,
+    Frame, Terminal,
 };
+use sx126x::Config;
 
 use crate::app::{App, LogEntry};
+use crate::backend::Radio;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -126,7 +135,107 @@ fn rssi_color(dbm: i16) -> Color {
     }
 }
 
-/// Temporary stub — full implementation added in Task 9.
-pub fn run_app(_port: &str, _dest_addr: u16, _config: sx126x::Config, _radio: Box<dyn crate::backend::Radio>) -> anyhow::Result<()> {
+pub fn run_app(port: &str, dest_addr: u16, config: Config, mut radio: Box<dyn Radio>) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let config_line = format!(
+        "port: {}  freq: {}MHz  addr: {}  dest: {}  power: {:?}",
+        port, config.freq_mhz, config.addr, dest_addr, config.power
+    );
+    let mut app = crate::app::App::new(config_line);
+
+    let tick_rate = Duration::from_millis(100);
+    let mut last_tick = Instant::now();
+
+    loop {
+        terminal.draw(|f| render(f, &app))?;
+
+        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.should_quit = true;
+                        }
+                        KeyCode::Enter => {
+                            if !app.input.is_empty() {
+                                let msg = std::mem::take(&mut app.input);
+                                let ts = timestamp();
+                                match radio.send(dest_addr, msg.as_bytes()) {
+                                    Ok(()) => app.push_log(LogEntry::Tx {
+                                        timestamp: ts,
+                                        dest_addr,
+                                        payload: msg,
+                                    }),
+                                    Err(e) => app.push_log(LogEntry::Error {
+                                        timestamp: ts,
+                                        message: e.to_string(),
+                                    }),
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.input.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if last_tick.elapsed() >= tick_rate {
+            match radio.receive() {
+                Ok(Some(pkt)) => {
+                    let payload = String::from_utf8_lossy(&pkt.payload).into_owned();
+                    app.push_log(LogEntry::Rx {
+                        timestamp: timestamp(),
+                        src_addr: pkt.src_addr,
+                        payload,
+                        rssi: pkt.rssi,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    app.push_log(LogEntry::Error {
+                        timestamp: timestamp(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+            last_tick = Instant::now();
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+    )?;
+    terminal.show_cursor()?;
     Ok(())
+}
+
+fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
