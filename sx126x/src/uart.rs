@@ -13,6 +13,8 @@ pub struct Sx126xUart<UART, M0, M1, DELAY> {
     pub(crate) m1: M1,
     pub(crate) delay: DELAY,
     pub(crate) config: Config,
+    /// Raw 12-byte ACK echoed by the module after the last configure() call.
+    pub last_configure_ack: [u8; 12],
 }
 
 impl<UART, M0, M1, DELAY> Sx126xUart<UART, M0, M1, DELAY>
@@ -28,6 +30,7 @@ where
             m0,
             m1,
             delay,
+            last_configure_ack: [0u8; 12],
             config: Config {
                 freq_mhz: 868,
                 addr: 0,
@@ -44,15 +47,40 @@ where
     fn enter_config_mode(&mut self) -> Result<(), Sx126xError<UART::Error>> {
         self.m0.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
         self.m1.set_high().map_err(|_| Sx126xError::InvalidConfig)?;
-        self.delay.delay_ms(100);
+        // E22 needs ~500ms to stabilize after entering config mode before it accepts commands.
+        self.delay.delay_ms(500);
         Ok(())
     }
 
     fn enter_normal_mode(&mut self) -> Result<(), Sx126xError<UART::Error>> {
         self.m0.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
         self.m1.set_low().map_err(|_| Sx126xError::InvalidConfig)?;
-        self.delay.delay_ms(100);
+        self.delay.delay_ms(200);
         Ok(())
+    }
+
+    /// Read 9 registers starting at address 0 (addresses, net_id, speed, power, channel, option, crypt).
+    /// Returns raw 12-byte response: [0xC1, 0x00, 0x09, REG0..REG8].
+    pub fn read_config(&mut self) -> Result<[u8; 12], Sx126xError<UART::Error>> {
+        self.enter_config_mode()?;
+        // Drain any bytes emitted during mode transition before issuing read command.
+        let mut discard = [0u8; 1];
+        loop {
+            match self.serial.read(&mut discard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        self.serial
+            .write_all(&[0xC1, 0x00, 0x09])
+            .map_err(Sx126xError::Transport)?;
+        let mut buf = [0u8; 12];
+        self.serial.read_exact(&mut buf).map_err(|e| match e {
+            ReadExactError::UnexpectedEof => Sx126xError::Timeout,
+            ReadExactError::Other(inner) => Sx126xError::Transport(inner),
+        })?;
+        self.enter_normal_mode()?;
+        Ok(buf)
     }
 }
 
@@ -71,7 +99,17 @@ where
             .ok_or(Sx126xError::InvalidConfig)?;
 
         self.config = config.clone();
+        self.enter_normal_mode()?;
         self.enter_config_mode()?;
+
+        // Flush any bytes the module emitted during mode transitions before issuing command.
+        let mut discard = [0u8; 1];
+        loop {
+            match self.serial.read(&mut discard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
 
         self.serial
             .write_all(&regs)
@@ -87,23 +125,39 @@ where
             return Err(Sx126xError::Timeout);
         }
 
+        self.last_configure_ack = ack;
         self.enter_normal_mode()?;
+
+        // Drain any bytes the module output during mode transitions.
+        let mut discard = [0u8; 1];
+        loop {
+            match self.serial.read(&mut discard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+
         Ok(())
     }
 
     fn send(&mut self, dest: u16, payload: &[u8]) -> Result<(), Self::Error> {
         self.enter_normal_mode()?;
-        let freq_off = self.config.freq_offset_byte();
-        let header = [
+        let routing = [
             (dest >> 8) as u8,
             (dest & 0xFF) as u8,
-            freq_off,
+            self.config.freq_offset_byte(),
+        ];
+        // Prepend our own address so the receiver knows the source.
+        // The E22 strips the routing header on TX; the receiver sees [src_high, src_low, data...].
+        let src_prefix = [
             (self.config.addr >> 8) as u8,
             (self.config.addr & 0xFF) as u8,
-            freq_off,
         ];
         self.serial
-            .write_all(&header)
+            .write_all(&routing)
+            .map_err(Sx126xError::Transport)?;
+        self.serial
+            .write_all(&src_prefix)
             .map_err(Sx126xError::Transport)?;
         self.serial
             .write_all(payload)
@@ -113,7 +167,7 @@ where
     }
 
     fn receive(&mut self) -> Result<Option<ReceivedPacket>, Self::Error> {
-        let mut header = [0u8; 3];
+        let mut header = [0u8; 2];
         match self.serial.read_exact(&mut header) {
             Err(ReadExactError::Other(e))
                 if e.kind() == embedded_io::ErrorKind::TimedOut =>
@@ -130,11 +184,12 @@ where
         let mut body = Vec::<u8, 240>::new();
         let mut byte = [0u8; 1];
         loop {
-            let n = self.serial.read(&mut byte).map_err(Sx126xError::Transport)?;
-            if n == 0 {
-                break;
+            match self.serial.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => { body.push(byte[0]).ok(); }
+                Err(e) if e.kind() == embedded_io::ErrorKind::TimedOut => break,
+                Err(e) => return Err(Sx126xError::Transport(e)),
             }
-            body.push(byte[0]).ok();
         }
 
         let (payload_bytes, rssi) = if self.config.rssi && !body.is_empty() {
@@ -168,7 +223,10 @@ mod tests {
 
     struct MockSerial {
         write_buf: std::vec::Vec<u8>,
+        /// Bytes available immediately (e.g., ambient data, received packets).
         read_buf: std::collections::VecDeque<u8>,
+        /// Bytes that become readable only after the first write (e.g., command ACK).
+        response_buf: std::collections::VecDeque<u8>,
     }
 
     impl MockSerial {
@@ -176,6 +234,15 @@ mod tests {
             Self {
                 write_buf: std::vec::Vec::new(),
                 read_buf: read_data.iter().copied().collect(),
+                response_buf: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn new_with_response(initial: &[u8], response: &[u8]) -> Self {
+            Self {
+                write_buf: std::vec::Vec::new(),
+                read_buf: initial.iter().copied().collect(),
+                response_buf: response.iter().copied().collect(),
             }
         }
     }
@@ -197,6 +264,10 @@ mod tests {
     impl embedded_io::Write for MockSerial {
         fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             self.write_buf.extend_from_slice(buf);
+            // On first write, move response bytes into the read buffer.
+            if !self.response_buf.is_empty() {
+                self.read_buf.extend(self.response_buf.drain(..));
+            }
             Ok(buf.len())
         }
         fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
@@ -223,10 +294,10 @@ mod tests {
 
     #[test]
     fn test_configure_writes_correct_registers() {
-        let m0_expects = std::vec![PinTx::set(State::Low), PinTx::set(State::Low)];
-        let m1_expects = std::vec![PinTx::set(State::High), PinTx::set(State::Low)];
+        let m0_expects = std::vec![PinTx::set(State::Low), PinTx::set(State::Low), PinTx::set(State::Low)];
+        let m1_expects = std::vec![PinTx::set(State::Low), PinTx::set(State::High), PinTx::set(State::Low)];
 
-        let serial = MockSerial::new(&config_ack());
+        let serial = MockSerial::new_with_response(&[], &config_ack());
         let m0 = PinMock::new(&m0_expects);
         let m1 = PinMock::new(&m1_expects);
 
@@ -246,12 +317,12 @@ mod tests {
         let m0 = PinMock::new(&[PinTx::set(State::Low)]);
         let m1 = PinMock::new(&[PinTx::set(State::Low)]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config(), last_configure_ack: [0u8; 12] };
         radio.send(1, b"hello").unwrap();
 
         let freq_off = config().freq_offset_byte();
-        let expected = [0x00, 0x01, freq_off, 0x00, 0x00, freq_off,
-                        b'h', b'e', b'l', b'l', b'o'];
+        // routing [dest_h, dest_l, ch] + src_prefix [addr_h, addr_l] + payload
+        let expected = [0x00, 0x01, freq_off, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
         assert_eq!(radio.serial.write_buf, expected);
 
         radio.m0.done();
@@ -264,7 +335,7 @@ mod tests {
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config(), last_configure_ack: [0u8; 12] };
         let result = radio.receive().unwrap();
         assert!(result.is_none());
 
@@ -275,12 +346,13 @@ mod tests {
     #[test]
     fn test_receive_parses_packet_with_rssi() {
         // rssi = -(256 - 174) = -82 dBm
-        let packet = [0x00, 0x01, 0x12, b'h', b'i', 174u8];
+        // 2-byte src_addr prefix (as embedded by sender), then payload + rssi byte
+        let packet = [0x00, 0x01, b'h', b'i', 174u8];
         let serial = MockSerial::new(&packet);
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config() };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: config(), last_configure_ack: [0u8; 12] };
         let pkt = radio.receive().unwrap().unwrap();
 
         assert_eq!(pkt.src_addr, 1);
@@ -295,12 +367,12 @@ mod tests {
     fn test_receive_parses_packet_without_rssi() {
         let mut cfg = config();
         cfg.rssi = false;
-        let packet = [0x00, 0x02, 0x12, b'o', b'k'];
+        let packet = [0x00, 0x02, b'o', b'k'];
         let serial = MockSerial::new(&packet);
         let m0 = PinMock::new(&[]);
         let m1 = PinMock::new(&[]);
 
-        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: cfg };
+        let mut radio = Sx126xUart { serial, m0, m1, delay: NoopDelay, config: cfg, last_configure_ack: [0u8; 12] };
         let pkt = radio.receive().unwrap().unwrap();
 
         assert_eq!(pkt.src_addr, 2);

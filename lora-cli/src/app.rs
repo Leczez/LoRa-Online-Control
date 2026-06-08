@@ -15,6 +15,10 @@ pub enum LogEntry {
         dest_addr: u16,
         payload: String,
     },
+    Heartbeat {
+        timestamp: String,
+        dest_addr: u16,
+    },
     Error {
         timestamp: String,
         message: String,
@@ -25,17 +29,25 @@ pub struct App {
     pub log: VecDeque<LogEntry>,
     pub input: String,
     pub should_quit: bool,
-    pub config_line: String,
+    pub addr: u16,
+    pub dest: u16,
+    port_info: String,
 }
 
 impl App {
-    pub fn new(config_line: String) -> Self {
+    pub fn new(port_info: String, addr: u16, dest: u16) -> Self {
         Self {
             log: VecDeque::new(),
             input: String::new(),
             should_quit: false,
-            config_line,
+            addr,
+            dest,
+            port_info,
         }
+    }
+
+    pub fn config_line(&self) -> String {
+        format!("{}  addr: {}  dest: {}", self.port_info, self.addr, self.dest)
     }
 
     pub fn push_log(&mut self, entry: LogEntry) {

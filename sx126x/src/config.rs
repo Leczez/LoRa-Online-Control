@@ -92,16 +92,16 @@ impl Config {
         let (_start, offset) = Self::freq_offset(self.freq_mhz)?;
         let rssi_flag = if self.rssi { 0x80 } else { 0x00 };
         Some([
-            0xC2,
+            0xC0,
             0x00,
             0x09,
             (self.addr >> 8) as u8,
             (self.addr & 0xFF) as u8,
             self.net_id,
             0x60 | self.air_speed.register_value(),
-            self.buffer_size.register_value() | self.power.register_value() | 0x20,
+            self.buffer_size.register_value() | self.power.register_value(),
             offset,
-            0x43 | rssi_flag,
+            0x40 | rssi_flag,
             (self.crypt >> 8) as u8,
             (self.crypt & 0xFF) as u8,
         ])
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_register_header() {
         let regs = default_config().to_registers();
-        assert_eq!(regs[0], 0xC2);
+        assert_eq!(regs[0], 0xC0);
         assert_eq!(regs[1], 0x00);
         assert_eq!(regs[2], 0x09);
     }
@@ -169,13 +169,13 @@ mod tests {
     #[test]
     fn test_power_22dbm() {
         let regs = default_config().to_registers();
-        assert_eq!(regs[7], 0x20); // buffer 240 (0x00) | power 22 (0x00) | noise rssi (0x20)
+        assert_eq!(regs[7], 0x00); // buffer 240 (0x00) | power 22 (0x00)
     }
 
     #[test]
     fn test_rssi_enabled() {
         let regs = default_config().to_registers();
-        assert_eq!(regs[9], 0x43 | 0x80);
+        assert_eq!(regs[9], 0x40 | 0x80);
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
         let mut cfg = default_config();
         cfg.rssi = false;
         let regs = cfg.to_registers();
-        assert_eq!(regs[9], 0x43);
+        assert_eq!(regs[9], 0x40);
     }
 
     #[test]

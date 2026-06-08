@@ -14,8 +14,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use sx126x::Config;
-
 use crate::app::{App, LogEntry};
 use crate::backend::Radio;
 
@@ -41,7 +39,7 @@ fn render_config(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .title(" Config ");
 
     let text = Line::from(vec![
-        Span::styled(&app.config_line, Style::default().fg(Color::Yellow)),
+        Span::styled(app.config_line(), Style::default().fg(Color::Yellow)),
     ]);
 
     let para = Paragraph::new(text).block(block);
@@ -112,6 +110,16 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 Style::default().fg(Color::Cyan),
             ),
         ]),
+        LogEntry::Heartbeat { timestamp, dest_addr } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("HB to   {:5}", dest_addr),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
         LogEntry::Error { timestamp, message } => Line::from(vec![
             Span::styled(
                 format!("[{}] ", timestamp),
@@ -135,21 +143,19 @@ fn rssi_color(dbm: i16) -> Color {
     }
 }
 
-pub fn run_app(port: &str, dest_addr: u16, config: Config, mut radio: Box<dyn Radio>) -> anyhow::Result<()> {
+pub fn run_app(port_info: String, addr: u16, dest_addr: u16, mut radio: Box<dyn Radio>, heartbeat_interval: u64) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let config_line = format!(
-        "port: {}  freq: {}MHz  addr: {}  dest: {}  power: {:?}",
-        port, config.freq_mhz, config.addr, dest_addr, config.power
-    );
-    let mut app = crate::app::App::new(config_line);
+    let mut app = crate::app::App::new(port_info, addr, dest_addr);
 
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
+    let heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
+    let mut last_heartbeat = Instant::now();
 
     loop {
         terminal.draw(|f| render(f, &app))?;
@@ -166,16 +172,30 @@ pub fn run_app(port: &str, dest_addr: u16, config: Config, mut radio: Box<dyn Ra
                             if !app.input.is_empty() {
                                 let msg = std::mem::take(&mut app.input);
                                 let ts = timestamp();
-                                match radio.send(dest_addr, msg.as_bytes()) {
-                                    Ok(()) => app.push_log(LogEntry::Tx {
-                                        timestamp: ts,
-                                        dest_addr,
-                                        payload: msg,
-                                    }),
-                                    Err(e) => app.push_log(LogEntry::Error {
-                                        timestamp: ts,
-                                        message: e.to_string(),
-                                    }),
+                                if let Some(val) = msg.strip_prefix("/dest ") {
+                                    match val.trim().parse::<u16>() {
+                                        Ok(n) => {
+                                            let _ = radio.set_dest(n);
+                                            app.dest = n;
+                                        }
+                                        Err(_) => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: format!("invalid address: {}", val.trim()),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/addr ") {
+                                    match val.trim().parse::<u16>() {
+                                        Ok(n) => app.addr = n,
+                                        Err(_) => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: format!("invalid address: {}", val.trim()),
+                                        }),
+                                    }
+                                } else {
+                                    match radio.send(app.dest, msg.as_bytes()) {
+                                        Ok(()) => app.push_log(LogEntry::Tx { timestamp: ts, dest_addr: app.dest, payload: msg }),
+                                        Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                    }
                                 }
                             }
                         }
@@ -187,6 +207,18 @@ pub fn run_app(port: &str, dest_addr: u16, config: Config, mut radio: Box<dyn Ra
                         }
                         _ => {}
                     }
+                }
+            }
+        }
+
+        if let Some(period) = heartbeat_period {
+            if last_heartbeat.elapsed() >= period {
+                last_heartbeat = Instant::now();
+                let ts = timestamp();
+                let dest = app.dest;
+                match radio.send(dest, b"HB") {
+                    Ok(()) => app.push_log(LogEntry::Heartbeat { timestamp: ts, dest_addr: dest }),
+                    Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
                 }
             }
         }
@@ -203,12 +235,10 @@ pub fn run_app(port: &str, dest_addr: u16, config: Config, mut radio: Box<dyn Ra
                     });
                 }
                 Ok(None) => {}
-                Err(e) => {
-                    app.push_log(LogEntry::Error {
-                        timestamp: timestamp(),
-                        message: e.to_string(),
-                    });
-                }
+                Err(e) => app.push_log(LogEntry::Error {
+                    timestamp: timestamp(),
+                    message: e.to_string(),
+                }),
             }
             last_tick = Instant::now();
         }
