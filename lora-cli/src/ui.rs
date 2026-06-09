@@ -47,14 +47,29 @@ fn render_config(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let total = app.log.len();
+
+    let max_scroll = total.saturating_sub(inner_height);
+    let scroll = app.scroll_offset.min(max_scroll);
+
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(inner_height);
+
+    let title = if scroll > 0 {
+        format!(" Traffic [+{}↓ to follow] ", scroll)
+    } else {
+        " Traffic ".to_string()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Traffic ");
+        .title(title);
 
     let items: Vec<ListItem> = app
         .log
-        .iter()
+        .range(start..end)
         .map(|entry| ListItem::new(format_entry(entry)))
         .collect();
 
@@ -198,6 +213,12 @@ pub fn run_app(port_info: String, addr: u16, dest_addr: u16, mut radio: Box<dyn 
                                     }
                                 }
                             }
+                        }
+                        KeyCode::Up => {
+                            app.scroll_up();
+                        }
+                        KeyCode::Down => {
+                            app.scroll_down();
                         }
                         KeyCode::Backspace => {
                             app.input.pop();

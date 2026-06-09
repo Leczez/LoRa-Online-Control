@@ -59,6 +59,20 @@ where
         Ok(())
     }
 
+    /// Configure the module only if its current flash registers differ from `config`.
+    /// Returns `true` if a write was performed, `false` if already correct.
+    /// On success, `last_configure_ack` holds the 12-byte read-back regardless.
+    pub fn configure_if_needed(&mut self, config: &Config) -> Result<bool, Sx126xError<UART::Error>> {
+        let desired = config.to_registers_checked().ok_or(Sx126xError::InvalidConfig)?;
+        let current = self.read_config()?;
+        if current[3..] == desired[3..] {
+            self.last_configure_ack = current;
+            return Ok(false);
+        }
+        self.configure(config)?;
+        Ok(true)
+    }
+
     /// Read 9 registers starting at address 0 (addresses, net_id, speed, power, channel, option, crypt).
     /// Returns raw 12-byte response: [0xC1, 0x00, 0x09, REG0..REG8].
     pub fn read_config(&mut self) -> Result<[u8; 12], Sx126xError<UART::Error>> {

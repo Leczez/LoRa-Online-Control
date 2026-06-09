@@ -120,7 +120,7 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
     if std::io::stdout().is_terminal() {
         let serial = open_serial(&port)?;
         let mut driver = Sx126xUart::new(serial, NoPin, NoPin, StdDelay);
-        driver.configure(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
+        driver.configure_if_needed(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
         let port_info = format!("port: {}  freq: {}MHz  power: {:?}", port, config.freq_mhz, config.power);
         return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval);
     }
@@ -138,11 +138,15 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
             }
         };
         let mut driver = Sx126xUart::new(serial, NoPin, NoPin, StdDelay);
-        match driver.configure(&config) {
-            Ok(()) => {
+        match driver.configure_if_needed(&config) {
+            Ok(written) => {
                 let ack = &driver.last_configure_ack;
                 let addr = ((ack[3] as u16) << 8) | ack[4] as u16;
-                log::info!("module configure ACK: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                if written {
+                    log::info!("module configured: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                } else {
+                    log::info!("module config unchanged: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                }
                 log::info!("module ready");
                 break Box::new(driver);
             }
@@ -180,7 +184,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
         let m1 = RppalPin(gpio.get(m1_pin)?.into_output_low());
         let serial = open_serial(&port)?;
         let mut driver = Sx126xUart::new(serial, m0, m1, StdDelay);
-        driver.configure(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
+        driver.configure_if_needed(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
         let port_info = format!("port: {}  freq: {}MHz  power: {:?}", port, config.freq_mhz, config.power);
         return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval);
     }
@@ -215,11 +219,15 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
         };
         let m1 = RppalPin(gpio.get(m1_pin).unwrap().into_output_low());
         let mut driver = Sx126xUart::new(serial, m0, m1, StdDelay);
-        match driver.configure(&config) {
-            Ok(()) => {
+        match driver.configure_if_needed(&config) {
+            Ok(written) => {
                 let ack = &driver.last_configure_ack;
                 let addr = ((ack[3] as u16) << 8) | ack[4] as u16;
-                log::info!("module configure ACK: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                if written {
+                    log::info!("module configured: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                } else {
+                    log::info!("module config unchanged: addr={} ch={} regs={:02X?}", addr, ack[8], ack);
+                }
                 log::info!("module ready");
                 break Box::new(driver);
             }

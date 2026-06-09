@@ -31,6 +31,7 @@ pub struct App {
     pub should_quit: bool,
     pub addr: u16,
     pub dest: u16,
+    pub scroll_offset: usize,
     port_info: String,
 }
 
@@ -42,6 +43,7 @@ impl App {
             should_quit: false,
             addr,
             dest,
+            scroll_offset: 0,
             port_info,
         }
     }
@@ -51,9 +53,23 @@ impl App {
     }
 
     pub fn push_log(&mut self, entry: LogEntry) {
-        if self.log.len() >= MAX_LOG_ENTRIES {
+        let at_capacity = self.log.len() >= MAX_LOG_ENTRIES;
+        if at_capacity {
             self.log.pop_front();
         }
         self.log.push_back(entry);
+        // Keep the viewport pinned when scrolled; when at capacity the pop+push
+        // leaves total unchanged so no adjustment is needed.
+        if self.scroll_offset > 0 && !at_capacity {
+            self.scroll_offset += 1;
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset += 1;
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 }
