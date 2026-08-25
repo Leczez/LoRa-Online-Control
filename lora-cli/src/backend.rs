@@ -116,13 +116,14 @@ pub fn run(args: Args) -> Result<()> {
 
 fn run_desktop(args: Args, config: Config) -> Result<()> {
     let port = args.port.as_deref().unwrap_or("").to_string();
+    let si_rx = crate::sportident::spawn_si_worker();
 
     if std::io::stdout().is_terminal() {
         let serial = open_serial(&port)?;
         let mut driver = Sx126xUart::new(serial, NoPin, NoPin, StdDelay);
         driver.configure_if_needed(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
         let port_info = format!("port: {}  freq: {}MHz  power: {:?}", port, config.freq_mhz, config.power);
-        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval);
+        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval, si_rx);
     }
 
     // Daemon: create socket first so clients can connect while waiting for hardware.
@@ -157,7 +158,7 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
         }
     };
 
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio)
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
 }
 
 #[cfg(feature = "rpi")]
@@ -177,6 +178,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
     let port = args.port.as_deref().unwrap_or("").to_string();
     let m0_pin = args.m0_pin.unwrap();
     let m1_pin = args.m1_pin.unwrap();
+    let si_rx = crate::sportident::spawn_si_worker();
 
     if std::io::stdout().is_terminal() {
         let gpio = Gpio::new()?;
@@ -186,7 +188,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
         let mut driver = Sx126xUart::new(serial, m0, m1, StdDelay);
         driver.configure_if_needed(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
         let port_info = format!("port: {}  freq: {}MHz  power: {:?}", port, config.freq_mhz, config.power);
-        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval);
+        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval, si_rx);
     }
 
     // Daemon: socket first, then retry hardware.
@@ -238,7 +240,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
         }
     };
 
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio)
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
 }
 
 // ── Daemon socket + loop ──────────────────────────────────────────────────────
@@ -315,6 +317,7 @@ fn run_daemon_loop(
     clients: Clients,
     cmd_rx: std::sync::mpsc::Receiver<String>,
     mut radio: Box<dyn Radio>,
+    si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
 ) -> Result<()> {
     let heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
@@ -353,6 +356,20 @@ fn run_daemon_loop(
                         log::error!("HB send failed: {}", e);
                         broadcast(&clients, format!("ERR HB: {}", e));
                     }
+                }
+            }
+        }
+
+        while let Ok(readout) = si_rx.try_recv() {
+            let msg = readout.to_payload();
+            match radio.send(dest, msg.as_bytes()) {
+                Ok(()) => {
+                    log::info!("TX to {}: {}", dest, msg);
+                    broadcast(&clients, format!("TX {} {}", dest, msg));
+                }
+                Err(e) => {
+                    log::error!("SI TX failed: {}", e);
+                    broadcast(&clients, format!("ERR TX: {}", e));
                 }
             }
         }
@@ -443,5 +460,6 @@ pub fn attach(socket_path: &str, addr: u16, dest: u16) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot connect to daemon at {}: {}", socket_path, e))?;
 
     let radio = SocketRadio::new(stream)?;
-    crate::ui::run_app("attached to daemon".to_string(), addr, dest, Box::new(radio), 0)
+    let (_, si_rx) = std::sync::mpsc::channel();
+    crate::ui::run_app("attached to daemon".to_string(), addr, dest, Box::new(radio), 0, si_rx)
 }

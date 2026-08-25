@@ -145,6 +145,22 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 Style::default().fg(Color::Red),
             ),
         ]),
+        LogEntry::SiPunch { timestamp, card_id, punches } => {
+            let punch_str = punches.iter()
+                .map(|(s, t)| format!("{}@{:02}:{:02}:{:02}", s, t / 3600, (t % 3600) / 60, t % 60))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", timestamp),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("SI  card {:>7}  {}", card_id, punch_str),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ])
+        }
     }
 }
 
@@ -158,7 +174,14 @@ fn rssi_color(dbm: i16) -> Color {
     }
 }
 
-pub fn run_app(port_info: String, addr: u16, dest_addr: u16, mut radio: Box<dyn Radio>, heartbeat_interval: u64) -> anyhow::Result<()> {
+pub fn run_app(
+    port_info: String,
+    addr: u16,
+    dest_addr: u16,
+    mut radio: Box<dyn Radio>,
+    heartbeat_interval: u64,
+    si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
+) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -242,6 +265,22 @@ pub fn run_app(port_info: String, addr: u16, dest_addr: u16, mut radio: Box<dyn 
                     Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
                 }
             }
+        }
+
+        while let Ok(readout) = si_rx.try_recv() {
+            let ts = timestamp();
+            let payload = readout.to_payload();
+            if let Err(e) = radio.send(app.dest, payload.as_bytes()) {
+                app.push_log(LogEntry::Error {
+                    timestamp: ts.clone(),
+                    message: format!("SI TX failed: {}", e),
+                });
+            }
+            app.push_log(crate::app::LogEntry::SiPunch {
+                timestamp: ts,
+                card_id: readout.card_id,
+                punches: readout.punches.iter().map(|p| (p.station, p.time_s)).collect(),
+            });
         }
 
         if last_tick.elapsed() >= tick_rate {

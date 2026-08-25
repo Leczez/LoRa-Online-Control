@@ -1,13 +1,17 @@
 # Användningsområden
-## Skogscontrol
+## Skogskontrol
   - Skicka data via LoRa till ROC
-  - Skicka data till TC via LoRa
+  - Skicka data till Tävlingsarenan via LoRa
 ## Förvarning
   - Skicka stämplingar via LoRa
 ## Målkontroll
   - Skicka stämplingar via LoRa
   - Skicka stämplingar via Wifi
   - Skicka stämplingar via BLE
-## Relay stationer
-  - LoRa relay station
+## Startkontroll
+  - Skicka startstämplingar till Tävlingsarenan
+## Checkkontroll
+  - Check stämplingar till Tävlingsarenan
+## Relay/Repeater stationer
+  - LoRa relay/repeater station
   - Bluetooth till LoRa

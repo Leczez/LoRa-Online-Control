@@ -23,6 +23,11 @@ pub enum LogEntry {
         timestamp: String,
         message: String,
     },
+    SiPunch {
+        timestamp: String,
+        card_id: u32,
+        punches: Vec<(u8, u32)>,  // (station, time_s)
+    },
 }
 
 pub struct App {

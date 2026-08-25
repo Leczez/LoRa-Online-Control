@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod sportident;
 mod ui;
 
 use clap::Parser;
