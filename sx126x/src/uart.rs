@@ -66,6 +66,7 @@ where
         let desired = config.to_registers_checked().ok_or(Sx126xError::InvalidConfig)?;
         let current = self.read_config()?;
         if current[3..] == desired[3..] {
+            self.config = config.clone();
             self.last_configure_ack = current;
             return Ok(false);
         }
@@ -320,6 +321,43 @@ mod tests {
 
         let expected_regs = config().to_registers();
         assert_eq!(&radio.serial.write_buf[..12], &expected_regs);
+
+        radio.m0.done();
+        radio.m1.done();
+    }
+
+    #[test]
+    fn test_configure_if_needed_skip_path_still_updates_config() {
+        // Registers already match the module's flash, so configure_if_needed should
+        // skip the write (`Ok(false)`) — but self.config must still be synced to the
+        // desired config, since send()/receive() read it afterward.
+        let desired = Config {
+            freq_mhz: 433,
+            addr: 5,
+            net_id: 0,
+            power: TxPower::Dbm22,
+            air_speed: AirSpeed::Bps2400,
+            buffer_size: BufferSize::Bytes240,
+            rssi: true,
+            crypt: 0,
+        };
+        let regs = desired.to_registers();
+        let mut current_ack = [0u8; 12];
+        current_ack[0] = 0xC1;
+        current_ack[1..].copy_from_slice(&regs[1..]);
+
+        let m0_expects = std::vec![PinTx::set(State::Low), PinTx::set(State::Low)];
+        let m1_expects = std::vec![PinTx::set(State::High), PinTx::set(State::Low)];
+
+        let serial = MockSerial::new_with_response(&[], &current_ack);
+        let m0 = PinMock::new(&m0_expects);
+        let m1 = PinMock::new(&m1_expects);
+
+        let mut radio = Sx126xUart::new(serial, m0, m1, NoopDelay);
+        let written = radio.configure_if_needed(&desired).unwrap();
+
+        assert!(!written, "registers already matched; write should have been skipped");
+        assert_eq!(radio.config, desired, "self.config must reflect the desired config even when the flash write is skipped");
 
         radio.m0.done();
         radio.m1.done();

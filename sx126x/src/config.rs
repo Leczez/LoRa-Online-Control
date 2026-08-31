@@ -61,7 +61,7 @@ impl BufferSize {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub freq_mhz: u32,
     pub addr: u16,
