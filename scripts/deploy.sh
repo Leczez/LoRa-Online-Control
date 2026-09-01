@@ -85,7 +85,33 @@ else
     echo "Preserved existing /etc/lora-cli/env"
 fi
 
-sudo tee /etc/systemd/system/lora-cli.service > /dev/null <<'SERVICE'
+# The systemd unit's ExecStart depends on which radio transport this env file
+# configures — regenerating the wrong template would silently switch a node
+# using --radio spi back to the UART/HAT flag set (or vice versa).
+if grep -q '^LORA_RADIO=spi' /etc/lora-cli/env; then
+    sudo tee /etc/systemd/system/lora-cli.service > /dev/null <<'SERVICE'
+[Unit]
+Description=LoRa CLI
+After=multi-user.target
+
+[Service]
+RuntimeDirectory=lora-cli
+EnvironmentFile=/etc/lora-cli/env
+ExecStart=/usr/local/bin/lora-cli \
+  --radio ${LORA_RADIO} --reset-pin ${LORA_RESET_PIN} \
+  --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
+  --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
+  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL}
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+else
+    sudo tee /etc/systemd/system/lora-cli.service > /dev/null <<'SERVICE'
 [Unit]
 Description=LoRa CLI
 After=multi-user.target
@@ -106,6 +132,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 SERVICE
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable lora-cli
