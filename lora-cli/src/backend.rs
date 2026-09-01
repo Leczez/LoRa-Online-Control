@@ -41,10 +41,20 @@ impl embedded_io::Write for SerialPortWrapper {
 
 // ── Radio trait ───────────────────────────────────────────────────────────────
 
+/// Out-of-band activity the daemon broadcasts to attached clients that isn't
+/// an incoming radio packet (its own outgoing heartbeats/sends, or errors).
+/// Real radio backends have nothing to report here.
+pub enum StatusEvent {
+    Heartbeat { dest: u16 },
+    Tx { dest: u16, payload: String },
+    Err(String),
+}
+
 pub trait Radio: Send {
     fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()>;
     fn receive(&mut self) -> Result<Option<ReceivedPacket>>;
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
+    fn poll_status(&mut self) -> Vec<StatusEvent> { Vec::new() }
 }
 
 impl<R: LoraRadio + Send> Radio for R
@@ -519,18 +529,24 @@ fn run_daemon_loop(
 struct SocketRadio {
     writer: BufWriter<std::os::unix::net::UnixStream>,
     events: std::sync::mpsc::Receiver<ReceivedPacket>,
+    status_events: std::sync::mpsc::Receiver<StatusEvent>,
 }
 
 impl SocketRadio {
     fn new(stream: std::os::unix::net::UnixStream) -> Result<Self> {
         let read_stream = stream.try_clone()?;
         let (tx, rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
             let reader = BufReader::new(read_stream);
             for line in reader.lines().flatten() {
                 if let Some(pkt) = parse_rx_line(&line) {
                     if tx.send(pkt).is_err() {
+                        break;
+                    }
+                } else if let Some(evt) = parse_status_line(&line) {
+                    if status_tx.send(evt).is_err() {
                         break;
                     }
                 }
@@ -540,6 +556,7 @@ impl SocketRadio {
         Ok(Self {
             writer: BufWriter::new(stream),
             events: rx,
+            status_events: status_rx,
         })
     }
 }
@@ -554,6 +571,23 @@ fn parse_rx_line(line: &str) -> Option<ReceivedPacket> {
     let mut payload = heapless::Vec::<u8, 240>::new();
     let _ = payload.extend_from_slice(text.as_bytes());
     Some(ReceivedPacket { src_addr: src, payload, rssi })
+}
+
+fn parse_status_line(line: &str) -> Option<StatusEvent> {
+    if let Some(rest) = line.strip_prefix("HB ") {
+        let dest: u16 = rest.trim().parse().ok()?;
+        return Some(StatusEvent::Heartbeat { dest });
+    }
+    if let Some(rest) = line.strip_prefix("TX ") {
+        let mut parts = rest.splitn(2, ' ');
+        let dest: u16 = parts.next()?.parse().ok()?;
+        let payload = parts.next().unwrap_or("").to_string();
+        return Some(StatusEvent::Tx { dest, payload });
+    }
+    if let Some(rest) = line.strip_prefix("ERR ") {
+        return Some(StatusEvent::Err(rest.to_string()));
+    }
+    None
 }
 
 impl Radio for SocketRadio {
@@ -571,6 +605,10 @@ impl Radio for SocketRadio {
         writeln!(self.writer, "SET_DEST {}", dest)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn poll_status(&mut self) -> Vec<StatusEvent> {
+        self.status_events.try_iter().collect()
     }
 }
 

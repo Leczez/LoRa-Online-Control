@@ -303,6 +303,20 @@ pub fn run_app(
                     message: e.to_string(),
                 }),
             }
+
+            for evt in radio.poll_status() {
+                match evt {
+                    crate::backend::StatusEvent::Heartbeat { dest } => {
+                        app.push_log(LogEntry::Heartbeat { timestamp: timestamp(), dest_addr: dest });
+                    }
+                    crate::backend::StatusEvent::Tx { dest, payload } => {
+                        app.push_log(LogEntry::Tx { timestamp: timestamp(), dest_addr: dest, payload });
+                    }
+                    crate::backend::StatusEvent::Err(message) => {
+                        app.push_log(LogEntry::Error { timestamp: timestamp(), message });
+                    }
+                }
+            }
             last_tick = Instant::now();
         }
 
