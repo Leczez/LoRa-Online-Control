@@ -195,6 +195,9 @@ pub fn run_app(
     let heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
 
+    // Run the event loop in a closure so a mid-loop I/O error still reaches the
+    // terminal-restore step below, instead of leaving the shell in raw/alt-screen mode.
+    let result: anyhow::Result<()> = (|| {
     loop {
         terminal.draw(|f| render(f, &app))?;
 
@@ -307,6 +310,8 @@ pub fn run_app(
             break;
         }
     }
+    Ok(())
+    })();
 
     disable_raw_mode()?;
     execute!(
@@ -315,7 +320,8 @@ pub fn run_app(
         DisableMouseCapture,
     )?;
     terminal.show_cursor()?;
-    Ok(())
+
+    result
 }
 
 fn timestamp() -> String {
