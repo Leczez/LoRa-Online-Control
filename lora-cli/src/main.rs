@@ -8,9 +8,33 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "lora-cli", about = "Interactive LoRa terminal")]
 pub struct Args {
-    /// Serial port path (e.g. /dev/ttyS0 or /dev/ttyUSB0)
-    #[arg(long, env = "LORA_PORT", required_unless_present = "attach")]
+    /// Serial port path (e.g. /dev/ttyS0 or /dev/ttyUSB0). Required unless --radio spi.
+    #[arg(long, env = "LORA_PORT")]
     pub port: Option<String>,
+
+    /// Radio transport: "uart" (EBYTE E22 HAT) or "spi" (bare SX1276/RFM9x module)
+    #[arg(long, env = "LORA_RADIO", default_value = "uart")]
+    pub radio: String,
+
+    /// RESET GPIO pin for the SPI radio (BCM, Raspberry Pi only)
+    #[arg(long, env = "LORA_RESET_PIN", default_value_t = 25)]
+    pub reset_pin: u8,
+
+    /// LoRa spreading factor for the SPI radio (7-12)
+    #[arg(long, env = "LORA_SF", default_value_t = 7)]
+    pub sf: u8,
+
+    /// LoRa bandwidth in Hz for the SPI radio (e.g. 125000)
+    #[arg(long, env = "LORA_BW_HZ", default_value_t = 125_000)]
+    pub bw_hz: u32,
+
+    /// LoRa coding rate denominator for the SPI radio (5-8, meaning 4/5..4/8)
+    #[arg(long, env = "LORA_CR", default_value_t = 5)]
+    pub cr: u8,
+
+    /// LoRa sync word for the SPI radio (decimal; default 18 = 0x12)
+    #[arg(long, env = "LORA_SYNC_WORD", default_value_t = 18)]
+    pub sync_word: u8,
 
     /// Frequency in MHz (410-493 or 850-930)
     #[arg(long, env = "LORA_FREQ", default_value_t = 868)]
@@ -85,10 +109,21 @@ fn main() -> anyhow::Result<()> {
         return backend::attach(&args.socket, args.addr, args.dest);
     }
 
-    log::info!(
-        "starting on port {} addr {} dest {} freq {}MHz air_speed {}bps heartbeat {}s",
-        args.port.as_deref().unwrap_or(""),
-        args.addr, args.dest, args.freq, args.air_speed, args.heartbeat_interval
-    );
+    if args.radio != "spi" && args.port.is_none() {
+        anyhow::bail!("--port is required unless --radio spi or --attach");
+    }
+
+    if args.radio == "spi" {
+        log::info!(
+            "starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
+            args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
+        );
+    } else {
+        log::info!(
+            "starting on port {} addr {} dest {} freq {}MHz air_speed {}bps heartbeat {}s",
+            args.port.as_deref().unwrap_or(""),
+            args.addr, args.dest, args.freq, args.air_speed, args.heartbeat_interval
+        );
+    }
     backend::run(args)
 }

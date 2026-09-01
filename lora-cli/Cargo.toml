@@ -9,6 +9,7 @@ rpi = ["dep:rppal"]
 
 [dependencies]
 sx126x = { path = "../sx126x", features = ["std"] }
+sx127x = { path = "../sx127x" }
 anyhow = "1"
 heapless = "0.8"
 log = "0.4"
@@ -21,6 +22,6 @@ embedded-io = { version = "0.6", features = ["std"] }
 embedded-hal = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.19", optional = true }
+rppal = { version = "0.19", optional = true, features = ["embedded-hal"] }
 udev = { version = "0.9", features = ["send"] }
 libc = "0.2"

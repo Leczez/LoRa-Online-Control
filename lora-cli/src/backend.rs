@@ -93,6 +93,70 @@ fn build_config(args: &Args) -> Result<Config> {
     })
 }
 
+#[cfg(feature = "rpi")]
+fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
+    use sx127x::{Bandwidth, CodingRate};
+
+    let bandwidth = match args.bw_hz {
+        7_800 => Bandwidth::Khz7_8,
+        10_400 => Bandwidth::Khz10_4,
+        15_600 => Bandwidth::Khz15_6,
+        20_800 => Bandwidth::Khz20_8,
+        31_250 => Bandwidth::Khz31_25,
+        41_700 => Bandwidth::Khz41_7,
+        62_500 => Bandwidth::Khz62_5,
+        125_000 => Bandwidth::Khz125,
+        250_000 => Bandwidth::Khz250,
+        500_000 => Bandwidth::Khz500,
+        b => anyhow::bail!("unsupported bandwidth {}Hz", b),
+    };
+    let coding_rate = match args.cr {
+        5 => CodingRate::Cr4_5,
+        6 => CodingRate::Cr4_6,
+        7 => CodingRate::Cr4_7,
+        8 => CodingRate::Cr4_8,
+        c => anyhow::bail!("unsupported coding rate 4/{} — use 5, 6, 7, or 8", c),
+    };
+    if !(7..=12).contains(&args.sf) {
+        anyhow::bail!("unsupported spreading factor {} — use 7-12", args.sf);
+    }
+
+    Ok(sx127x::Config {
+        freq_hz: args.freq * 1_000_000,
+        addr: args.addr,
+        spreading_factor: args.sf,
+        bandwidth,
+        coding_rate,
+        sync_word: args.sync_word,
+        preamble_len: 8,
+        tx_power_dbm: args.power as i8,
+        crc_on: true,
+    })
+}
+
+// Local newtype: sx126x::LoraRadio and sx127x::Sx127xSpi are both foreign to
+// this crate, so a direct `impl Radio for Sx127xSpi<..>` conflicts (in the
+// compiler's eyes) with the sx126x blanket impl above — a future sx127x
+// version could add `impl sx126x::LoraRadio for Sx127xSpi`, which neither
+// impl can rule out. Wrapping in a local type sidesteps that.
+#[cfg(feature = "rpi")]
+struct Sx127xRadio<SPI, RESET, DELAY>(sx127x::Sx127xSpi<SPI, RESET, DELAY>);
+
+#[cfg(feature = "rpi")]
+impl<SPI, RESET, DELAY> Radio for Sx127xRadio<SPI, RESET, DELAY>
+where
+    SPI: embedded_hal::spi::SpiDevice + Send,
+    RESET: embedded_hal::digital::OutputPin + Send,
+    DELAY: embedded_hal::delay::DelayNs + Send,
+{
+    fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()> {
+        sx127x::LoraRadio::send(&mut self.0, dest, payload).map_err(|e| anyhow::anyhow!("{}", e))
+    }
+    fn receive(&mut self) -> Result<Option<ReceivedPacket>> {
+        sx127x::LoraRadio::receive(&mut self.0).map_err(|e| anyhow::anyhow!("{}", e))
+    }
+}
+
 fn open_serial(port: &str) -> Result<SerialPortWrapper> {
     let s = serialport::new(port, 9600)
         .timeout(std::time::Duration::from_millis(1000))
@@ -104,6 +168,13 @@ fn open_serial(port: &str) -> Result<SerialPortWrapper> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run(args: Args) -> Result<()> {
+    if args.radio == "spi" {
+        #[cfg(feature = "rpi")]
+        return run_spi(args);
+        #[cfg(not(feature = "rpi"))]
+        anyhow::bail!("--radio spi requires building lora-cli with the `rpi` feature");
+    }
+
     let config = build_config(&args)?;
 
     #[cfg(feature = "rpi")]
@@ -162,18 +233,21 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
 }
 
 #[cfg(feature = "rpi")]
+struct RppalPin(rppal::gpio::OutputPin);
+
+#[cfg(feature = "rpi")]
+impl embedded_hal::digital::ErrorType for RppalPin {
+    type Error = std::convert::Infallible;
+}
+#[cfg(feature = "rpi")]
+impl embedded_hal::digital::OutputPin for RppalPin {
+    fn set_high(&mut self) -> Result<(), Self::Error> { self.0.set_high(); Ok(()) }
+    fn set_low(&mut self) -> Result<(), Self::Error> { self.0.set_low(); Ok(()) }
+}
+
+#[cfg(feature = "rpi")]
 fn run_rpi(args: Args, config: Config) -> Result<()> {
     use rppal::gpio::Gpio;
-
-    struct RppalPin(rppal::gpio::OutputPin);
-
-    impl embedded_hal::digital::ErrorType for RppalPin {
-        type Error = std::convert::Infallible;
-    }
-    impl embedded_hal::digital::OutputPin for RppalPin {
-        fn set_high(&mut self) -> Result<(), Self::Error> { self.0.set_high(); Ok(()) }
-        fn set_low(&mut self) -> Result<(), Self::Error> { self.0.set_low(); Ok(()) }
-    }
 
     let port = args.port.as_deref().unwrap_or("").to_string();
     let m0_pin = args.m0_pin.unwrap();
@@ -235,6 +309,51 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
             }
             Err(e) => {
                 log::warn!("module not responding ({}), retrying in 5s", e);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+    };
+
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
+}
+
+#[cfg(feature = "rpi")]
+fn run_spi(args: Args) -> Result<()> {
+    use rppal::gpio::Gpio;
+    use rppal::spi::{Bus, Mode, SimpleHalSpiDevice, SlaveSelect, Spi};
+
+    let config = build_sx127x_config(&args)?;
+    let si_rx = crate::sportident::spawn_si_worker();
+
+    let build_driver = || -> Result<Sx127xRadio<SimpleHalSpiDevice<Spi>, RppalPin, StdDelay>> {
+        let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss0, 1_000_000, Mode::Mode0)
+            .map_err(|e| anyhow::anyhow!("SPI open failed: {}", e))?;
+        let spi_device = SimpleHalSpiDevice::new(spi);
+        let gpio = Gpio::new()?;
+        let reset = RppalPin(gpio.get(args.reset_pin)?.into_output_high());
+        let mut driver = sx127x::Sx127xSpi::new(spi_device, reset, StdDelay);
+        sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(Sx127xRadio(driver))
+    };
+
+    if std::io::stdout().is_terminal() {
+        let driver = build_driver()?;
+        let port_info = format!(
+            "SPI0 CE0  freq: {}Hz  sf: {}  bw: {}Hz",
+            config.freq_hz, config.spreading_factor, config.bandwidth.hz()
+        );
+        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval, si_rx);
+    }
+
+    let (clients, cmd_rx) = setup_daemon_socket(&args.socket)?;
+    let radio: Box<dyn Radio> = loop {
+        match build_driver() {
+            Ok(driver) => {
+                log::info!("SX1276 module ready on SPI0 CE0");
+                break Box::new(driver);
+            }
+            Err(e) => {
+                log::warn!("SPI module not responding ({}), retrying in 5s", e);
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
