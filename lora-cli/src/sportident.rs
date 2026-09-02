@@ -26,6 +26,21 @@ const C_GET_SI5: u8 = 0xB1;
 const C_GET_SI6: u8 = 0xE1;
 const C_GET_SI9: u8 = 0xEF;
 
+// Autosend punch record — sent unsolicited by a station in "Control" operating
+// mode with Extended Protocol + Autosend enabled, one per card punch. Requires
+// Extended Protocol, which adds a 2-byte station/control-number field to every
+// packet's header (see try_parse_packet); this differs from a full card
+// readout (CardData above), which is the whole card's punch history read out
+// after physical insertion.
+const C_TRANS_REC: u8 = 0xD3;
+
+// Offsets within an autosend punch record's data (after the 2-byte station
+// header field has been split off): 4-byte card number, then a punch time
+// (12-hour raw seconds, no AM/PM bit — must be resolved against the current
+// wall clock, unlike stored card data which carries an explicit PTD byte).
+const PUNCH_CARD_OFFSET: usize = 0;
+const PUNCH_TIME_OFFSET: usize = 5;
+
 // Offsets within the 128-byte SI Card 9 image returned by C_GET_SI9
 // Verify these against sireader2.py if the hardware behaves differently.
 const SI9_PUNCH_COUNT_OFFSET: usize = 0x16;
@@ -73,6 +88,7 @@ enum ParsedPacket {
     CardInserted { card_type: CardType, card_id: u32 },
     CardRemoved,
     CardData { data: Vec<u8> },
+    Punch { control: u16, data: Vec<u8> },
 }
 
 // ─── CRC-16 (polynomial 0x8005, covering CMD+LEN+DATA) ────────────────────────
@@ -127,19 +143,31 @@ impl SiReader {
 
             let cmd = self.buf[1];
             let len = self.buf[2] as usize;
-            let total = 1 + 1 + 1 + len + 2 + 1;  // STX CMD LEN DATA[len] CRC[2] ETX
+            // Extended Protocol (required for autosend/control mode) prepends a
+            // 2-byte station/control-number field ahead of the data, still
+            // counted within `len` — so the overall packet length is unchanged,
+            // only the split between header and payload shifts by 2 bytes.
+            let total = 1 + 1 + 1 + len + 2 + 1;  // STX CMD LEN STATION+DATA[len] CRC[2] ETX
 
             if self.buf.len() < total { return None; }
+            if len < 2 {
+                self.buf.remove(0);
+                continue;
+            }
 
             if self.buf[total - 1] != ETX {
                 self.buf.remove(0);
                 continue;
             }
 
-            let data = self.buf[3..3 + len].to_vec();
+            let station = ((self.buf[3] as u16) << 8) | self.buf[4] as u16;
+            let data = self.buf[5..3 + len].to_vec();
             self.buf.drain(..total);
 
             match cmd {
+                C_TRANS_REC => {
+                    return Some(ParsedPacket::Punch { control: station, data });
+                }
                 C_SI5_DET if data.len() >= 3 => {
                     return Some(ParsedPacket::CardInserted {
                         card_type: CardType::Si5,
@@ -200,6 +228,11 @@ impl SiReader {
                     self.pending = None;
                     return Ok(Some(SiEvent::CardRemoved));
                 }
+                ParsedPacket::Punch { control, data } => {
+                    if let Some(readout) = parse_punch(control, &data, now_seconds_of_day()) {
+                        return Ok(Some(SiEvent::CardReadout(readout)));
+                    }
+                }
             }
         }
 
@@ -242,6 +275,56 @@ fn parse_si9(card_id: u32, data: &[u8]) -> Option<CardReadout> {
     }
 
     Some(CardReadout { card_id, punches })
+}
+
+// ─── Autosend punch parsing (control-point / online-control mode) ────────────
+
+/// Parses one autosend punch record (command 0xD3). `now_s` is the current
+/// wall-clock time as seconds since local midnight, used to resolve the
+/// record's 12-hour raw time (it carries no AM/PM bit, unlike stored card
+/// data — see resolve_autosend_time).
+fn parse_punch(control: u16, data: &[u8], now_s: u32) -> Option<CardReadout> {
+    if data.len() < PUNCH_TIME_OFFSET + 2 { return None; }
+
+    // Byte 0 of the 4-byte card number is a card-series/type marker, matching
+    // the same convention already used for C_SI9_DET above.
+    let card_id = card_id_3b(&data[PUNCH_CARD_OFFSET + 1..PUNCH_CARD_OFFSET + 4]);
+
+    let raw_time = ((data[PUNCH_TIME_OFFSET] as u32) << 8) | data[PUNCH_TIME_OFFSET + 1] as u32;
+    if raw_time >= 86_400 { return None; }  // TIME_RESET / no valid time recorded
+    let time_s = resolve_autosend_time(raw_time % 43_200, now_s);
+
+    let station = (control & 0xFF) as u8;
+    Some(CardReadout { card_id, punches: vec![ControlPunch { station, time_s }] })
+}
+
+/// Resolves a 12-hour raw punch time (0..43199 s) against the current time of
+/// day, replicating sireader.py's SIReader._decode_time no-PTD path: pick
+/// whichever of {raw, raw+12h} falls in the same 12-hour half as "now + 2h"
+/// (the 2h safety margin absorbs the few seconds of relay latency so a punch
+/// right at a noon/midnight boundary still resolves correctly).
+fn resolve_autosend_time(raw_time_s: u32, now_s: u32) -> u32 {
+    const DAY: u32 = 86_400;
+    const NOON: u32 = 43_200;
+    let ref_s = (now_s + 2 * 3600) % DAY;
+
+    if ref_s < NOON {
+        if raw_time_s < ref_s { raw_time_s } else { raw_time_s + NOON }
+    } else if raw_time_s < ref_s - NOON {
+        raw_time_s + NOON
+    } else {
+        raw_time_s
+    }
+}
+
+/// Current local wall-clock time as seconds since midnight.
+fn now_seconds_of_day() -> u32 {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (tm.tm_hour as u32) * 3600 + (tm.tm_min as u32) * 60 + tm.tm_sec as u32
+    }
 }
 
 // ─── Port discovery ────────────────────────────────────────────────────────────
@@ -439,4 +522,56 @@ pub fn spawn_si_worker() -> std::sync::mpsc::Receiver<CardReadout> {
         .expect("failed to spawn SI worker");
 
     out_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_autosend_time_am_stays_am() {
+        // Punch at 08:00:00, checked moments later at 08:00:05 — clearly AM.
+        let raw = 8 * 3600;
+        let now = 8 * 3600 + 5;
+        assert_eq!(resolve_autosend_time(raw, now), raw);
+    }
+
+    #[test]
+    fn test_resolve_autosend_time_pm_gets_12h_added() {
+        // Raw punch time is always 0..43199 (12h range); a punch at 15:00:00
+        // arrives from the station as 03:00:00 (10800s) since that's what
+        // wraps into the 12h range. Checked at 15:00:05 — clearly PM.
+        let raw = 3 * 3600;
+        let now = 15 * 3600 + 5;
+        assert_eq!(resolve_autosend_time(raw, now), raw + 43_200);
+    }
+
+    #[test]
+    fn test_resolve_autosend_time_noon_boundary_with_safety_margin() {
+        // Punch at 11:59:58 (raw, AM), but relay processing pushes wall clock
+        // to 12:00:02 by the time we check — the +2h safety margin should
+        // still resolve this correctly as the AM punch it actually was.
+        let raw = 11 * 3600 + 59 * 60 + 58;
+        let now = 12 * 3600 + 2;
+        assert_eq!(resolve_autosend_time(raw, now), raw);
+    }
+
+    #[test]
+    fn test_parse_punch_decodes_card_and_control() {
+        // card series byte (SI9) + 3-byte card number, 1 unused byte, then
+        // a 2-byte 12h raw time of 08:00:00 = 28800s = 0x7080.
+        let data = [0x01, 0x0F, 0x42, 0x40, 0x00, 0x70, 0x80];
+        let now_s = 8 * 3600 + 5; // 08:00:05, same AM half as the punch
+        let readout = parse_punch(33, &data, now_s).unwrap();
+
+        assert_eq!(readout.card_id, 0x0F4240);
+        assert_eq!(readout.punches.len(), 1);
+        assert_eq!(readout.punches[0].station, 33);
+        assert_eq!(readout.punches[0].time_s, 8 * 3600);
+    }
+
+    #[test]
+    fn test_parse_punch_rejects_short_data() {
+        assert!(parse_punch(1, &[0x01, 0x00, 0x00], 0).is_none());
+    }
 }
