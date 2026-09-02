@@ -262,10 +262,16 @@ impl SiReader {
         let auto_send = proto & 0x02 != 0;
         let mode = self.query_sys_val(O_MODE).ok();
 
-        log::info!(
-            "SI station config: ext_proto={} auto_send={} mode=0x{:02X?}",
-            ext_proto, auto_send, mode
-        );
+        match mode {
+            Some(m) => log::info!(
+                "SI station config: ext_proto={} auto_send={} mode=0x{:02X}",
+                ext_proto, auto_send, m
+            ),
+            None => log::info!(
+                "SI station config: ext_proto={} auto_send={} mode=<query failed>",
+                ext_proto, auto_send
+            ),
+        }
 
         if mode == Some(M_CONTROL) && !(ext_proto && auto_send) {
             log::warn!(
