@@ -57,6 +57,41 @@ time, matching the addressing scheme above.
   to ever hear the "undo" instruction, and it can only be fixed by physical
   access again. Those settings stay commissioning-time only.
 
+## Relay Nodes
+
+A control point out of direct range of the base station can reach it via a
+relay — another node (either a dedicated relay-only device, or a normal
+control-point node doing double duty) that forwards its traffic on. The
+topology for an event is known at setup time, so relay paths are **fixed
+and configured at commissioning**, not discovered dynamically — no route
+discovery, no loop-avoidance protocol, just "node 7 relays via node 5."
+This keeps a relay node's logic small: it either has traffic of its own to
+send, or a packet arrives that isn't addressed to it but matches its
+configured forwarding rule, and it re-transmits that packet on its own next
+uplink turn.
+
+- **Origin address travels in the payload, not just the radio header.**
+  The radio-layer address on each hop is only the *next hop*, so after one
+  or more relay hops the base station's `pkt.src_addr` is the last relay,
+  not the punching node. Punch and heartbeat payloads carry the originating
+  node's address explicitly, so the base station always attributes a punch
+  to the right control point regardless of how many hops it took — this
+  also means the same parsing path handles direct and relayed traffic
+  identically, with no special-casing.
+- **A small hop-count/TTL field is cheap insurance.** The topology is fixed
+  by configuration so loops shouldn't happen, but a 1-byte hop count
+  decremented per relay hop (packet dropped at zero) is nearly free and
+  guards against a future misconfiguration silently spamming the channel.
+- **Command packets route the same way, reversed.** A command destined for
+  a node beyond direct range travels base → relay → target using the same
+  fixed path, just the other direction — no separate mechanism needed.
+- **Dual-role nodes share one airtime/duty-cycle budget.** A node that is
+  both a control point and a relay is carrying its own traffic plus
+  whatever it forwards on the same radio, same duty-cycle allowance, same
+  battery. That's the real cost of combining the roles — worth planning
+  power budget for specifically, rather than assuming a relay node draws
+  the same as a plain control-point node.
+
 ## RF Parameters
 
 To maximize range, we use the lowest practical bitrate rather than the
