@@ -134,6 +134,27 @@ impl CardReadout {
             .join(",");
         format!("PUNCH {} {}", self.card_id, punches)
     }
+
+    /// Inverse of `to_payload` — decodes a `PUNCH <card_id> <station>:<time_s>,...`
+    /// wire payload (as relayed by a remote LoRa node) back into structured data.
+    pub fn parse_payload(s: &str) -> Option<CardReadout> {
+        let rest = s.strip_prefix("PUNCH ")?;
+        let mut parts = rest.splitn(2, ' ');
+        let card_id: u32 = parts.next()?.parse().ok()?;
+        let punches = parts.next().unwrap_or("");
+
+        let mut result = Vec::new();
+        if !punches.is_empty() {
+            for p in punches.split(',') {
+                let (station_str, time_str) = p.split_once(':')?;
+                let station: u8 = station_str.parse().ok()?;
+                let time_s: u32 = time_str.parse().ok()?;
+                result.push(ControlPunch { station, time_s });
+            }
+        }
+
+        Some(CardReadout { card_id, punches: result })
+    }
 }
 
 #[derive(Debug)]
@@ -1005,5 +1026,39 @@ mod tests {
         let c = crc16(&[0xEF, 0x00, 0x00, 0x03]);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_punch_payload_round_trips() {
+        let original = CardReadout {
+            card_id: 0x0F4240,
+            punches: vec![
+                ControlPunch { station: 33, time_s: 36070 },
+                ControlPunch { station: 50, time_s: 37300 },
+            ],
+        };
+        let payload = original.to_payload();
+        let decoded = CardReadout::parse_payload(&payload).unwrap();
+
+        assert_eq!(decoded.card_id, original.card_id);
+        assert_eq!(decoded.punches.len(), 2);
+        assert_eq!(decoded.punches[0].station, 33);
+        assert_eq!(decoded.punches[0].time_s, 36070);
+        assert_eq!(decoded.punches[1].station, 50);
+        assert_eq!(decoded.punches[1].time_s, 37300);
+    }
+
+    #[test]
+    fn test_punch_payload_no_punches() {
+        let original = CardReadout { card_id: 42, punches: vec![] };
+        let decoded = CardReadout::parse_payload(&original.to_payload()).unwrap();
+        assert_eq!(decoded.card_id, 42);
+        assert!(decoded.punches.is_empty());
+    }
+
+    #[test]
+    fn test_punch_payload_rejects_non_punch_text() {
+        assert!(CardReadout::parse_payload("HB").is_none());
+        assert!(CardReadout::parse_payload("hello?").is_none());
     }
 }

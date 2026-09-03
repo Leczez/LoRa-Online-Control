@@ -1,5 +1,7 @@
 mod app;
 mod backend;
+mod punch_buffer;
+mod pusher;
 mod sportident;
 mod ui;
 
@@ -75,6 +77,21 @@ pub struct Args {
     /// Attach to a running daemon instead of starting one
     #[arg(long)]
     pub attach: bool,
+
+    /// Path to the persistent punch buffer (SQLite). Every punch, local or
+    /// remote, is recorded here before anything else happens to it.
+    #[arg(long, env = "LORA_PUNCH_DB", default_value = "/var/lib/lora-cli/punches.db")]
+    pub punch_db: String,
+
+    /// URL of the remote roc/mip output server's ingestion endpoint (e.g.
+    /// http://100.x.y.z:8080/punches). If unset, punches are still buffered
+    /// locally but never pushed anywhere.
+    #[arg(long, env = "LORA_PUSH_TO")]
+    pub push_to: Option<String>,
+
+    /// How often the background pusher checks the buffer for unsent punches.
+    #[arg(long, env = "LORA_PUSH_INTERVAL_SECS", default_value_t = 10)]
+    pub push_interval_secs: u64,
 }
 
 fn load_env_file(path: &str) {

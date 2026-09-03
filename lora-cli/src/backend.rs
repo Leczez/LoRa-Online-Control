@@ -239,7 +239,8 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
         }
     };
 
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
+    let punch_buffer = setup_punch_pipeline(&args)?;
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
 }
 
 #[cfg(feature = "rpi")]
@@ -324,7 +325,8 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
         }
     };
 
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
+    let punch_buffer = setup_punch_pipeline(&args)?;
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
 }
 
 #[cfg(feature = "rpi")]
@@ -369,7 +371,8 @@ fn run_spi(args: Args) -> Result<()> {
         }
     };
 
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx)
+    let punch_buffer = setup_punch_pipeline(&args)?;
+    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
 }
 
 // ── Daemon socket + loop ──────────────────────────────────────────────────────
@@ -440,6 +443,30 @@ fn handle_client(
     }
 }
 
+/// Opens the persistent punch buffer and, if `--push-to` is configured,
+/// starts the background pusher thread. Called once per daemon startup;
+/// the returned buffer is fed by run_daemon_loop for both local and remote
+/// punches regardless of whether pushing is enabled.
+fn setup_punch_pipeline(args: &Args) -> Result<Arc<crate::punch_buffer::PunchBuffer>> {
+    if let Some(parent) = std::path::Path::new(&args.punch_db).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(&args.punch_db)?);
+
+    if let Some(push_to) = &args.push_to {
+        crate::pusher::spawn(
+            Arc::clone(&buffer),
+            push_to.clone(),
+            Duration::from_secs(args.push_interval_secs),
+        );
+        log::info!("punch pusher started, pushing to {}", push_to);
+    } else {
+        log::info!("no --push-to configured; punches are buffered at {} but not pushed anywhere", args.punch_db);
+    }
+
+    Ok(buffer)
+}
+
 fn run_daemon_loop(
     dest: u16,
     heartbeat_interval: u64,
@@ -447,6 +474,7 @@ fn run_daemon_loop(
     cmd_rx: std::sync::mpsc::Receiver<String>,
     mut radio: Box<dyn Radio>,
     si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
+    punch_buffer: Arc<crate::punch_buffer::PunchBuffer>,
 ) -> Result<()> {
     let heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
@@ -490,6 +518,11 @@ fn run_daemon_loop(
         }
 
         while let Ok(readout) = si_rx.try_recv() {
+            for p in &readout.punches {
+                if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, "local") {
+                    log::error!("failed to buffer local punch: {}", e);
+                }
+            }
             let msg = readout.to_payload();
             match radio.send(dest, msg.as_bytes()) {
                 Ok(()) => {
@@ -510,6 +543,14 @@ fn run_daemon_loop(
                 match pkt.rssi {
                     Some(dbm) => log::info!("RX from {}: {} (RSSI: {}dBm)", pkt.src_addr, payload, dbm),
                     None      => log::info!("RX from {}: {}", pkt.src_addr, payload),
+                }
+                if let Some(readout) = crate::sportident::CardReadout::parse_payload(&payload) {
+                    let source = pkt.src_addr.to_string();
+                    for p in &readout.punches {
+                        if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &source) {
+                            log::error!("failed to buffer remote punch: {}", e);
+                        }
+                    }
                 }
                 broadcast(&clients, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
             }
