@@ -77,6 +77,17 @@ if systemctl list-unit-files lora-cli.service &>/dev/null; then
     echo "Found old lora-cli.service — stopping and disabling it"
     sudo systemctl stop lora-cli || true
     sudo systemctl disable lora-cli || true
+    sudo rm -f /etc/systemd/system/lora-cli.service
+    sudo systemctl daemon-reload
+fi
+
+# The old lora-cli binary has no service pointing at it anymore, but left
+# on disk it's still a loaded gun: manually running it would grab the same
+# serial port/SPI bus/GPIO pins lora-server is using and reproduce the
+# exact hardware lockup the service split was fixed for.
+if [[ -f /usr/local/bin/lora-cli ]]; then
+    sudo rm -f /usr/local/bin/lora-cli
+    echo "Removed old /usr/local/bin/lora-cli"
 fi
 
 if [[ ! -f /etc/lora-server/env ]] && [[ -f /etc/lora-cli/env ]]; then
