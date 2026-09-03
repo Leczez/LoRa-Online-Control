@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::protocol::{Frame, Setting};
 use crate::Args;
 
 // ── Delay ─────────────────────────────────────────────────────────────────────
@@ -48,6 +49,10 @@ pub enum StatusEvent {
     Heartbeat { dest: u16 },
     Tx { dest: u16, payload: String },
     Err(String),
+    /// A command this daemon originated was confirmed applied by its target.
+    CmdOk { target: u16, setting: Setting },
+    /// A command this daemon originated got no ack after retrying.
+    CmdErr { target: u16, setting: Setting },
 }
 
 pub trait Radio: Send {
@@ -55,6 +60,16 @@ pub trait Radio: Send {
     fn receive(&mut self) -> Result<Option<ReceivedPacket>>;
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
     fn poll_status(&mut self) -> Vec<StatusEvent> { Vec::new() }
+
+    /// Ask the node at `target` to change its heartbeat interval. Direct
+    /// hardware backends send this as a single, untracked frame — a human
+    /// watching the TUI can retry manually if no ack shows up. The daemon's
+    /// SocketRadio instead hands this off to the daemon itself, which owns
+    /// retry-with-ack tracking (see run_daemon_loop).
+    fn send_command(&mut self, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
+        let frame = Frame::Command { target, setting: Setting::HeartbeatIntervalSecs(heartbeat_interval_secs) };
+        self.send(target, frame.encode().as_bytes())
+    }
 }
 
 impl<R: LoraRadio + Send> Radio for R
@@ -240,7 +255,10 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
     };
 
     let punch_buffer = setup_punch_pipeline(&args)?;
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
+    run_daemon_loop(
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        clients, cmd_rx, radio, si_rx, punch_buffer,
+    )
 }
 
 #[cfg(feature = "rpi")]
@@ -326,7 +344,10 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
     };
 
     let punch_buffer = setup_punch_pipeline(&args)?;
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
+    run_daemon_loop(
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        clients, cmd_rx, radio, si_rx, punch_buffer,
+    )
 }
 
 #[cfg(feature = "rpi")]
@@ -372,7 +393,10 @@ fn run_spi(args: Args) -> Result<()> {
     };
 
     let punch_buffer = setup_punch_pipeline(&args)?;
-    run_daemon_loop(args.dest, args.heartbeat_interval, clients, cmd_rx, radio, si_rx, punch_buffer)
+    run_daemon_loop(
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        clients, cmd_rx, radio, si_rx, punch_buffer,
+    )
 }
 
 // ── Daemon socket + loop ──────────────────────────────────────────────────────
@@ -428,7 +452,7 @@ fn handle_client(
     std::thread::spawn(move || {
         let reader = BufReader::new(read_stream);
         for line in reader.lines().flatten() {
-            if line.starts_with("SEND ") || line.starts_with("SET_DEST ") {
+            if line.starts_with("SEND ") || line.starts_with("SET_DEST ") || line.starts_with("CMD ") {
                 let _ = cmd_tx.send(line);
             }
         }
@@ -467,18 +491,55 @@ fn setup_punch_pipeline(args: &Args) -> Result<Arc<crate::punch_buffer::PunchBuf
     Ok(buffer)
 }
 
-fn run_daemon_loop(
+/// How often an un-acked command is retried, and how many attempts before
+/// it's given up on. Kept short since a command's only real cost on failure
+/// is airtime — unlike a punch, there's nothing to lose by retrying often.
+const CMD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const CMD_MAX_ATTEMPTS: u32 = 5;
+
+struct PendingCommand {
+    target: u16,
+    setting: Setting,
+    sent_at: Instant,
+    attempts: u32,
+}
+
+fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, target: u16, setting: Setting) {
+    let frame = Frame::Command { target, setting };
+    let payload = frame.encode();
+    match radio.send(target, payload.as_bytes()) {
+        Ok(()) => {
+            log::info!("CMD to {}: {}", target, payload);
+            broadcast(clients, format!("TX {} {}", target, payload));
+        }
+        Err(e) => {
+            log::error!("CMD send failed: {}", e);
+            broadcast(clients, format!("ERR CMD: {}", e));
+        }
+    }
+}
+
+/// The daemon's own identity and starting config — as opposed to the
+/// runtime handles (radio, sockets, buffers) it operates on.
+struct DaemonIdentity {
+    own_addr: u16,
     dest: u16,
     heartbeat_interval: u64,
+}
+
+fn run_daemon_loop(
+    identity: DaemonIdentity,
     clients: Clients,
     cmd_rx: std::sync::mpsc::Receiver<String>,
     mut radio: Box<dyn Radio>,
     si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
     punch_buffer: Arc<crate::punch_buffer::PunchBuffer>,
 ) -> Result<()> {
-    let heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
+    let DaemonIdentity { own_addr, dest, heartbeat_interval } = identity;
+    let mut heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
     let mut dest = dest;
+    let mut pending_commands: Vec<PendingCommand> = Vec::new();
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -498,8 +559,32 @@ fn run_daemon_loop(
                         broadcast(&clients, format!("ERR TX: {}", e));
                     }
                 }
+            } else if let Some(rest) = cmd.strip_prefix("CMD ") {
+                let mut parts = rest.splitn(2, ' ');
+                if let (Some(target_str), Some(secs_str)) = (parts.next(), parts.next()) {
+                    if let (Ok(target), Ok(secs)) = (target_str.parse::<u16>(), secs_str.parse::<u32>()) {
+                        let setting = Setting::HeartbeatIntervalSecs(secs);
+                        send_command_frame(radio.as_mut(), &clients, target, setting);
+                        pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
+                    }
+                }
             }
         }
+
+        pending_commands.retain_mut(|cmd| {
+            if cmd.sent_at.elapsed() < CMD_RETRY_INTERVAL {
+                return true;
+            }
+            if cmd.attempts >= CMD_MAX_ATTEMPTS {
+                log::warn!("CMD to {} ({:?}) gave up after {} attempts", cmd.target, cmd.setting, cmd.attempts);
+                broadcast(&clients, format!("CMDERR {} {}", cmd.target, cmd.setting.encode()));
+                return false;
+            }
+            cmd.attempts += 1;
+            cmd.sent_at = Instant::now();
+            send_command_frame(radio.as_mut(), &clients, cmd.target, cmd.setting);
+            true
+        });
 
         if let Some(period) = heartbeat_period {
             if last_heartbeat.elapsed() >= period {
@@ -549,6 +634,33 @@ fn run_daemon_loop(
                     for p in &readout.punches {
                         if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &source) {
                             log::error!("failed to buffer remote punch: {}", e);
+                        }
+                    }
+                } else if let Some(frame) = Frame::parse(&payload) {
+                    match frame {
+                        Frame::Command { target, setting } if target == own_addr => {
+                            match setting {
+                                Setting::HeartbeatIntervalSecs(secs) => {
+                                    heartbeat_period = (secs > 0).then(|| Duration::from_secs(secs as u64));
+                                    log::info!("heartbeat interval changed to {}s by command from {}", secs, pkt.src_addr);
+                                }
+                            }
+                            let ack = Frame::Ack { origin: own_addr, setting };
+                            if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
+                                log::error!("failed to ack command: {}", e);
+                            }
+                            broadcast(&clients, format!("CMDAPPLIED {:?}", setting));
+                        }
+                        Frame::Command { .. } => {
+                            // Not addressed to us and we don't relay yet — ignore.
+                        }
+                        Frame::Ack { origin, setting } => {
+                            let had = pending_commands.len();
+                            pending_commands.retain(|p| !(p.target == origin && p.setting == setting));
+                            if pending_commands.len() < had {
+                                log::info!("CMD to {} ({:?}) acked", origin, setting);
+                                broadcast(&clients, format!("CMDOK {} {}", origin, setting.encode()));
+                            }
                         }
                     }
                 }
@@ -628,6 +740,18 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
     if let Some(rest) = line.strip_prefix("ERR ") {
         return Some(StatusEvent::Err(rest.to_string()));
     }
+    if let Some(rest) = line.strip_prefix("CMDOK ") {
+        let mut parts = rest.splitn(2, ' ');
+        let target: u16 = parts.next()?.parse().ok()?;
+        let setting = Setting::parse(parts.next()?)?;
+        return Some(StatusEvent::CmdOk { target, setting });
+    }
+    if let Some(rest) = line.strip_prefix("CMDERR ") {
+        let mut parts = rest.splitn(2, ' ');
+        let target: u16 = parts.next()?.parse().ok()?;
+        let setting = Setting::parse(parts.next()?)?;
+        return Some(StatusEvent::CmdErr { target, setting });
+    }
     None
 }
 
@@ -651,6 +775,12 @@ impl Radio for SocketRadio {
     fn poll_status(&mut self) -> Vec<StatusEvent> {
         self.status_events.try_iter().collect()
     }
+
+    fn send_command(&mut self, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
+        writeln!(self.writer, "CMD {} {}", target, heartbeat_interval_secs)?;
+        self.writer.flush()?;
+        Ok(())
+    }
 }
 
 pub fn attach(socket_path: &str, addr: u16, dest: u16) -> Result<()> {
@@ -660,4 +790,57 @@ pub fn attach(socket_path: &str, addr: u16, dest: u16) -> Result<()> {
     let radio = SocketRadio::new(stream)?;
     let (_, si_rx) = std::sync::mpsc::channel();
     crate::ui::run_app("attached to daemon".to_string(), addr, dest, Box::new(radio), 0, si_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_status_line_cmdok() {
+        let evt = parse_status_line("CMDOK 5 hb_interval=30").unwrap();
+        match evt {
+            StatusEvent::CmdOk { target, setting } => {
+                assert_eq!(target, 5);
+                assert_eq!(setting, Setting::HeartbeatIntervalSecs(30));
+            }
+            _ => panic!("expected CmdOk"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_line_cmderr() {
+        let evt = parse_status_line("CMDERR 7 hb_interval=45").unwrap();
+        match evt {
+            StatusEvent::CmdErr { target, setting } => {
+                assert_eq!(target, 7);
+                assert_eq!(setting, Setting::HeartbeatIntervalSecs(45));
+            }
+            _ => panic!("expected CmdErr"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_line_still_handles_existing_events() {
+        assert!(matches!(parse_status_line("HB 3").unwrap(), StatusEvent::Heartbeat { dest: 3 }));
+        assert!(matches!(parse_status_line("ERR boom").unwrap(), StatusEvent::Err(m) if m == "boom"));
+        assert!(parse_status_line("garbage").is_none());
+    }
+
+    /// Real end-to-end check of the client -> daemon wire protocol for
+    /// commands: a SocketRadio wrapping one end of a real Unix socket pair
+    /// should write exactly "CMD <target> <secs>" to the other end when
+    /// send_command is called, since that's the line the daemon's
+    /// handle_client / run_daemon_loop parse to originate a command.
+    #[test]
+    fn test_socket_radio_send_command_writes_expected_line() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut radio = SocketRadio::new(a).unwrap();
+        radio.send_command(5, 30).unwrap();
+
+        let mut reader = BufReader::new(b);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "CMD 5 30");
+    }
 }

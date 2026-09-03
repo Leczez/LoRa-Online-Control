@@ -161,6 +161,16 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 ),
             ])
         }
+        LogEntry::CmdResult { timestamp, target, message, ok } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("CMD  {:5}  {}", target, message),
+                Style::default().fg(if *ok { Color::Green } else { Color::Red }),
+            ),
+        ]),
     }
 }
 
@@ -230,6 +240,24 @@ pub fn run_app(
                                         Err(_) => app.push_log(LogEntry::Error {
                                             timestamp: ts,
                                             message: format!("invalid address: {}", val.trim()),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/cmd ") {
+                                    let mut parts = val.trim().splitn(2, ' ');
+                                    let parsed = parts.next().zip(parts.next())
+                                        .and_then(|(t, s)| Some((t.parse::<u16>().ok()?, s.parse::<u32>().ok()?)));
+                                    match parsed {
+                                        Some((target, secs)) => match radio.send_command(target, secs) {
+                                            Ok(()) => app.push_log(LogEntry::Tx {
+                                                timestamp: ts,
+                                                dest_addr: target,
+                                                payload: format!("CMD hb_interval={}", secs),
+                                            }),
+                                            Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                        },
+                                        None => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /cmd <target-addr> <heartbeat-secs>".to_string(),
                                         }),
                                     }
                                 } else {
@@ -314,6 +342,22 @@ pub fn run_app(
                     }
                     crate::backend::StatusEvent::Err(message) => {
                         app.push_log(LogEntry::Error { timestamp: timestamp(), message });
+                    }
+                    crate::backend::StatusEvent::CmdOk { target, setting } => {
+                        app.push_log(LogEntry::CmdResult {
+                            timestamp: timestamp(),
+                            target,
+                            message: format!("acked: {}", setting.encode()),
+                            ok: true,
+                        });
+                    }
+                    crate::backend::StatusEvent::CmdErr { target, setting } => {
+                        app.push_log(LogEntry::CmdResult {
+                            timestamp: timestamp(),
+                            target,
+                            message: format!("no ack: {}", setting.encode()),
+                            ok: false,
+                        });
                     }
                 }
             }

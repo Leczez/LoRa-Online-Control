@@ -28,6 +28,12 @@ pub enum LogEntry {
         card_id: u32,
         punches: Vec<(u8, u32)>,  // (station, time_s)
     },
+    CmdResult {
+        timestamp: String,
+        target: u16,
+        message: String,
+        ok: bool,
+    },
 }
 
 pub struct App {
