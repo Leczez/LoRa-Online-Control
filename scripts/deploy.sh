@@ -69,6 +69,22 @@ sudo install -m 755 /tmp/lora-tui /usr/local/bin/lora-tui
 rm /tmp/lora-server /tmp/lora-tui
 echo "Binaries installed to /usr/local/bin/lora-server and /usr/local/bin/lora-tui"
 
+# A node deployed before the lora-cli -> lora-server rename has an old
+# lora-cli.service still enabled under its own unit name — a different
+# name means starting lora-server doesn't stop it, and both ends up
+# fighting over the same serial port / SPI bus / GPIO pins at once.
+if systemctl list-unit-files lora-cli.service &>/dev/null; then
+    echo "Found old lora-cli.service — stopping and disabling it"
+    sudo systemctl stop lora-cli || true
+    sudo systemctl disable lora-cli || true
+fi
+
+if [[ ! -f /etc/lora-server/env ]] && [[ -f /etc/lora-cli/env ]]; then
+    sudo mkdir -p /etc/lora-server
+    sudo cp /etc/lora-cli/env /etc/lora-server/env
+    echo "Migrated /etc/lora-cli/env -> /etc/lora-server/env"
+fi
+
 if [[ ! -f /etc/lora-server/env ]]; then
     sudo mkdir -p /etc/lora-server
     sudo tee /etc/lora-server/env > /dev/null <<'ENV'
