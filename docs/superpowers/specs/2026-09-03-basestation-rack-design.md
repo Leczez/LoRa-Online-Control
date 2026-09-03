@@ -37,22 +37,25 @@ cabinet.
 | Small display | 2U | No native 10" rack-mount monitor arm exists at this width — plan on a shelf + VESA bracket, or Velcro-mounting the display's own stand |
 | Dell OptiPlex Micro | 1U (shelf) | ~7"×7"×1.4" footprint sits comfortably on one vented shelf |
 | Raspberry Pi (+ LoRa module) | shares a shelf, or its own 1U tray | Keep the SPI/GPIO wiring to the RFM95W/SX1276 accessible — see §3 |
-| Network switch | 1U | Desktop-style switch on a shelf, unless a rack-eared 10" model is used |
+| Network switch | 1U (unconfirmed) | Model/size not chosen yet — see the open question below. A small desktop 5-8 port switch shares a shelf with the Pi; anything bigger needs its own U |
 | Power strip / PDU | 1U | Basic outlet strip is fine; a proper rack PDU with fusing if committing to rack-native gear throughout |
 
-Total: roughly **6U** of actively-mounted gear. **Decision: 6U rack**, since
-this is confirmed portable — a 9U's extra cable/airflow headroom isn't worth
-the added size and weight for something that gets packed up and carried
-between events. The tradeoff is that 6U is a near-exact fit against the
-table above, so two things keep it workable rather than cramped:
+Total: roughly **6U** of actively-mounted gear, **if** the switch is small
+enough to share a shelf with the Pi — not yet confirmed (no model has been
+picked). **Decision: 6U rack**, since this is confirmed portable — a 9U's
+extra cable/airflow headroom isn't worth the added size and weight for
+something that gets packed up and carried between events. The tradeoff is
+that 6U is a near-exact fit against the table above, so two things keep it
+workable rather than cramped:
 
-- **Combine the Pi and the switch on one shared 1U shelf** (both are small)
-  instead of giving each its own U — frees a full U back for cable slack
-  without losing anything, bringing the working total to 5U and leaving a
-  spare U in a 6U rack.
-- Keep an eye on component selection going forward (display bracket depth,
-  shelf choice) so nothing creeps past what's budgeted here — there's much
-  less slack to absorb a surprise than a 9U would have had.
+- **Combine the Pi and the switch on one shared 1U shelf, if the switch
+  turns out small enough** — frees a full U back for cable slack, bringing
+  the working total to 5U with a spare U in a 6U rack. If the switch you
+  pick doesn't fit alongside the Pi, this collapses back to a flat 6U with
+  no spare — still fits, but with zero slack for cabling.
+- Keep an eye on component selection going forward (switch model, display
+  bracket depth, shelf choice) so nothing creeps past what's budgeted here
+  — there's much less slack to absorb a surprise than a 9U would have had.
 
 The UPS/battery (§5) is not counted in the table — it's unlikely to fit
 rack-mounted at this width and is better placed at the base of, or beside,
@@ -118,11 +121,14 @@ backup buffer, per your "plan for both" answer:
   | Dell OptiPlex Micro | ~30–65W (check the specific model's PSU rating — commonly a 65W or 90W external brick) |
   | Raspberry Pi + LoRa module | ~5–10W |
   | Small display | ~10–25W (size/backlight dependent) |
-  | Network switch | ~5–10W |
+  | Network switch | ~5–10W (assumes small unmanaged, non-PoE — see open question) |
   | **Total** | **~60–110W continuous** |
 
   A mid-size UPS (600VA/~360W class) gives multi-hour ride-through margin
-  against this load for a mains blip — comfortable rather than tight.
+  against this load for a mains blip — comfortable rather than tight. If
+  the switch ends up being a PoE model (e.g. to power a PoE display or
+  camera), its draw could be 50-150W+ higher depending on PoE budget —
+  revisit this sizing once the switch is actually chosen.
 
 - **If off-grid ever becomes the actual primary supply** (not just a
   buffer), the same UPS/battery becomes the load-bearing power source
@@ -146,6 +152,9 @@ backup buffer, per your "plan for both" answer:
 
 ## 7. Open questions
 
+- **Switch model/size/PoE-or-not** — not chosen yet. Determines whether it
+  shares a shelf with the Pi (§2) or needs its own U, and whether its power
+  draw is the assumed ~5–10W or significantly more if it turns out to be PoE.
 - Exact display model/size — determines the mounting hardware and whether
   2U is enough.
 - OptiPlex Micro's actual PSU wattage (model-specific) — needed to finalize
