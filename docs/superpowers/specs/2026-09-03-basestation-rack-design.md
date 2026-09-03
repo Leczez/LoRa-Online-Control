@@ -40,10 +40,24 @@ cabinet.
 | Network switch | 1U | Desktop-style switch on a shelf, unless a rack-eared 10" model is used |
 | Power strip / PDU | 1U | Basic outlet strip is fine; a proper rack PDU with fusing if committing to rack-native gear throughout |
 
-Total: roughly **6U** of actively-mounted gear. A **9U** rack gives headroom
-for cable routing and airflow without being tight. The UPS/battery (§5) is
-not counted here — it's unlikely to fit rack-mounted at this width and is
-better placed at the base of, or beside, the rack.
+Total: roughly **6U** of actively-mounted gear. **Decision: 6U rack**, since
+this is confirmed portable — a 9U's extra cable/airflow headroom isn't worth
+the added size and weight for something that gets packed up and carried
+between events. The tradeoff is that 6U is a near-exact fit against the
+table above, so two things keep it workable rather than cramped:
+
+- **Combine the Pi and the switch on one shared 1U shelf** (both are small)
+  instead of giving each its own U — frees a full U back for cable slack
+  without losing anything, bringing the working total to 5U and leaving a
+  spare U in a 6U rack.
+- Keep an eye on component selection going forward (display bracket depth,
+  shelf choice) so nothing creeps past what's budgeted here — there's much
+  less slack to absorb a surprise than a 9U would have had.
+
+The UPS/battery (§5) is not counted in the table — it's unlikely to fit
+rack-mounted at this width and is better placed at the base of, or beside,
+the rack (which also keeps it out of the U budget entirely, portable or
+not).
 
 ## 3. Mounting non-rack-native gear
 
@@ -61,6 +75,16 @@ rack-mount. Plan:
   a nearby window) — an enclosed metal rack is exactly the kind of RF
   shielding that would undo all the range work already put into the SF/BW
   choice.
+- **Since this rack is portable and gets repeatedly packed/transported**,
+  fasten everything with screws rather than Velcro/friction alone — the
+  OptiPlex's VESA plate and the Pi's case mounting holes both support this
+  already, so it costs nothing beyond using the mounting points that exist.
+  Vibration during transit is what turns a friction-mounted device into a
+  loose one after a few trips, not normal use at the venue.
+- Favor an **enclosed rack case with a lid** over an open-frame rack, given
+  the transport pattern — it protects the gear (and the cabling) during
+  loading/unloading and the drive between events, which an open frame does
+  nothing for.
 
 ## 4. Networking
 
@@ -129,6 +153,3 @@ backup buffer, per your "plan for both" answer:
 - Whether "off-grid" is ever the *real* primary scenario for a venue this
   rack goes to, since that reshapes the power section's sizing math (see
   §5's last point).
-- Transport pattern: does this rack get packed/unpacked repeatedly between
-  events, or live semi-permanently in one place? Decides whether an
-  enclosed rack case is worth the cost over an open-frame one.
