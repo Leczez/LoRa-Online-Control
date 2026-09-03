@@ -1,7 +1,7 @@
 // roc-server/src/store.rs
 //
-// Persisted log of punches received from one or more lora-cli daemons. This
-// is a separate store from lora-cli's own punch_buffer — that one tracks
+// Persisted log of punches received from one or more lora-server daemons.
+// This is a separate store from lora-server's own punch_buffer — that one tracks
 // "has this been pushed to us yet", this one tracks "has MIP/ROC clients
 // already seen this" (its own incrementing id space, its own file).
 

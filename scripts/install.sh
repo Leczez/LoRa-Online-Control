@@ -10,16 +10,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 
-echo "Building lora-cli (desktop)..."
+echo "Building lora-server and lora-tui (desktop)..."
 # The rpi feature (rppal GPIO) is opt-in; the default build is the desktop variant.
 cd "$WORKSPACE_ROOT"
-cargo build --release -p lora-cli
+cargo build --release -p lora-server
 
 mkdir -p "$HOME/.local/bin"
-cp "$TARGET_DIR/release/lora-cli" "$HOME/.local/bin/lora-cli.tmp"
-mv "$HOME/.local/bin/lora-cli.tmp" "$HOME/.local/bin/lora-cli"
-chmod +x "$HOME/.local/bin/lora-cli"
-echo "Installed to $HOME/.local/bin/lora-cli"
+for bin in lora-server lora-tui; do
+    cp "$TARGET_DIR/release/$bin" "$HOME/.local/bin/$bin.tmp"
+    mv "$HOME/.local/bin/$bin.tmp" "$HOME/.local/bin/$bin"
+    chmod +x "$HOME/.local/bin/$bin"
+    echo "Installed to $HOME/.local/bin/$bin"
+done
 
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     echo "warning: $HOME/.local/bin is not in your PATH."

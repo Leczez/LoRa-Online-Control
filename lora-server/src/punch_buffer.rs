@@ -1,4 +1,4 @@
-// lora-cli/src/punch_buffer.rs
+// lora-server/src/punch_buffer.rs
 //
 // Persistent (disk-backed) buffer of punches, so a network outage between
 // this daemon and the remote roc/mip output server never loses data — a

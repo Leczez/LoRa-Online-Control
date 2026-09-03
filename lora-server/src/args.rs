@@ -1,14 +1,7 @@
-mod app;
-mod backend;
-mod punch_buffer;
-mod pusher;
-mod sportident;
-mod ui;
-
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "lora-cli", about = "Interactive LoRa terminal")]
+#[command(name = "lora-server", about = "LoRa daemon: radio I/O, SportIdent reading, punch buffering")]
 pub struct Args {
     /// Serial port path (e.g. /dev/ttyS0 or /dev/ttyUSB0). Required unless --radio spi.
     #[arg(long, env = "LORA_PORT")]
@@ -70,20 +63,16 @@ pub struct Args {
     #[arg(long, env = "LORA_HEARTBEAT_INTERVAL", default_value_t = 60)]
     pub heartbeat_interval: u64,
 
-    /// Unix socket path used by the daemon
-    #[arg(long, default_value = "/run/lora-cli/control.sock")]
+    /// Unix socket path this daemon binds, for lora-tui (or other clients) to attach to.
+    #[arg(long, default_value = "/run/lora-server/control.sock")]
     pub socket: String,
-
-    /// Attach to a running daemon instead of starting one
-    #[arg(long)]
-    pub attach: bool,
 
     /// Path to the persistent punch buffer (SQLite). Every punch, local or
     /// remote, is recorded here before anything else happens to it.
-    #[arg(long, env = "LORA_PUNCH_DB", default_value = "/var/lib/lora-cli/punches.db")]
+    #[arg(long, env = "LORA_PUNCH_DB", default_value = "/var/lib/lora-server/punches.db")]
     pub punch_db: String,
 
-    /// URL of the remote roc/mip output server's ingestion endpoint (e.g.
+    /// URL of the remote roc-server's ingestion endpoint (e.g.
     /// http://100.x.y.z:8080/punches). If unset, punches are still buffered
     /// locally but never pushed anywhere.
     #[arg(long, env = "LORA_PUSH_TO")]
@@ -92,55 +81,4 @@ pub struct Args {
     /// How often the background pusher checks the buffer for unsent punches.
     #[arg(long, env = "LORA_PUSH_INTERVAL_SECS", default_value_t = 10)]
     pub push_interval_secs: u64,
-}
-
-fn load_env_file(path: &str) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, val)) = line.split_once('=') {
-                let key = key.trim();
-                let val = val.trim();
-                if std::env::var(key).is_err() {
-                    unsafe { std::env::set_var(key, val) };
-                }
-            }
-        }
-    }
-}
-
-fn main() -> anyhow::Result<()> {
-    load_env_file("/etc/lora-cli/env");
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .format_timestamp(None)
-        .init();
-
-    let args = Args::parse();
-
-    if args.attach {
-        return backend::attach(&args.socket, args.addr, args.dest);
-    }
-
-    if args.radio != "spi" && args.port.is_none() {
-        anyhow::bail!("--port is required unless --radio spi or --attach");
-    }
-
-    if args.radio == "spi" {
-        log::info!(
-            "starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
-            args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
-        );
-    } else {
-        log::info!(
-            "starting on port {} addr {} dest {} freq {}MHz air_speed {}bps heartbeat {}s",
-            args.port.as_deref().unwrap_or(""),
-            args.addr, args.dest, args.freq, args.air_speed, args.heartbeat_interval
-        );
-    }
-    backend::run(args)
 }

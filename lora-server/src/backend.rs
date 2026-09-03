@@ -182,7 +182,7 @@ pub fn run(args: Args) -> Result<()> {
         #[cfg(feature = "rpi")]
         return run_spi(args);
         #[cfg(not(feature = "rpi"))]
-        anyhow::bail!("--radio spi requires building lora-cli with the `rpi` feature");
+        anyhow::bail!("--radio spi requires building lora-server with the `rpi` feature");
     }
 
     let config = build_config(&args)?;

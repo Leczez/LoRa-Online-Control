@@ -1,4 +1,4 @@
-// lora-cli/src/ui.rs
+// lora-server/src/ui.rs
 
 use std::time::{Duration, Instant};
 use crossterm::{

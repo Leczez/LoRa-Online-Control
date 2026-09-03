@@ -1,4 +1,4 @@
-// lora-cli/src/pusher.rs
+// lora-server/src/pusher.rs
 //
 // Background thread that drains the persistent punch buffer to the remote
 // roc/mip output server whenever it's reachable. Runs independently of LoRa

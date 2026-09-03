@@ -46,30 +46,34 @@ else
     echo "Detected: Linux device ($REMOTE_ARCH) → $RUST_TARGET"
 fi
 
-echo "Cross-compiling lora-cli..."
+echo "Cross-compiling lora-server (daemon) and lora-tui (attach client)..."
 cd "$WORKSPACE_ROOT"
 # shellcheck disable=SC2086
-cross build --release -p lora-cli $FEATURES --target "$RUST_TARGET"
+cross build --release -p lora-server $FEATURES --target "$RUST_TARGET"
 
-BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-cli"
-[[ -f "$BINARY" ]] || { echo "error: expected binary not found at $BINARY" >&2; exit 1; }
+SERVER_BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-server"
+TUI_BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-tui"
+[[ -f "$SERVER_BINARY" ]] || { echo "error: expected binary not found at $SERVER_BINARY" >&2; exit 1; }
+[[ -f "$TUI_BINARY" ]] || { echo "error: expected binary not found at $TUI_BINARY" >&2; exit 1; }
 
-echo "Copying binary to $TARGET_HOST..."
-scp "$BINARY" "$TARGET_HOST:/tmp/lora-cli"
+echo "Copying binaries to $TARGET_HOST..."
+scp "$SERVER_BINARY" "$TARGET_HOST:/tmp/lora-server"
+scp "$TUI_BINARY" "$TARGET_HOST:/tmp/lora-tui"
 
 echo "Installing on remote..."
 ssh "$TARGET_HOST" bash <<'REMOTE'
 set -euo pipefail
 
-sudo install -m 755 /tmp/lora-cli /usr/local/bin/lora-cli
-rm /tmp/lora-cli
-echo "Binary installed to /usr/local/bin/lora-cli"
+sudo install -m 755 /tmp/lora-server /usr/local/bin/lora-server
+sudo install -m 755 /tmp/lora-tui /usr/local/bin/lora-tui
+rm /tmp/lora-server /tmp/lora-tui
+echo "Binaries installed to /usr/local/bin/lora-server and /usr/local/bin/lora-tui"
 
-if [[ ! -f /etc/lora-cli/env ]]; then
-    sudo mkdir -p /etc/lora-cli
-    sudo tee /etc/lora-cli/env > /dev/null <<'ENV'
-# LoRa CLI configuration
-# Edit these values then: sudo systemctl restart lora-cli
+if [[ ! -f /etc/lora-server/env ]]; then
+    sudo mkdir -p /etc/lora-server
+    sudo tee /etc/lora-server/env > /dev/null <<'ENV'
+# lora-server configuration
+# Edit these values then: sudo systemctl restart lora-server
 LORA_PORT=/dev/ttyS0
 LORA_FREQ=433
 LORA_AIR_SPEED=1200
@@ -80,24 +84,24 @@ LORA_HEARTBEAT_INTERVAL=60
 LORA_M0_PIN=22
 LORA_M1_PIN=27
 ENV
-    echo "Created /etc/lora-cli/env (edit to configure)"
+    echo "Created /etc/lora-server/env (edit to configure)"
 else
-    echo "Preserved existing /etc/lora-cli/env"
+    echo "Preserved existing /etc/lora-server/env"
 fi
 
 # The systemd unit's ExecStart depends on which radio transport this env file
 # configures — regenerating the wrong template would silently switch a node
 # using --radio spi back to the UART/HAT flag set (or vice versa).
-if grep -q '^LORA_RADIO=spi' /etc/lora-cli/env; then
-    sudo tee /etc/systemd/system/lora-cli.service > /dev/null <<'SERVICE'
+if grep -q '^LORA_RADIO=spi' /etc/lora-server/env; then
+    sudo tee /etc/systemd/system/lora-server.service > /dev/null <<'SERVICE'
 [Unit]
-Description=LoRa CLI
+Description=lora-server (LoRa daemon)
 After=multi-user.target
 
 [Service]
-RuntimeDirectory=lora-cli
-EnvironmentFile=/etc/lora-cli/env
-ExecStart=/usr/local/bin/lora-cli \
+RuntimeDirectory=lora-server
+EnvironmentFile=/etc/lora-server/env
+ExecStart=/usr/local/bin/lora-server \
   --radio ${LORA_RADIO} --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
@@ -111,15 +115,15 @@ RestartSec=5
 WantedBy=multi-user.target
 SERVICE
 else
-    sudo tee /etc/systemd/system/lora-cli.service > /dev/null <<'SERVICE'
+    sudo tee /etc/systemd/system/lora-server.service > /dev/null <<'SERVICE'
 [Unit]
-Description=LoRa CLI
+Description=lora-server (LoRa daemon)
 After=multi-user.target
 
 [Service]
-RuntimeDirectory=lora-cli
-EnvironmentFile=/etc/lora-cli/env
-ExecStart=/usr/local/bin/lora-cli \
+RuntimeDirectory=lora-server
+EnvironmentFile=/etc/lora-server/env
+ExecStart=/usr/local/bin/lora-server \
   --port ${LORA_PORT} --freq ${LORA_FREQ} --air-speed ${LORA_AIR_SPEED} \
   --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
   --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} \
@@ -135,16 +139,16 @@ SERVICE
 fi
 
 sudo systemctl daemon-reload
-sudo systemctl enable lora-cli
-sudo systemctl restart lora-cli
-echo "lora-cli service enabled and started"
+sudo systemctl enable lora-server
+sudo systemctl restart lora-server
+echo "lora-server service enabled and started"
 REMOTE
 
 echo ""
 echo "Deploy complete!"
-echo "  Binary:  /usr/local/bin/lora-cli"
-echo "  Config:  /etc/lora-cli/env  (edit on device, then: sudo systemctl restart lora-cli)"
-echo "  Service: sudo systemctl {start,stop,status} lora-cli"
+echo "  Binaries: /usr/local/bin/lora-server, /usr/local/bin/lora-tui"
+echo "  Config:   /etc/lora-server/env  (edit on device, then: sudo systemctl restart lora-server)"
+echo "  Service:  sudo systemctl {start,stop,status} lora-server"
 echo ""
-echo "  To use interactively over SSH:"
-echo "    ssh $TARGET_HOST 'sudo systemctl stop lora-cli && lora-cli'"
+echo "  To watch live traffic without stopping the service:"
+echo "    ssh $TARGET_HOST 'lora-tui'"
