@@ -1,0 +1,13 @@
+services:
+  roc-server:
+    build:
+      context: ..
+      dockerfile: roc-server/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - roc-server-data:/data
+    restart: unless-stopped
+
+volumes:
+  roc-server-data:
