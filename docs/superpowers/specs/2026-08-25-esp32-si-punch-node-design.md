@@ -7,7 +7,7 @@
 **Goal:** Field units (ESP32-S3 + RFM95W) read punches from a USB-connected SportIdent master station and relay them over LoRa directly to the RPi's existing E22 module, for start/check control points that can't run a wired PC.
 
 **In scope:**
-- New `sportident-proto` shared crate: protocol parsing extracted from `lora-cli/src/sportident.rs`, `no_std`-compatible, used by both the RPi CLI and the ESP32 firmware.
+- New `sportident-proto` shared crate: protocol parsing extracted from `lora-server/src/sportident.rs`, `no_std`-compatible, used by both the RPi daemon (`lora-server`) and the ESP32 firmware.
 - New `sx127x` driver crate for the RFM95W/SX1276, styled like the existing `sx126x` crate (`no_std`, generic over `embedded-hal`).
 - New ESP32-S3 firmware binary: USB-host reads the SI master, forwards punches over LoRa.
 - RPi-side change: recognize incoming `PUNCH ...` payloads from remote nodes and render them the same way local punches already are (`LogEntry::SiPunch`), instead of as generic RX text.
@@ -36,7 +36,7 @@
                                  ▼
                    E22-400T22S1B (SX1268, on RPi)
                                  │ UART
-                          lora-cli daemon
+                          lora-server daemon
                        (existing Sx126xUart driver)
                                  │
                     parses "PUNCH ..." RX payloads →
@@ -46,13 +46,13 @@
 
 **Components:**
 
-1. **`sportident-proto`** (new crate, `no_std`) — CRC16, packet framing, `parse_si9`/`parse_card_data`, `ControlPunch`/`CardReadout` types, `CardReadout::to_payload()`. Pulled out of today's `lora-cli/src/sportident.rs`. No transport code lives here — that stays per-platform (`serialport` on the RPi/desktop side, ESP-IDF `usb_host` CDC-ACM on the ESP32 side).
+1. **`sportident-proto`** (new crate, `no_std`) — CRC16, packet framing, `parse_si9`/`parse_card_data`, `ControlPunch`/`CardReadout` types, `CardReadout::to_payload()`. Pulled out of today's `lora-server/src/sportident.rs`. No transport code lives here — that stays per-platform (`serialport` on the RPi/desktop side, ESP-IDF `usb_host` CDC-ACM on the ESP32 side).
 
 2. **`sx127x`** (new crate, `no_std`, generic over `embedded-hal` SPI) — minimal SX1276 driver: register setup for a given SF/BW/CR/sync-word/preamble, TX, RX, and the addressing/framing needed to match the E22's over-the-air format once that's pinned down by the spike. Mirrors `sx126x`'s shape (a `Config`, a transport struct, a `LoraRadio`-compatible interface).
 
 3. **ESP32-S3 firmware** (new binary crate, `esp-idf-hal`, std Rust) — a USB-host worker thread (FFI bindings to ESP-IDF's `usb_host`/CDC-ACM component) reads the SI master and feeds `sportident-proto`'s parser, producing `CardReadout`s over a channel; the main loop drains the channel and transmits each one via `sx127x`. Structurally mirrors `spawn_si_worker()` in today's `sportident.rs` — same shape, different transport underneath.
 
-4. **`lora-cli` (RPi) changes** — in `backend.rs`'s `run_daemon_loop` and `ui.rs`'s RX handling, when an incoming packet's payload starts with `PUNCH `, parse it into the same `LogEntry::SiPunch` used for locally-read punches instead of a generic RX log line.
+4. **`lora-server` (RPi) changes** — in `backend.rs`'s `run_daemon_loop` and `ui.rs`'s RX handling, when an incoming packet's payload starts with `PUNCH `, parse it into the same `LogEntry::SiPunch` used for locally-read punches instead of a generic RX log line.
 
 5. **Config mode** — gated by a physical switch on a GPIO pin, checked once at boot:
    - **Switch off (normal):** boots straight into the USB-host + LoRa relay loop (component 3). No Wi-Fi radio ever powers on.
