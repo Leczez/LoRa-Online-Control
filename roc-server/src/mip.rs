@@ -1,4 +1,4 @@
-// lora-output/src/mip.rs
+// roc-server/src/mip.rs
 //
 // MeOS Info Protocol (MIP) output: MEOS polls us with a LastId it has
 // already consumed, we hand back everything newer as `<MIPData>` XML.

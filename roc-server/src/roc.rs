@@ -1,4 +1,4 @@
-// lora-output/src/roc.rs
+// roc-server/src/roc.rs
 //
 // ROC (Radio Online Control) output: a simple polled, semicolon-delimited
 // text format — `id;control;card;timestamp` per line, oldest first.

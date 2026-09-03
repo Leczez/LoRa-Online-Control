@@ -11,14 +11,14 @@ use tiny_http::{Header, Method, Response, Server};
 use store::Store;
 
 #[derive(Parser, Debug)]
-#[command(name = "lora-output", about = "MIP/ROC output server for buffered LoRa punches")]
+#[command(name = "roc-server", about = "MIP/ROC output server for buffered LoRa punches")]
 struct Args {
     /// Address:port to listen on.
-    #[arg(long, env = "LORA_OUTPUT_LISTEN", default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "ROC_SERVER_LISTEN", default_value = "0.0.0.0:8080")]
     listen: String,
 
     /// Path to this server's own SQLite punch log.
-    #[arg(long, env = "LORA_OUTPUT_DB", default_value = "/var/lib/lora-output/punches.db")]
+    #[arg(long, env = "ROC_SERVER_DB", default_value = "/var/lib/roc-server/punches.db")]
     db: String,
 }
 
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     }
     let store = Arc::new(Store::open(&args.db)?);
 
-    log::info!("lora-output listening on {} (db {})", args.listen, args.db);
+    log::info!("roc-server listening on {} (db {})", args.listen, args.db);
     let server = Server::http(&args.listen).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for mut request in server.incoming_requests() {

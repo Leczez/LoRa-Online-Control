@@ -1,4 +1,4 @@
-// lora-output/src/store.rs
+// roc-server/src/store.rs
 //
 // Persisted log of punches received from one or more lora-cli daemons. This
 // is a separate store from lora-cli's own punch_buffer — that one tracks
