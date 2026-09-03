@@ -13,10 +13,11 @@
 - RPi-side change: recognize incoming `PUNCH ...` payloads from remote nodes and render them the same way local punches already are (`LogEntry::SiPunch`), instead of as generic RX text.
 - Multiple simultaneous field nodes, each with a distinct LoRa address.
 - Field-editable node address/dest/channel via a switch-gated Wi-Fi config page (no reflashing).
+- A small I2C OLED status display — link/RSSI, SI reader connected/not, last punch sent, node address — so a technician can verify a control point is working without a laptop.
 
 **Out of scope for this design:**
 - The SF/BW/CR + over-the-air frame format discovery spike itself — exploratory work, not something to design up front. It's an early task in the implementation plan, with a documented fallback (section 4) if it doesn't pan out.
-- Battery/power management beyond the Wi-Fi-off-by-default switch (no deep sleep / WOR mode) — treating this as "on for the duration of an event," same as how SI stations are used today.
+- Battery/power management beyond the Wi-Fi-off-by-default switch (no deep sleep / WOR mode) — treating this as "on for the duration of an event," same as how SI stations are used today. The OLED fits this model too: no dedicated sleep scheduling, just dim/blank it between state changes rather than refreshing continuously (see component 6).
 - Forwarding punches onward from the RPi to Tävlingsarenan/ROC — that's already the daemon's existing broadcast mechanism; no new work implied here.
 
 ## 2. Architecture & components
@@ -55,8 +56,11 @@
 
 5. **Config mode** — gated by a physical switch on a GPIO pin, checked once at boot:
    - **Switch off (normal):** boots straight into the USB-host + LoRa relay loop (component 3). No Wi-Fi radio ever powers on.
-   - **Switch on (config):** skips normal operation entirely, starts a Wi-Fi AP + a minimal web page (addr/dest/channel fields), saves to NVS (ESP-IDF's flash key-value store) on submit. Node needs a reboot (or a "restart" button on the page) to pick up new values and re-enter normal mode.
+   - **Switch on (config):** skips normal operation entirely, starts a Wi-Fi AP + a minimal web page (addr/dest/channel fields), saves to NVS (ESP-IDF's flash key-value store) on submit. Node needs a reboot (or a "restart" button on the page) to pick up new values and re-enter normal mode. The OLED (component 6) shows the AP's SSID/IP while in this mode, so no second device is needed just to find it.
    - Firmware reads `addr`/`dest`/`channel` from NVS at boot in the normal path, falling back to sane defaults if unset (first boot).
+
+6. **OLED status display** (new, small I2C SSD1306-class 0.96" panel) — shows, in normal operation: LoRa link status (last successful send/ack, RSSI to the base station), whether the SI master is currently connected over USB, the node's own address, and a brief "card `<id>` sent" confirmation on each punch. In config mode, shows the Wi-Fi AP's SSID/IP instead (see component 5). Not continuously redrawn — updates only on state change and otherwise sits static (the SSD1306 controller's own sleep mode can blank it between updates), keeping its contribution close to its active-draw figure rather than that figure held indefinitely.
+   - **Power cost:** roughly 10–20mA while actively displaying content, under 1mA in the controller's sleep mode. Against an estimated ~150–250mA average for the ESP32-S3 + RFM95W node itself (USB host running, LoRa mostly idle/RX with occasional TX bursts at SF11/12), this is a ~5–10% addition to the power budget — small against the "on for the duration of an event" model already adopted for the node as a whole, not something that changes the event-length battery math meaningfully.
 
 ## 3. Data flow & addressing
 
@@ -93,4 +97,4 @@ This is empirical work: configure a real E22 in receive mode, transmit known raw
 - `sportident-proto`: pure unit tests for CRC16/framing/`parse_si9`, ported over during extraction — no hardware needed, matches the existing testing style already in this repo.
 - `sx127x`: pure register-encoding unit tests mirroring `sx126x/src/config.rs`'s style. Actual on-air interoperability can only be verified with two real radios — that's what the spike itself is for.
 - RPi-side `PUNCH`-payload parsing (`backend.rs`/`ui.rs`): extracted into a small testable function, unit tested the same way.
-- ESP32 firmware, Wi-Fi config page, USB-host+SI-master integration: no automated tests — verified on real hardware, consistent with this project's existing "CLI/TUI has no automated tests, verified by running on real hardware" precedent.
+- ESP32 firmware, Wi-Fi config page, USB-host+SI-master integration, OLED display: no automated tests — verified on real hardware, consistent with this project's existing "CLI/TUI has no automated tests, verified by running on real hardware" precedent.
