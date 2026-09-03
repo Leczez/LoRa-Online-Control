@@ -6,7 +6,56 @@ The purpose of this protocol is to send the SPORTident punches from a SPORTident
 ## Protocol Structure
 - Packets should have some form of crc or identifier to make sure that the data received is from one of our own nodes and the data is correct.
 - Heartbeat data should be sent to make sure that the receiver knows that the node is alive, together with the voltage of the battery of the node if it has one and other status data that could be necessary.
-- The address  of the node should match the number that the SPORTident unit is programmed with.
+
+## Addressing
+
+The LoRa node address and the SPORTident control/station number are two
+separate things, not one:
+
+- **LoRa node address** — a small integer, unique per physical device,
+  assigned at commissioning (or derived from the device's hardware chip ID).
+  Used for addressing on the radio link itself: which node a command packet
+  targets, which node's traffic the base station is looking at.
+- **SI station/control number** — the control code the SI unit is
+  programmed with. Carried as payload data (punches already encode which
+  station a punch belongs to; heartbeats should too), never as the LoRa
+  address.
+
+This split matters for a real deployment pattern: some controls run two
+independent SI masters programmed with the *same* control number for
+redundancy (e.g. a remote or high-traffic control). If the LoRa address
+were tied to the station number, both nodes would collide on one address
+and the base station could never single one out for a command. With the
+split, both nodes get distinct LoRa addresses and both report the same
+station number in their payloads — the base station sees "node 5 → control
+31 (primary)" and "node 6 → control 31 (backup)" as clearly separate.
+
+Including each node's hardware chip ID in heartbeats and a commissioning/
+join packet (rather than on every packet, to save airtime) lets the base
+station detect a genuinely dangerous failure mode: two nodes accidentally
+sharing a LoRa address, which would otherwise be silently ambiguous.
+
+## Command Packets
+
+The base station needs a way to change limited settings on a deployed node
+(heartbeat interval, TX power) without physically hiking back out to it.
+This is a new **downlink** direction — everything else in this protocol is
+uplink (node → base station) — addressed to one node's LoRa address at a
+time, matching the addressing scheme above.
+
+- **Half-duplex constraint.** These radios can't transmit and receive
+  simultaneously, so a node can't be commanded mid-transmit. A node opens a
+  short listen window after each uplink send (heartbeat or punch) to check
+  for a pending command before returning to its normal receive/sleep cycle.
+- **Acknowledge before applying.** The base station doesn't consider a
+  command delivered until the node acks it; LoRa drops packets, so a
+  command with no ack gets retried, not assumed to have landed.
+- **Scope stays narrow.** Only settings that can't strand the node are
+  remotely changeable — heartbeat interval, TX power. Anything that
+  affects the radio link itself (spreading factor, bandwidth, frequency)
+  is out of scope for remote command: a bad change can leave a node unable
+  to ever hear the "undo" instruction, and it can only be fixed by physical
+  access again. Those settings stay commissioning-time only.
 
 ## RF Parameters
 
