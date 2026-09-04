@@ -37,7 +37,7 @@ cabinet.
 | Small display | 2U | No native 10" rack-mount monitor arm exists at this width — plan on a shelf + VESA bracket, or Velcro-mounting the display's own stand |
 | Dell OptiPlex Micro | 1U (shelf) | ~7"×7"×1.4" footprint sits comfortably on one vented shelf |
 | Raspberry Pi (+ LoRa module) | shares a shelf, or its own 1U tray | Keep the SPI/GPIO wiring to the RFM95W/SX1276 accessible — see §3 |
-| Network switch | shares the Pi's shelf | Reusing an existing Netgear switch — confirmed small enough for a 10" rack |
+| Network switch | shares the Pi's shelf | Reusing an existing metal-cased Netgear switch, estimated ~15cm (~5.9") wide — comfortable margin against the rack's ~25.4cm (10") internal width, confirmed to fit alongside the Pi |
 | Power strip / PDU | 1U | Basic outlet strip is fine; a proper rack PDU with fusing if committing to rack-native gear throughout |
 
 Total: roughly **5U** of actively-mounted gear (display 2U, OptiPlex 1U
