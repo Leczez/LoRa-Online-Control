@@ -72,6 +72,25 @@ rack-mount. Plan:
   a nearby window) — an enclosed metal rack is exactly the kind of RF
   shielding that would undo all the range work already put into the SF/BW
   choice.
+- **Antenna panel mount:** the RFM95W/SX1276's on-board u.FL connector isn't
+  meant for repeated mating or panel use, so route it out via a single
+  integrated **u.FL-to-SMA-female bulkhead pigtail** (u.FL end plugs into
+  the module; the SMA-female end *is* the panel-mount bulkhead — one part,
+  not a separate adapter plus a separate cable), through a drilled hole in
+  a flat area of the case top clear of the rails/lid. The antenna's own
+  connector then screws directly onto that external SMA-female thread.
+  **Confirm the antenna is standard SMA and not RP-SMA** (reverse-polarity,
+  common on WiFi gear, looks identical but won't mate) before ordering.
+- **If the antenna needs to sit further away** (e.g. mast-mounted for
+  height/line-of-sight over terrain — usually worth the tradeoff below),
+  don't extend with the same thin coax the pigtail uses: cheap RG174-class
+  cable loses ~0.5–0.8dB/m at 433MHz, so 5m would cost 2.5–4dB of the link
+  budget the SF11/12 choice was tuned to maximize. Use **LMR-400** instead
+  (~0.13dB/m at 433MHz, so ~0.7dB over 5m) or **LMR-240** as a thinner/
+  cheaper middle ground (~0.35dB/m, ~1.7dB over 5m), run as a separate
+  cable from the bulkhead to the antenna. Gender note: this cable needs to
+  be **SMA-male (into the bulkhead) to SMA-female (accepting the antenna's
+  plug)**, not male-to-male.
 - **Since this rack is portable and gets repeatedly packed/transported**,
   fasten everything with screws rather than Velcro/friction alone — the
   OptiPlex's VESA plate and the Pi's case mounting holes both support this
