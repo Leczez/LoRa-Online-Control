@@ -95,33 +95,36 @@ send, or a packet arrives that isn't addressed to it but matches its
 configured forwarding rule, and it re-transmits that packet on its own next
 uplink turn.
 
-- **Origin address travels in the payload, not just the radio header —
-  implemented for punches.** The radio-layer address on each hop is only
-  the *next hop*, so after one or more relay hops `pkt.src_addr` is the
-  last relay, not the punching node. `PUNCH <origin> <card_id> ...` now
-  carries the originating node's address explicitly (`CardReadout::
-  to_payload`/`parse_payload` in `sportident.rs`), so the same parsing path
-  handles direct and relayed traffic identically, with no special-casing —
-  and `PunchAck` carries the origin too, so an ack can be relayed back
-  toward it just as the punch was relayed forward. **Heartbeats don't carry
-  an origin field yet** — only punch traffic relays for now.
+- **Origin/commander address travels in the payload, not just the radio
+  header — implemented for punches and commands.** The radio-layer address
+  on each hop is only the *next hop*, so after one or more relay hops
+  `pkt.src_addr` is the last relay, not the original node. `PUNCH <origin>
+  <card_id> ...` carries the punching node's address explicitly
+  (`CardReadout::to_payload`/`parse_payload` in `sportident.rs`), and
+  `Command`/`Ack` carry a `commander` field the same way, so the same
+  parsing path handles direct and relayed traffic identically, with no
+  special-casing, and both `PunchAck` and a command's `Ack` can be relayed
+  back toward whoever they're ultimately for. **Heartbeats don't carry an
+  origin field yet** — only punch and command traffic relays for now.
 - **A relay is enabled with `--relay`; forwarding is best-effort, not
-  itself retried at the relay hop.** A relay node re-transmits a punch (or
-  an ack addressed elsewhere) unchanged toward its own `--dest` (uplink) or
-  toward the named target directly (downlink), without tracking or
-  retrying that specific hop. Reliability still comes from the end-to-end
-  stop-and-wait between the original sender and the final consumer — a
-  dropped relay hop just means the sender's own retry (see "Punch
-  Delivery" above) resends the punch, which gets relayed again.
+  itself retried at the relay hop.** A relay node re-transmits a punch/
+  command (or an ack addressed elsewhere) unchanged toward its own
+  `--dest` (uplink) or toward the named target/commander directly
+  (downlink), without tracking or retrying that specific hop. Reliability
+  still comes from the end-to-end stop-and-wait between the original
+  sender and the final consumer (punches) or the bounded retry the
+  original commander already runs (commands) — a dropped relay hop just
+  means that existing retry fires again, and gets relayed again.
+- **Commanding a node other than your current `--dest` now needs a
+  `SET_DEST` first.** Command frames route to `--dest` (this node's own
+  next hop) rather than straight to the named target, exactly like uplink
+  punch traffic already does — that's what makes relaying possible, and it
+  makes `CMD` consistent with the existing `SEND` socket command instead of
+  being the one exception that assumed direct reach.
 - **Hop-count/TTL is not implemented yet.** Still worth adding as cheap
   insurance against a future misconfigured relay loop, but the current
   fixed, hand-configured topology doesn't need it to function correctly
   today — tracked as a follow-up, not a blocker.
-- **Command packets don't relay yet.** Unlike punches, `Command`/`Ack`
-  don't carry an origin-commander field — only "who's confirming," not
-  "who originally asked" — so a relay can't yet forward a command's ack
-  back to the right place. Extending that pair the same way `PUNCH`/
-  `PunchAck` were extended is the natural next step when this is needed.
 - **Dual-role nodes share one airtime/duty-cycle budget.** A node that is
   both a control point and a relay is carrying its own traffic plus
   whatever it forwards on the same radio, same duty-cycle allowance, same

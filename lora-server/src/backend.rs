@@ -61,13 +61,14 @@ pub trait Radio: Send {
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
     fn poll_status(&mut self) -> Vec<StatusEvent> { Vec::new() }
 
-    /// Ask the node at `target` to change its heartbeat interval. Direct
-    /// hardware backends send this as a single, untracked frame — a human
-    /// watching the TUI can retry manually if no ack shows up. The daemon's
-    /// SocketRadio instead hands this off to the daemon itself, which owns
-    /// retry-with-ack tracking (see run_daemon_loop).
-    fn send_command(&mut self, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
-        let frame = Frame::Command { target, setting: Setting::HeartbeatIntervalSecs(heartbeat_interval_secs) };
+    /// Ask the node at `target` to change its heartbeat interval, as
+    /// `commander` (this node's own address). Direct hardware backends send
+    /// this as a single, untracked frame — a human watching the TUI can
+    /// retry manually if no ack shows up. The daemon's SocketRadio instead
+    /// hands this off to the daemon itself, which owns retry-with-ack
+    /// tracking (see run_daemon_loop).
+    fn send_command(&mut self, commander: u16, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
+        let frame = Frame::Command { target, commander, setting: Setting::HeartbeatIntervalSecs(heartbeat_interval_secs) };
         self.send(target, frame.encode().as_bytes())
     }
 }
@@ -540,13 +541,22 @@ fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16) ->
     Ok(Some((card_id, row_ids, payload)))
 }
 
-fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, target: u16, setting: Setting) {
-    let frame = Frame::Command { target, setting };
+/// Sends a Command frame to the radio-layer address `dest` — this node's
+/// own configured next hop, not necessarily `target` directly. That's what
+/// makes relaying possible: if `target` isn't in direct range, `dest` is
+/// the relay that is, exactly mirroring how uplink punch traffic already
+/// routes via each node's own `--dest` rather than straight to the final
+/// destination. Commanding a node other than the current `--dest` now needs
+/// a `SET_DEST` first, same as the existing `SEND` socket command already
+/// requires — this makes `CMD` consistent with the rest of the protocol
+/// instead of being the one exception that assumed direct reach.
+fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, dest: u16, target: u16, commander: u16, setting: Setting) {
+    let frame = Frame::Command { target, commander, setting };
     let payload = frame.encode();
-    match radio.send(target, payload.as_bytes()) {
+    match radio.send(dest, payload.as_bytes()) {
         Ok(()) => {
-            log::info!("CMD to {}: {}", target, payload);
-            broadcast(clients, format!("TX {} {}", target, payload));
+            log::info!("CMD to {} (via {}): {}", target, dest, payload);
+            broadcast(clients, format!("TX {} {}", dest, payload));
         }
         Err(e) => {
             log::error!("CMD send failed: {}", e);
@@ -621,7 +631,7 @@ fn run_daemon_loop(
                 if let (Some(target_str), Some(secs_str)) = (parts.next(), parts.next()) {
                     if let (Ok(target), Ok(secs)) = (target_str.parse::<u16>(), secs_str.parse::<u32>()) {
                         let setting = Setting::HeartbeatIntervalSecs(secs);
-                        send_command_frame(radio.as_mut(), &clients, target, setting);
+                        send_command_frame(radio.as_mut(), &clients, dest, target, own_addr, setting);
                         pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
                     }
                 }
@@ -639,7 +649,7 @@ fn run_daemon_loop(
             }
             cmd.attempts += 1;
             cmd.sent_at = Instant::now();
-            send_command_frame(radio.as_mut(), &clients, cmd.target, cmd.setting);
+            send_command_frame(radio.as_mut(), &clients, dest, cmd.target, own_addr, cmd.setting);
             true
         });
 
@@ -744,32 +754,47 @@ fn run_daemon_loop(
                     }
                 } else if let Some(frame) = Frame::parse(&payload) {
                     match frame {
-                        Frame::Command { target, setting } if target == own_addr => {
+                        Frame::Command { target, commander, setting } if target == own_addr => {
                             match setting {
                                 Setting::HeartbeatIntervalSecs(secs) => {
                                     heartbeat_period = (secs > 0).then(|| Duration::from_secs(secs as u64));
                                     log::info!("heartbeat interval changed to {}s by command from {}", secs, pkt.src_addr);
                                 }
                             }
-                            let ack = Frame::Ack { origin: own_addr, setting };
+                            // Ack names the true commander (so a relay
+                            // downstream of it knows where to forward this)
+                            // but is transmitted to whoever handed us this
+                            // packet, same pattern as PunchAck.
+                            let ack = Frame::Ack { origin: own_addr, commander, setting };
                             if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
                                 log::error!("failed to ack command: {}", e);
                             }
                             broadcast(&clients, format!("CMDAPPLIED {:?}", setting));
                         }
-                        Frame::Command { .. } => {
-                            // Not addressed to us. Commands/acks don't carry
-                            // an origin-commander field the way punches now
-                            // carry origin, so relaying them correctly needs
-                            // its own follow-up — left alone for now.
+                        Frame::Command { target, .. } if relay => {
+                            // Not addressed to us — pass it on toward the
+                            // named target directly (single-hop relay:
+                            // assumed within direct reach downstream).
+                            forward(radio.as_mut(), &clients, target, &payload);
                         }
-                        Frame::Ack { origin, setting } => {
+                        Frame::Command { .. } => {
+                            // Not addressed to us and not relaying — ignore.
+                        }
+                        Frame::Ack { origin, commander, setting } if commander == own_addr => {
                             let had = pending_commands.len();
                             pending_commands.retain(|p| !(p.target == origin && p.setting == setting));
                             if pending_commands.len() < had {
                                 log::info!("CMD to {} ({:?}) acked", origin, setting);
                                 broadcast(&clients, format!("CMDOK {} {}", origin, setting.encode()));
                             }
+                        }
+                        Frame::Ack { commander, .. } if relay => {
+                            // Not for us — forward toward the commander who
+                            // originally issued this command.
+                            forward(radio.as_mut(), &clients, commander, &payload);
+                        }
+                        Frame::Ack { .. } => {
+                            // Not relaying and not ours — ignore.
                         }
                         Frame::PunchAck { node, card_id } if node == own_addr => {
                             if pending_punch.as_ref().is_some_and(|p| p.card_id == card_id) {
@@ -906,7 +931,10 @@ impl Radio for SocketRadio {
         self.status_events.try_iter().collect()
     }
 
-    fn send_command(&mut self, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
+    fn send_command(&mut self, _commander: u16, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
+        // The daemon fills in its own address as commander when it builds
+        // the actual radio frame — an attach client has no radio identity
+        // of its own to offer here.
         writeln!(self.writer, "CMD {} {}", target, heartbeat_interval_secs)?;
         self.writer.flush()?;
         Ok(())
@@ -1014,7 +1042,7 @@ mod tests {
     fn test_socket_radio_send_command_writes_expected_line() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut radio = SocketRadio::new(a).unwrap();
-        radio.send_command(5, 30).unwrap();
+        radio.send_command(1, 5, 30).unwrap();
 
         let mut reader = BufReader::new(b);
         let mut line = String::new();

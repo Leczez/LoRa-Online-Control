@@ -31,10 +31,16 @@ impl Setting {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame {
-    /// Downlink: base station -> node at `target`, asking it to change `setting`.
-    Command { target: u16, setting: Setting },
-    /// Uplink: node at `origin` confirming it applied `setting`.
-    Ack { origin: u16, setting: Setting },
+    /// Downlink: `commander` -> node at `target`, asking it to change
+    /// `setting`. `commander` travels in the payload (not just inferred from
+    /// the radio header) so that once this is relayed, the resulting `Ack`
+    /// can be forwarded back to the right place rather than just to
+    /// whichever relay last touched it.
+    Command { target: u16, commander: u16, setting: Setting },
+    /// Uplink: node at `origin` confirming it applied `setting`, addressed
+    /// back to `commander` (echoed from the `Command` that prompted it) so
+    /// a relay forwarding this ack knows where it's ultimately headed.
+    Ack { origin: u16, commander: u16, setting: Setting },
     /// Confirms to `node` that its punch for `card_id` was received. A node
     /// holds its next punch (stop-and-wait, see the protocol doc) until this
     /// arrives or a retry timeout elapses, so only one punch is ever
@@ -46,24 +52,26 @@ pub enum Frame {
 impl Frame {
     pub fn encode(&self) -> String {
         match self {
-            Frame::Command { target, setting } => format!("CMD {} {}", target, setting.encode()),
-            Frame::Ack { origin, setting } => format!("ACK {} {}", origin, setting.encode()),
+            Frame::Command { target, commander, setting } => format!("CMD {} {} {}", target, commander, setting.encode()),
+            Frame::Ack { origin, commander, setting } => format!("ACK {} {} {}", origin, commander, setting.encode()),
             Frame::PunchAck { node, card_id } => format!("PACK {} {}", node, card_id),
         }
     }
 
     pub fn parse(s: &str) -> Option<Frame> {
         if let Some(rest) = s.strip_prefix("CMD ") {
-            let mut parts = rest.splitn(2, ' ');
+            let mut parts = rest.splitn(3, ' ');
             let target: u16 = parts.next()?.parse().ok()?;
+            let commander: u16 = parts.next()?.parse().ok()?;
             let setting = Setting::parse(parts.next()?)?;
-            return Some(Frame::Command { target, setting });
+            return Some(Frame::Command { target, commander, setting });
         }
         if let Some(rest) = s.strip_prefix("ACK ") {
-            let mut parts = rest.splitn(2, ' ');
+            let mut parts = rest.splitn(3, ' ');
             let origin: u16 = parts.next()?.parse().ok()?;
+            let commander: u16 = parts.next()?.parse().ok()?;
             let setting = Setting::parse(parts.next()?)?;
-            return Some(Frame::Ack { origin, setting });
+            return Some(Frame::Ack { origin, commander, setting });
         }
         if let Some(rest) = s.strip_prefix("PACK ") {
             let mut parts = rest.splitn(2, ' ');
@@ -81,17 +89,17 @@ mod tests {
 
     #[test]
     fn test_command_round_trips() {
-        let frame = Frame::Command { target: 5, setting: Setting::HeartbeatIntervalSecs(30) };
+        let frame = Frame::Command { target: 5, commander: 1, setting: Setting::HeartbeatIntervalSecs(30) };
         let encoded = frame.encode();
-        assert_eq!(encoded, "CMD 5 hb_interval=30");
+        assert_eq!(encoded, "CMD 5 1 hb_interval=30");
         assert_eq!(Frame::parse(&encoded), Some(frame));
     }
 
     #[test]
     fn test_ack_round_trips() {
-        let frame = Frame::Ack { origin: 7, setting: Setting::HeartbeatIntervalSecs(45) };
+        let frame = Frame::Ack { origin: 7, commander: 1, setting: Setting::HeartbeatIntervalSecs(45) };
         let encoded = frame.encode();
-        assert_eq!(encoded, "ACK 7 hb_interval=45");
+        assert_eq!(encoded, "ACK 7 1 hb_interval=45");
         assert_eq!(Frame::parse(&encoded), Some(frame));
     }
 
@@ -119,9 +127,11 @@ mod tests {
 
     #[test]
     fn test_parse_rejects_malformed_command() {
-        assert_eq!(Frame::parse("CMD notanumber hb_interval=30"), None);
-        assert_eq!(Frame::parse("CMD 5 unknown_setting=30"), None);
-        assert_eq!(Frame::parse("CMD 5 hb_interval=notanumber"), None);
+        assert_eq!(Frame::parse("CMD notanumber 1 hb_interval=30"), None);
+        assert_eq!(Frame::parse("CMD 5 notanumber hb_interval=30"), None);
+        assert_eq!(Frame::parse("CMD 5 1 unknown_setting=30"), None);
+        assert_eq!(Frame::parse("CMD 5 1 hb_interval=notanumber"), None);
         assert_eq!(Frame::parse("CMD 5"), None);
+        assert_eq!(Frame::parse("CMD 5 1"), None);
     }
 }

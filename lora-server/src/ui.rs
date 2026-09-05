@@ -247,7 +247,7 @@ pub fn run_app(
                                     let parsed = parts.next().zip(parts.next())
                                         .and_then(|(t, s)| Some((t.parse::<u16>().ok()?, s.parse::<u32>().ok()?)));
                                     match parsed {
-                                        Some((target, secs)) => match radio.send_command(target, secs) {
+                                        Some((target, secs)) => match radio.send_command(app.addr, target, secs) {
                                             Ok(()) => app.push_log(LogEntry::Tx {
                                                 timestamp: ts,
                                                 dest_addr: target,
