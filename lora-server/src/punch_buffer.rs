@@ -70,6 +70,27 @@ impl PunchBuffer {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Unsent punches from this node's own local SI reader (source == "local"),
+    /// oldest first — the candidates for radio (re)transmission. Distinct from
+    /// `unsent()`, which also includes remote-sourced punches relevant to the
+    /// HTTP push path but not to what this node itself needs to transmit.
+    pub fn unsent_local(&self) -> Result<Vec<BufferedPunch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, card_id, station, time_s, source FROM punches WHERE sent = 0 AND source = 'local' ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BufferedPunch {
+                id: row.get(0)?,
+                card_id: row.get(1)?,
+                station: row.get(2)?,
+                time_s: row.get(3)?,
+                source: row.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn mark_sent(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE punches SET sent = 1 WHERE id = ?1", [id])?;
@@ -116,5 +137,27 @@ mod tests {
 
         let ids: Vec<u32> = buf.unsent().unwrap().iter().map(|p| p.card_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_unsent_local_excludes_remote_sourced_punches() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        buf.record(1, 1, 100, "local").unwrap();
+        buf.record(2, 2, 200, "192.168.1.5").unwrap();
+        buf.record(3, 3, 300, "local").unwrap();
+
+        let ids: Vec<u32> = buf.unsent_local().unwrap().iter().map(|p| p.card_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_unsent_local_excludes_already_sent() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        let id = buf.record(1, 1, 100, "local").unwrap();
+        buf.record(2, 2, 200, "local").unwrap();
+        buf.mark_sent(id).unwrap();
+
+        let ids: Vec<u32> = buf.unsent_local().unwrap().iter().map(|p| p.card_id).collect();
+        assert_eq!(ids, vec![2]);
     }
 }

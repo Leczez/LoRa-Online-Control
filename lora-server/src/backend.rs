@@ -504,6 +504,42 @@ struct PendingCommand {
     attempts: u32,
 }
 
+/// How often an unacked punch is retried. Unlike commands, there's no give-up
+/// count — a punch is real event data, not a settings tweak, so it's held and
+/// retried indefinitely rather than dropped after N attempts. Stop-and-wait:
+/// only one punch is ever outstanding per node (see docs/protocols/
+/// lora_online_control_protocol.md), so the next buffered punch waits for
+/// this one to be acked before it's even attempted.
+const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PendingPunch {
+    card_id: u32,
+    row_ids: Vec<i64>,
+    payload: String,
+    sent_at: Instant,
+    attempts: u32,
+}
+
+/// The next batch of local, unsent punches to (re)transmit: the oldest
+/// unsent local row, plus any immediately-following unsent local rows that
+/// share its card_id (reconstructing the original CardReadout's grouping,
+/// since punches from one card tap are buffered as consecutive rows sharing
+/// one card_id). Returns the row ids covered (to mark sent once acked) and
+/// the exact payload to send, rebuilt via `CardReadout::to_payload()` so it
+/// matches the wire format precisely.
+fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer) -> Result<Option<(u32, Vec<i64>, String)>> {
+    let unsent = buffer.unsent_local()?;
+    let Some(first) = unsent.first() else { return Ok(None) };
+    let card_id = first.card_id;
+    let batch: Vec<_> = unsent.iter().take_while(|p| p.card_id == card_id).collect();
+    let row_ids = batch.iter().map(|p| p.id).collect();
+    let punches = batch.iter()
+        .map(|p| crate::sportident::ControlPunch { station: p.station, time_s: p.time_s })
+        .collect();
+    let payload = crate::sportident::CardReadout { card_id, punches }.to_payload();
+    Ok(Some((card_id, row_ids, payload)))
+}
+
 fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, target: u16, setting: Setting) {
     let frame = Frame::Command { target, setting };
     let payload = frame.encode();
@@ -540,6 +576,7 @@ fn run_daemon_loop(
     let mut last_heartbeat = Instant::now();
     let mut dest = dest;
     let mut pending_commands: Vec<PendingCommand> = Vec::new();
+    let mut pending_punch: Option<PendingPunch> = None;
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -603,20 +640,49 @@ fn run_daemon_loop(
         }
 
         while let Ok(readout) = si_rx.try_recv() {
+            // Buffer immediately, unconditionally — every punch a SportIdent
+            // master hands us is safe on disk before we ever try to send it.
+            // Actual transmission (and its stop-and-wait retry) happens below,
+            // driven by the buffer itself rather than sent inline here.
             for p in &readout.punches {
                 if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, "local") {
                     log::error!("failed to buffer local punch: {}", e);
                 }
             }
-            let msg = readout.to_payload();
-            match radio.send(dest, msg.as_bytes()) {
-                Ok(()) => {
-                    log::info!("TX to {}: {}", dest, msg);
-                    broadcast(&clients, format!("TX {} {}", dest, msg));
+            log::info!("buffered {} punch(es) for card {}", readout.punches.len(), readout.card_id);
+        }
+
+        if pending_punch.is_none() {
+            match next_local_batch(&punch_buffer) {
+                Ok(Some((card_id, row_ids, payload))) => {
+                    match radio.send(dest, payload.as_bytes()) {
+                        Ok(()) => {
+                            log::info!("PUNCH to {}: {}", dest, payload);
+                            broadcast(&clients, format!("TX {} {}", dest, payload));
+                            pending_punch = Some(PendingPunch { card_id, row_ids, payload, sent_at: Instant::now(), attempts: 1 });
+                        }
+                        Err(e) => {
+                            log::error!("PUNCH send failed: {}", e);
+                            broadcast(&clients, format!("ERR TX: {}", e));
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::error!("SI TX failed: {}", e);
-                    broadcast(&clients, format!("ERR TX: {}", e));
+                Ok(None) => {}
+                Err(e) => log::error!("failed to query punch buffer: {}", e),
+            }
+        } else if let Some(p) = &mut pending_punch {
+            if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
+                p.attempts += 1;
+                p.sent_at = Instant::now();
+                match radio.send(dest, p.payload.as_bytes()) {
+                    Ok(()) => {
+                        log::info!("PUNCH retry #{} to {}: {}", p.attempts, dest, p.payload);
+                        broadcast(&clients, format!("TX {} {}", dest, p.payload));
+                    }
+                    Err(e) => {
+                        log::error!("PUNCH retry failed: {}", e);
+                        broadcast(&clients, format!("ERR TX: {}", e));
+                    }
                 }
             }
         }
@@ -635,6 +701,14 @@ fn run_daemon_loop(
                         if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &source) {
                             log::error!("failed to buffer remote punch: {}", e);
                         }
+                    }
+                    // Ack is best-effort and not itself retried: if it's lost,
+                    // the sender's own retry timeout resends the punch, which
+                    // prompts another ack attempt here — self-healing without
+                    // needing reliable ack delivery.
+                    let ack = Frame::PunchAck { node: pkt.src_addr, card_id: readout.card_id };
+                    if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
+                        log::error!("failed to ack punch: {}", e);
                     }
                 } else if let Some(frame) = Frame::parse(&payload) {
                     match frame {
@@ -661,6 +735,21 @@ fn run_daemon_loop(
                                 log::info!("CMD to {} ({:?}) acked", origin, setting);
                                 broadcast(&clients, format!("CMDOK {} {}", origin, setting.encode()));
                             }
+                        }
+                        Frame::PunchAck { node, card_id } if node == own_addr => {
+                            if pending_punch.as_ref().is_some_and(|p| p.card_id == card_id) {
+                                let p = pending_punch.take().unwrap();
+                                for id in &p.row_ids {
+                                    if let Err(e) = punch_buffer.mark_sent(*id) {
+                                        log::error!("failed to mark punch {} sent: {}", id, e);
+                                    }
+                                }
+                                log::info!("PUNCH card {} acked by {}", card_id, pkt.src_addr);
+                                broadcast(&clients, format!("PACKOK {}", card_id));
+                            }
+                        }
+                        Frame::PunchAck { .. } => {
+                            // Ack for a different node — not ours, ignore.
                         }
                     }
                 }

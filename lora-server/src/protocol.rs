@@ -35,6 +35,12 @@ pub enum Frame {
     Command { target: u16, setting: Setting },
     /// Uplink: node at `origin` confirming it applied `setting`.
     Ack { origin: u16, setting: Setting },
+    /// Confirms to `node` that its punch for `card_id` was received. A node
+    /// holds its next punch (stop-and-wait, see the protocol doc) until this
+    /// arrives or a retry timeout elapses, so only one punch is ever
+    /// unacknowledged at a time per node — `card_id` alone is enough to
+    /// disambiguate since there's never more than one outstanding.
+    PunchAck { node: u16, card_id: u32 },
 }
 
 impl Frame {
@@ -42,6 +48,7 @@ impl Frame {
         match self {
             Frame::Command { target, setting } => format!("CMD {} {}", target, setting.encode()),
             Frame::Ack { origin, setting } => format!("ACK {} {}", origin, setting.encode()),
+            Frame::PunchAck { node, card_id } => format!("PACK {} {}", node, card_id),
         }
     }
 
@@ -57,6 +64,12 @@ impl Frame {
             let origin: u16 = parts.next()?.parse().ok()?;
             let setting = Setting::parse(parts.next()?)?;
             return Some(Frame::Ack { origin, setting });
+        }
+        if let Some(rest) = s.strip_prefix("PACK ") {
+            let mut parts = rest.splitn(2, ' ');
+            let node: u16 = parts.next()?.parse().ok()?;
+            let card_id: u32 = parts.next()?.parse().ok()?;
+            return Some(Frame::PunchAck { node, card_id });
         }
         None
     }
@@ -80,6 +93,21 @@ mod tests {
         let encoded = frame.encode();
         assert_eq!(encoded, "ACK 7 hb_interval=45");
         assert_eq!(Frame::parse(&encoded), Some(frame));
+    }
+
+    #[test]
+    fn test_punch_ack_round_trips() {
+        let frame = Frame::PunchAck { node: 12, card_id: 123456 };
+        let encoded = frame.encode();
+        assert_eq!(encoded, "PACK 12 123456");
+        assert_eq!(Frame::parse(&encoded), Some(frame));
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_punch_ack() {
+        assert_eq!(Frame::parse("PACK notanumber 123"), None);
+        assert_eq!(Frame::parse("PACK 12 notanumber"), None);
+        assert_eq!(Frame::parse("PACK 12"), None);
     }
 
     #[test]

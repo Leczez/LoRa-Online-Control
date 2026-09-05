@@ -35,6 +35,31 @@ join packet (rather than on every packet, to save airtime) lets the base
 station detect a genuinely dangerous failure mode: two nodes accidentally
 sharing a LoRa address, which would otherwise be silently ambiguous.
 
+## Punch Delivery
+
+Every punch a SportIdent master hands a node is buffered to disk immediately,
+unconditionally — independent of whether or when it can actually be
+transmitted. Delivery over the radio link itself works as **stop-and-wait**:
+
+- A node holds at most **one punch outstanding** at a time. It doesn't
+  attempt the next buffered punch until the current one is acknowledged.
+- The receiver (whoever gets a `PUNCH` payload) buffers it on its own end,
+  then sends back a `PACK` frame naming the sending node and the card
+  involved — e.g. `PACK <node> <card_id>` — so that on a shared channel with
+  multiple nodes, only the node actually waiting for that ack acts on it.
+- If no ack arrives within a retry window, the node resends the exact same
+  payload and keeps waiting — **there's no give-up count for punches**,
+  unlike the bounded retry used for command packets below. A punch is real
+  event data, not a settings tweak; it's held and retried indefinitely
+  rather than ever silently dropped.
+- The ack itself is sent best-effort, not separately retried — if it's lost,
+  the sender's own retry timeout resends the punch, which prompts another
+  ack attempt. This is self-healing without needing the ack path itself to
+  be reliable.
+- Since only one card_id is ever outstanding per node at a time, the ack
+  only needs to name it — no separate sequence number was needed on top of
+  what `PUNCH` already carries.
+
 ## Command Packets
 
 The base station needs a way to change limited settings on a deployed node
