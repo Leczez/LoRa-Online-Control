@@ -161,13 +161,27 @@ where
     }
 
     fn send(&mut self, _dest: u16, payload: &[u8]) -> Result<(), Self::Error> {
+        // Checked up front, before touching the radio at all: heapless::Vec's
+        // extend_from_slice is all-or-nothing, so silently letting it fail
+        // here would mean transmitting just the 2-byte address prefix with
+        // no indication anything was dropped — the caller would see Ok(())
+        // for a transmission that carried none of its actual payload.
+        const MAX_PAYLOAD: usize = 240;
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Sx127xError::PayloadTooLarge { len: payload.len(), max: MAX_PAYLOAD });
+        }
+
         self.set_mode(MODE_STDBY)?;
         self.write_register(REG_FIFO_ADDR_PTR, 0x00)?;
 
+        // Capacity is guaranteed by the length check above (2-byte prefix +
+        // up to MAX_PAYLOAD fits the 242-byte buffer with room to spare) —
+        // expect() turns "silently truncated" into "loud bug report" if
+        // that invariant is ever violated by a future change here.
         let mut buf = heapless::Vec::<u8, 242>::new();
-        buf.push((self.addr >> 8) as u8).ok();
-        buf.push((self.addr & 0xFF) as u8).ok();
-        buf.extend_from_slice(payload).ok();
+        buf.push((self.addr >> 8) as u8).expect("address prefix always fits");
+        buf.push((self.addr & 0xFF) as u8).expect("address prefix always fits");
+        buf.extend_from_slice(payload).expect("payload length already validated");
 
         self.write_register(REG_PAYLOAD_LENGTH, buf.len() as u8)?;
         self.write_fifo(&buf)?;
@@ -288,6 +302,30 @@ mod tests {
         let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
 
         radio.write_register(REG_SYNC_WORD, 0x34).unwrap();
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_send_rejects_oversized_payload_without_touching_the_radio() {
+        // Regression test for the silent-drop bug: extend_from_slice on the
+        // internal buffer is all-or-nothing, so an oversized payload used to
+        // vanish entirely while send() still reported Ok(()). It must now
+        // fail loudly, and before any SPI transaction is even issued.
+        let spi = SpiMock::<u8>::new(&[]);
+        let reset = PinMock::new(&[]);
+        let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
+
+        let oversized = std::vec![0u8; 241];
+        let err = radio.send(0, &oversized).unwrap_err();
+        match err {
+            Sx127xError::PayloadTooLarge { len, max } => {
+                assert_eq!(len, 241);
+                assert_eq!(max, 240);
+            }
+            other => panic!("expected PayloadTooLarge, got {:?}", other),
+        }
 
         radio.spi.done();
         radio.reset.done();

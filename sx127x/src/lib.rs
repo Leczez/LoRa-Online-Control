@@ -45,6 +45,10 @@ pub enum Sx127xError<E> {
     InvalidConfig,
     /// Module did not respond (e.g. TxDone/RxDone never set) within the poll budget.
     Timeout,
+    /// `send()`'s payload won't fit in the FIFO alongside the 2-byte address
+    /// prefix. Rejected up front rather than silently dropped, so a caller
+    /// never mistakes "nothing was actually transmitted" for success.
+    PayloadTooLarge { len: usize, max: usize },
 }
 
 #[cfg(feature = "std")]
@@ -56,6 +60,9 @@ impl<E: core::fmt::Debug> core::fmt::Display for Sx127xError<E> {
             Sx127xError::Transport(e) => write!(f, "transport error: {:?}", e),
             Sx127xError::InvalidConfig => write!(f, "invalid configuration"),
             Sx127xError::Timeout => write!(f, "module did not respond"),
+            Sx127xError::PayloadTooLarge { len, max } => {
+                write!(f, "payload too large: {} bytes (max {})", len, max)
+            }
         }
     }
 }
