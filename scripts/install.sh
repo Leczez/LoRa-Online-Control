@@ -10,8 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 
-echo "Building lora-server and lora-tui (desktop)..."
-# The rpi feature (rppal GPIO) is opt-in; the default build is the desktop variant.
+echo "Building lora-server and lora-tui..."
+# SPI+GPIO (via rppal) is required unconditionally now that E22/UART support
+# has been dropped — this only builds/runs correctly on Linux with GPIO/SPI
+# access (a Raspberry Pi), not a plain desktop machine.
 cd "$WORKSPACE_ROOT"
 cargo build --release -p lora-server
 

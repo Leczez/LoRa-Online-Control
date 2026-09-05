@@ -156,5 +156,11 @@ extreme (SF12 at 7.8kHz), because:
   further while costing airtime and drift margin.
 
 `LowDataRateOptimize` must be enabled whenever the symbol period exceeds
-16ms (true for SF11+ at 125kHz) — both `sx126x` and `sx127x` compute this
-automatically from the configured SF/BW rather than needing it set by hand.
+16ms (true for SF11+ at 125kHz) — `sx127x` computes this automatically from
+the configured SF/BW rather than needing it set by hand.
+
+*(Note: EBYTE E22 module support — a separate `sx126x` driver crate over
+UART — has been dropped. Every node, base station included, now runs bare
+SX1276/RFM95W modules over SPI, the same hardware and driver the ESP32
+field nodes use — see the "Risk 1" section of the ESP32 node design doc
+for why this consolidation happened.)*

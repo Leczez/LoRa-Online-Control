@@ -29,21 +29,9 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    if args.radio != "spi" && args.port.is_none() {
-        anyhow::bail!("--port is required unless --radio spi");
-    }
-
-    if args.radio == "spi" {
-        log::info!(
-            "starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
-            args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
-        );
-    } else {
-        log::info!(
-            "starting on port {} addr {} dest {} freq {}MHz air_speed {}bps heartbeat {}s",
-            args.port.as_deref().unwrap_or(""),
-            args.addr, args.dest, args.freq, args.air_speed, args.heartbeat_interval
-        );
-    }
+    log::info!(
+        "starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
+        args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
+    );
     lora_server::backend::run(args)
 }

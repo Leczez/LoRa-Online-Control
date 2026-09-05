@@ -9,10 +9,20 @@ pub use config::{Bandwidth, CodingRate, Config};
 pub mod spi;
 pub use spi::Sx127xSpi;
 
-pub use sx126x::ReceivedPacket;
+use heapless::Vec;
 
-/// Common interface for sx127x transport implementations. Shaped like
-/// `sx126x::LoraRadio`, but bound to this crate's own `Config` type.
+/// A packet received from the radio.
+#[derive(Debug)]
+pub struct ReceivedPacket {
+    pub src_addr: u16,
+    /// Signal strength in dBm. None if RSSI reporting was disabled in Config.
+    pub rssi: Option<i16>,
+    /// Raw payload bytes. Max 240 bytes (largest SX127x FIFO budget after
+    /// the 2-byte address prefix).
+    pub payload: Vec<u8, 240>,
+}
+
+/// Common interface for sx127x transport implementations.
 pub trait LoraRadio {
     type Error;
 

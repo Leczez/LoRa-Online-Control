@@ -3,12 +3,7 @@ name = "lora-server"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-rpi = ["dep:rppal"]
-
 [dependencies]
-sx126x = { path = "../sx126x", features = ["std"] }
 sx127x = { path = "../sx127x" }
 anyhow = "1"
 heapless = "0.8"
@@ -18,14 +13,16 @@ clap = { version = "4", features = ["derive", "env"] }
 ratatui = "0.28"
 crossterm = "0.28"
 serialport = "4"
-embedded-io = { version = "0.6", features = ["std"] }
 embedded-hal = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Bare SX1276/RFM95W over SPI+GPIO is the only supported radio transport now
+# (E22/UART support dropped), which means lora-server needs Pi GPIO access
+# unconditionally rather than as an opt-in "rpi" feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.19", optional = true, features = ["embedded-hal"] }
+rppal = { version = "0.19", features = ["embedded-hal"] }
 udev = { version = "0.9", features = ["send"] }
 libc = "0.2"

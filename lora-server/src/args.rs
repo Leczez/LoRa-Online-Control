@@ -3,14 +3,6 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "lora-server", about = "LoRa daemon: radio I/O, SportIdent reading, punch buffering")]
 pub struct Args {
-    /// Serial port path (e.g. /dev/ttyS0 or /dev/ttyUSB0). Required unless --radio spi.
-    #[arg(long, env = "LORA_PORT")]
-    pub port: Option<String>,
-
-    /// Radio transport: "uart" (EBYTE E22 HAT) or "spi" (bare SX1276/RFM9x module)
-    #[arg(long, env = "LORA_RADIO", default_value = "uart")]
-    pub radio: String,
-
     /// RESET GPIO pin for the SPI radio (BCM, Raspberry Pi only)
     #[arg(long, env = "LORA_RESET_PIN", default_value_t = 25)]
     pub reset_pin: u8,
@@ -56,18 +48,6 @@ pub struct Args {
     /// TX power in dBm (10, 13, 17, or 22)
     #[arg(long, env = "LORA_POWER", default_value_t = 22)]
     pub power: u8,
-
-    /// Air speed in bps (1200, 2400, 4800, 9600, 19200, 38400, 62500)
-    #[arg(long, env = "LORA_AIR_SPEED", default_value_t = 2400)]
-    pub air_speed: u32,
-
-    /// M0 GPIO pin number (BCM, Raspberry Pi only)
-    #[arg(long, env = "LORA_M0_PIN")]
-    pub m0_pin: Option<u8>,
-
-    /// M1 GPIO pin number (BCM, Raspberry Pi only)
-    #[arg(long, env = "LORA_M1_PIN")]
-    pub m1_pin: Option<u8>,
 
     /// Heartbeat interval in seconds (0 to disable)
     #[arg(long, env = "LORA_HEARTBEAT_INTERVAL", default_value_t = 60)]

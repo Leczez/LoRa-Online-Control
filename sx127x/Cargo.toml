@@ -10,7 +10,6 @@ std = []
 [dependencies]
 embedded-hal = "1.0"
 heapless = "0.8"
-sx126x = { path = "../sx126x" }
 
 [dev-dependencies]
 embedded-hal-mock = { version = "0.10", features = ["eh1"] }

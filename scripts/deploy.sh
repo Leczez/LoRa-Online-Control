@@ -37,19 +37,9 @@ case "$REMOTE_ARCH" in
         ;;
 esac
 
-IS_RPI=$(ssh "$TARGET_HOST" 'grep -qi "raspberry pi" /proc/cpuinfo && echo yes || echo no')
-if [[ "$IS_RPI" == "yes" ]]; then
-    FEATURES="--features rpi"
-    echo "Detected: Raspberry Pi ($REMOTE_ARCH) → $RUST_TARGET"
-else
-    FEATURES=""
-    echo "Detected: Linux device ($REMOTE_ARCH) → $RUST_TARGET"
-fi
-
 echo "Cross-compiling lora-server (daemon) and lora-tui (attach client)..."
 cd "$WORKSPACE_ROOT"
-# shellcheck disable=SC2086
-cross build --release -p lora-server $FEATURES --target "$RUST_TARGET"
+cross build --release -p lora-server --target "$RUST_TARGET"
 
 SERVER_BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-server"
 TUI_BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-tui"
@@ -101,26 +91,23 @@ if [[ ! -f /etc/lora-server/env ]]; then
     sudo tee /etc/lora-server/env > /dev/null <<'ENV'
 # lora-server configuration
 # Edit these values then: sudo systemctl restart lora-server
-LORA_PORT=/dev/ttyS0
+LORA_RESET_PIN=25
+LORA_SF=7
+LORA_BW_HZ=125000
+LORA_CR=5
+LORA_SYNC_WORD=18
 LORA_FREQ=433
-LORA_AIR_SPEED=1200
 LORA_ADDR=0
 LORA_DEST=1
 LORA_POWER=22
 LORA_HEARTBEAT_INTERVAL=60
-LORA_M0_PIN=22
-LORA_M1_PIN=27
 ENV
     echo "Created /etc/lora-server/env (edit to configure)"
 else
     echo "Preserved existing /etc/lora-server/env"
 fi
 
-# The systemd unit's ExecStart depends on which radio transport this env file
-# configures — regenerating the wrong template would silently switch a node
-# using --radio spi back to the UART/HAT flag set (or vice versa).
-if grep -q '^LORA_RADIO=spi' /etc/lora-server/env; then
-    sudo tee /etc/systemd/system/lora-server.service > /dev/null <<'SERVICE'
+sudo tee /etc/systemd/system/lora-server.service > /dev/null <<'SERVICE'
 [Unit]
 Description=lora-server (LoRa daemon)
 After=multi-user.target
@@ -129,7 +116,7 @@ After=multi-user.target
 RuntimeDirectory=lora-server
 EnvironmentFile=/etc/lora-server/env
 ExecStart=/usr/local/bin/lora-server \
-  --radio ${LORA_RADIO} --reset-pin ${LORA_RESET_PIN} \
+  --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
   --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL}
@@ -141,29 +128,6 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 SERVICE
-else
-    sudo tee /etc/systemd/system/lora-server.service > /dev/null <<'SERVICE'
-[Unit]
-Description=lora-server (LoRa daemon)
-After=multi-user.target
-
-[Service]
-RuntimeDirectory=lora-server
-EnvironmentFile=/etc/lora-server/env
-ExecStart=/usr/local/bin/lora-server \
-  --port ${LORA_PORT} --freq ${LORA_FREQ} --air-speed ${LORA_AIR_SPEED} \
-  --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
-  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} \
-  --m0-pin ${LORA_M0_PIN} --m1-pin ${LORA_M1_PIN}
-StandardOutput=journal
-StandardError=journal
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable lora-server
