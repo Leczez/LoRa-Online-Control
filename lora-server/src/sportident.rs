@@ -126,20 +126,29 @@ pub struct CardReadout {
 }
 
 impl CardReadout {
-    /// Wire format sent over LoRa: `PUNCH <card_id> <station>:<time_s>,...`
-    pub fn to_payload(&self) -> String {
+    /// Wire format sent over LoRa: `PUNCH <origin> <card_id> <station>:<time_s>,...`
+    ///
+    /// `origin` is the LoRa address of the node that actually read this
+    /// card — carried explicitly in the payload, not inferred from the
+    /// radio layer's immediate sender, so that once a punch travels through
+    /// a relay the base station still attributes it to the right control
+    /// point rather than to the relay that last touched it (see the
+    /// "Relay Nodes" section of docs/protocols/lora_online_control_protocol.md).
+    pub fn to_payload(&self, origin: u16) -> String {
         let punches: String = self.punches.iter()
             .map(|p| format!("{}:{}", p.station, p.time_s))
             .collect::<Vec<_>>()
             .join(",");
-        format!("PUNCH {} {}", self.card_id, punches)
+        format!("PUNCH {} {} {}", origin, self.card_id, punches)
     }
 
-    /// Inverse of `to_payload` — decodes a `PUNCH <card_id> <station>:<time_s>,...`
-    /// wire payload (as relayed by a remote LoRa node) back into structured data.
-    pub fn parse_payload(s: &str) -> Option<CardReadout> {
+    /// Inverse of `to_payload` — decodes a `PUNCH <origin> <card_id>
+    /// <station>:<time_s>,...` wire payload back into the originating node's
+    /// address and the card data itself.
+    pub fn parse_payload(s: &str) -> Option<(u16, CardReadout)> {
         let rest = s.strip_prefix("PUNCH ")?;
-        let mut parts = rest.splitn(2, ' ');
+        let mut parts = rest.splitn(3, ' ');
+        let origin: u16 = parts.next()?.parse().ok()?;
         let card_id: u32 = parts.next()?.parse().ok()?;
         let punches = parts.next().unwrap_or("");
 
@@ -153,7 +162,7 @@ impl CardReadout {
             }
         }
 
-        Some(CardReadout { card_id, punches: result })
+        Some((origin, CardReadout { card_id, punches: result }))
     }
 }
 
@@ -1037,9 +1046,10 @@ mod tests {
                 ControlPunch { station: 50, time_s: 37300 },
             ],
         };
-        let payload = original.to_payload();
-        let decoded = CardReadout::parse_payload(&payload).unwrap();
+        let payload = original.to_payload(12);
+        let (origin, decoded) = CardReadout::parse_payload(&payload).unwrap();
 
+        assert_eq!(origin, 12);
         assert_eq!(decoded.card_id, original.card_id);
         assert_eq!(decoded.punches.len(), 2);
         assert_eq!(decoded.punches[0].station, 33);
@@ -1051,7 +1061,8 @@ mod tests {
     #[test]
     fn test_punch_payload_no_punches() {
         let original = CardReadout { card_id: 42, punches: vec![] };
-        let decoded = CardReadout::parse_payload(&original.to_payload()).unwrap();
+        let (origin, decoded) = CardReadout::parse_payload(&original.to_payload(7)).unwrap();
+        assert_eq!(origin, 7);
         assert_eq!(decoded.card_id, 42);
         assert!(decoded.punches.is_empty());
     }

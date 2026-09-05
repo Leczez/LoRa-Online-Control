@@ -95,21 +95,33 @@ send, or a packet arrives that isn't addressed to it but matches its
 configured forwarding rule, and it re-transmits that packet on its own next
 uplink turn.
 
-- **Origin address travels in the payload, not just the radio header.**
-  The radio-layer address on each hop is only the *next hop*, so after one
-  or more relay hops the base station's `pkt.src_addr` is the last relay,
-  not the punching node. Punch and heartbeat payloads carry the originating
-  node's address explicitly, so the base station always attributes a punch
-  to the right control point regardless of how many hops it took — this
-  also means the same parsing path handles direct and relayed traffic
-  identically, with no special-casing.
-- **A small hop-count/TTL field is cheap insurance.** The topology is fixed
-  by configuration so loops shouldn't happen, but a 1-byte hop count
-  decremented per relay hop (packet dropped at zero) is nearly free and
-  guards against a future misconfiguration silently spamming the channel.
-- **Command packets route the same way, reversed.** A command destined for
-  a node beyond direct range travels base → relay → target using the same
-  fixed path, just the other direction — no separate mechanism needed.
+- **Origin address travels in the payload, not just the radio header —
+  implemented for punches.** The radio-layer address on each hop is only
+  the *next hop*, so after one or more relay hops `pkt.src_addr` is the
+  last relay, not the punching node. `PUNCH <origin> <card_id> ...` now
+  carries the originating node's address explicitly (`CardReadout::
+  to_payload`/`parse_payload` in `sportident.rs`), so the same parsing path
+  handles direct and relayed traffic identically, with no special-casing —
+  and `PunchAck` carries the origin too, so an ack can be relayed back
+  toward it just as the punch was relayed forward. **Heartbeats don't carry
+  an origin field yet** — only punch traffic relays for now.
+- **A relay is enabled with `--relay`; forwarding is best-effort, not
+  itself retried at the relay hop.** A relay node re-transmits a punch (or
+  an ack addressed elsewhere) unchanged toward its own `--dest` (uplink) or
+  toward the named target directly (downlink), without tracking or
+  retrying that specific hop. Reliability still comes from the end-to-end
+  stop-and-wait between the original sender and the final consumer — a
+  dropped relay hop just means the sender's own retry (see "Punch
+  Delivery" above) resends the punch, which gets relayed again.
+- **Hop-count/TTL is not implemented yet.** Still worth adding as cheap
+  insurance against a future misconfigured relay loop, but the current
+  fixed, hand-configured topology doesn't need it to function correctly
+  today — tracked as a follow-up, not a blocker.
+- **Command packets don't relay yet.** Unlike punches, `Command`/`Ack`
+  don't carry an origin-commander field — only "who's confirming," not
+  "who originally asked" — so a relay can't yet forward a command's ack
+  back to the right place. Extending that pair the same way `PUNCH`/
+  `PunchAck` were extended is the natural next step when this is needed.
 - **Dual-role nodes share one airtime/duty-cycle budget.** A node that is
   both a control point and a relay is carrying its own traffic plus
   whatever it forwards on the same radio, same duty-cycle allowance, same

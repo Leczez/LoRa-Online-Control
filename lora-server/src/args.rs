@@ -39,9 +39,19 @@ pub struct Args {
     #[arg(long, env = "LORA_ADDR", default_value_t = 0)]
     pub addr: u16,
 
-    /// Destination address for sent messages (0-65535)
+    /// Destination address for sent messages (0-65535). For a node acting
+    /// as a relay (--relay), this also doubles as the next hop for traffic
+    /// it forwards on behalf of other nodes.
     #[arg(long, env = "LORA_DEST", default_value_t = 1)]
     pub dest: u16,
+
+    /// Act as a relay: forward punches/acks/commands this node receives
+    /// that aren't its own, on toward --dest, rather than treating itself
+    /// as the final consumer. A node can be a relay and still have its own
+    /// local SI reader — the two roles are independent (see the "Relay
+    /// Nodes" section of docs/protocols/lora_online_control_protocol.md).
+    #[arg(long, env = "LORA_RELAY", default_value_t = false)]
+    pub relay: bool,
 
     /// TX power in dBm (10, 13, 17, or 22)
     #[arg(long, env = "LORA_POWER", default_value_t = 22)]

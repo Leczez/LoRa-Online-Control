@@ -256,7 +256,7 @@ fn run_desktop(args: Args, config: Config) -> Result<()> {
 
     let punch_buffer = setup_punch_pipeline(&args)?;
     run_daemon_loop(
-        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
         clients, cmd_rx, radio, si_rx, punch_buffer,
     )
 }
@@ -345,7 +345,7 @@ fn run_rpi(args: Args, config: Config) -> Result<()> {
 
     let punch_buffer = setup_punch_pipeline(&args)?;
     run_daemon_loop(
-        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
         clients, cmd_rx, radio, si_rx, punch_buffer,
     )
 }
@@ -394,7 +394,7 @@ fn run_spi(args: Args) -> Result<()> {
 
     let punch_buffer = setup_punch_pipeline(&args)?;
     run_daemon_loop(
-        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval },
+        DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
         clients, cmd_rx, radio, si_rx, punch_buffer,
     )
 }
@@ -527,7 +527,7 @@ struct PendingPunch {
 /// one card_id). Returns the row ids covered (to mark sent once acked) and
 /// the exact payload to send, rebuilt via `CardReadout::to_payload()` so it
 /// matches the wire format precisely.
-fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer) -> Result<Option<(u32, Vec<i64>, String)>> {
+fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16) -> Result<Option<(u32, Vec<i64>, String)>> {
     let unsent = buffer.unsent_local()?;
     let Some(first) = unsent.first() else { return Ok(None) };
     let card_id = first.card_id;
@@ -536,7 +536,7 @@ fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer) -> Result<Option<
     let punches = batch.iter()
         .map(|p| crate::sportident::ControlPunch { station: p.station, time_s: p.time_s })
         .collect();
-    let payload = crate::sportident::CardReadout { card_id, punches }.to_payload();
+    let payload = crate::sportident::CardReadout { card_id, punches }.to_payload(own_addr);
     Ok(Some((card_id, row_ids, payload)))
 }
 
@@ -555,12 +555,32 @@ fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, target: u16, set
     }
 }
 
+/// Re-transmits `raw_payload` unchanged toward `next_hop` — a relay's only
+/// job for traffic that isn't its own: pass it on, not track or retry it at
+/// this hop. Overall reliability still comes from the end-to-end stop-and-
+/// wait between the original sender and the final consumer; a lost forward
+/// just means that sender's own retry resends the punch, which gets
+/// forwarded again.
+fn forward(radio: &mut dyn Radio, clients: &Clients, next_hop: u16, raw_payload: &str) {
+    match radio.send(next_hop, raw_payload.as_bytes()) {
+        Ok(()) => {
+            log::info!("relayed to {}: {}", next_hop, raw_payload);
+            broadcast(clients, format!("TX {} {}", next_hop, raw_payload));
+        }
+        Err(e) => {
+            log::error!("relay forward failed: {}", e);
+            broadcast(clients, format!("ERR TX: {}", e));
+        }
+    }
+}
+
 /// The daemon's own identity and starting config — as opposed to the
 /// runtime handles (radio, sockets, buffers) it operates on.
 struct DaemonIdentity {
     own_addr: u16,
     dest: u16,
     heartbeat_interval: u64,
+    relay: bool,
 }
 
 fn run_daemon_loop(
@@ -571,7 +591,7 @@ fn run_daemon_loop(
     si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
     punch_buffer: Arc<crate::punch_buffer::PunchBuffer>,
 ) -> Result<()> {
-    let DaemonIdentity { own_addr, dest, heartbeat_interval } = identity;
+    let DaemonIdentity { own_addr, dest, heartbeat_interval, relay } = identity;
     let mut heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
     let mut dest = dest;
@@ -653,7 +673,7 @@ fn run_daemon_loop(
         }
 
         if pending_punch.is_none() {
-            match next_local_batch(&punch_buffer) {
+            match next_local_batch(&punch_buffer, own_addr) {
                 Ok(Some((card_id, row_ids, payload))) => {
                     match radio.send(dest, payload.as_bytes()) {
                         Ok(()) => {
@@ -695,20 +715,32 @@ fn run_daemon_loop(
                     Some(dbm) => log::info!("RX from {}: {} (RSSI: {}dBm)", pkt.src_addr, payload, dbm),
                     None      => log::info!("RX from {}: {}", pkt.src_addr, payload),
                 }
-                if let Some(readout) = crate::sportident::CardReadout::parse_payload(&payload) {
-                    let source = pkt.src_addr.to_string();
-                    for p in &readout.punches {
-                        if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &source) {
-                            log::error!("failed to buffer remote punch: {}", e);
+                if let Some((origin, readout)) = crate::sportident::CardReadout::parse_payload(&payload) {
+                    if relay && origin != own_addr {
+                        // Not ours to consume — pass it on toward our own
+                        // dest unchanged. The final consumer (whoever that
+                        // ends up being) does the buffering; a relay hop
+                        // doesn't duplicate that bookkeeping for traffic
+                        // that isn't its own.
+                        forward(radio.as_mut(), &clients, dest, &payload);
+                    } else {
+                        for p in &readout.punches {
+                            if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &origin.to_string()) {
+                                log::error!("failed to buffer remote punch: {}", e);
+                            }
                         }
-                    }
-                    // Ack is best-effort and not itself retried: if it's lost,
-                    // the sender's own retry timeout resends the punch, which
-                    // prompts another ack attempt here — self-healing without
-                    // needing reliable ack delivery.
-                    let ack = Frame::PunchAck { node: pkt.src_addr, card_id: readout.card_id };
-                    if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
-                        log::error!("failed to ack punch: {}", e);
+                        // Ack names the true origin (so a relay downstream
+                        // knows who it's ultimately for) but is transmitted
+                        // to whoever handed us this packet — retracing the
+                        // same path backward, one hop at a time. Best-effort,
+                        // not itself retried: if it's lost, the sender's own
+                        // retry timeout resends the punch, prompting another
+                        // ack attempt — self-healing without needing the ack
+                        // path itself to be reliable.
+                        let ack = Frame::PunchAck { node: origin, card_id: readout.card_id };
+                        if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
+                            log::error!("failed to ack punch: {}", e);
+                        }
                     }
                 } else if let Some(frame) = Frame::parse(&payload) {
                     match frame {
@@ -726,7 +758,10 @@ fn run_daemon_loop(
                             broadcast(&clients, format!("CMDAPPLIED {:?}", setting));
                         }
                         Frame::Command { .. } => {
-                            // Not addressed to us and we don't relay yet — ignore.
+                            // Not addressed to us. Commands/acks don't carry
+                            // an origin-commander field the way punches now
+                            // carry origin, so relaying them correctly needs
+                            // its own follow-up — left alone for now.
                         }
                         Frame::Ack { origin, setting } => {
                             let had = pending_commands.len();
@@ -748,8 +783,14 @@ fn run_daemon_loop(
                                 broadcast(&clients, format!("PACKOK {}", card_id));
                             }
                         }
+                        Frame::PunchAck { node, .. } if relay => {
+                            // Named node isn't us — pass the ack on toward
+                            // it directly (single-hop relay: assumed within
+                            // direct reach downstream of this relay).
+                            forward(radio.as_mut(), &clients, node, &payload);
+                        }
                         Frame::PunchAck { .. } => {
-                            // Ack for a different node — not ours, ignore.
+                            // Not relaying and not ours — ignore.
                         }
                     }
                 }
@@ -884,6 +925,54 @@ pub fn attach(socket_path: &str, addr: u16, dest: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_next_local_batch_empty_buffer_is_none() {
+        let buffer = crate::punch_buffer::PunchBuffer::open(":memory:").unwrap();
+        assert!(next_local_batch(&buffer, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_next_local_batch_groups_same_card_id_and_matches_wire_format() {
+        let buffer = crate::punch_buffer::PunchBuffer::open(":memory:").unwrap();
+        let id1 = buffer.record(123456, 31, 36070, "local").unwrap();
+        let id2 = buffer.record(123456, 32, 36200, "local").unwrap();
+
+        let (card_id, row_ids, payload) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        assert_eq!(card_id, 123456);
+        assert_eq!(row_ids, vec![id1, id2]);
+
+        let expected = crate::sportident::CardReadout {
+            card_id: 123456,
+            punches: vec![
+                crate::sportident::ControlPunch { station: 31, time_s: 36070 },
+                crate::sportident::ControlPunch { station: 32, time_s: 36200 },
+            ],
+        }.to_payload(5);
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn test_next_local_batch_does_not_mix_different_card_ids() {
+        let buffer = crate::punch_buffer::PunchBuffer::open(":memory:").unwrap();
+        buffer.record(1, 1, 100, "local").unwrap();
+        buffer.record(2, 2, 200, "local").unwrap();
+
+        let (card_id, row_ids, _) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        assert_eq!(card_id, 1);
+        assert_eq!(row_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_next_local_batch_ignores_remote_sourced_rows() {
+        let buffer = crate::punch_buffer::PunchBuffer::open(":memory:").unwrap();
+        buffer.record(1, 1, 100, "192.168.1.5").unwrap();
+        let id = buffer.record(2, 2, 200, "local").unwrap();
+
+        let (card_id, row_ids, _) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        assert_eq!(card_id, 2);
+        assert_eq!(row_ids, vec![id]);
+    }
 
     #[test]
     fn test_parse_status_line_cmdok() {
