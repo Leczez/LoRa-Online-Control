@@ -42,7 +42,7 @@ pub fn run(
     wifi.start()?;
     wifi.wait_netif_up()?;
 
-    log::info!("config portal up: connect to Wi-Fi \"{}\", browse to http://192.168.71.1/", ssid);
+    log::info!("config portal up: connect to Wi-Fi \"{}\", browse to http://192.168.4.1/", ssid);
 
     let mut server = EspHttpServer::new(&HttpServerConfig::default())?;
 
