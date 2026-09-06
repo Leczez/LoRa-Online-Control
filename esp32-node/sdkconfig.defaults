@@ -1,2 +1,14 @@
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+
+# ESP32-S3FH4R2's in-package PSRAM is quad-SPI (not octal) — see
+# docs/devices/esp32-s3/diymore_esp32-s3_mini_dev_board/wiring.md. Verified
+# against esp_psram/esp32s3/Kconfig.spiram in the actual ESP-IDF v5.3.1
+# checkout, not assumed. CAPS_ALLOC (not MALLOC) deliberately keeps PSRAM
+# out of the general heap — only src/psram.rs's explicit allocator uses it,
+# not a heap-wide policy change.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y

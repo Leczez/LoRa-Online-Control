@@ -6,7 +6,13 @@
 //! stopped and normal operation proceeds with whatever's in NVS (or these
 //! defaults on first boot). Reads punches from the SI master over USB
 //! (cp210x.rs + sportident.rs) and relays them to the base station over
-//! LoRa, using the same wire format lora-server already parses.
+//! LoRa, using the same wire format lora-server already parses. The pending-
+//! punch queue is allocated in PSRAM (psram.rs), not the main heap.
+
+// `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
+// nightly build, so this is available — see psram.rs's own doc comment for
+// what breaks if this ever moves to a stable compiler.
+#![feature(allocator_api)]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -25,10 +31,12 @@ use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi}
 mod config;
 mod cp210x;
 mod protocol;
+mod psram;
 mod sportident;
 mod wifi_config;
 
 use config::NodeConfig;
+use psram::PsramAllocator;
 use sportident::CardReadout;
 
 /// How often an unacked punch is retried — matches lora-server's own
@@ -148,7 +156,12 @@ fn main() -> anyhow::Result<()> {
         // queue on a crash/power cycle — unlike the RPi's SQLite-backed
         // buffer — is a known gap, not something worth solving before this
         // link is proven on real hardware.
-        let mut punch_queue: VecDeque<CardReadout> = VecDeque::new();
+        //
+        // Allocated in PSRAM (see psram.rs), not the main heap — this queue
+        // is the one place a backlog could actually grow (a burst of punches
+        // arriving faster than the stop-and-wait ack lets them drain), so
+        // it's the one worth pinning off the scarce internal RAM.
+        let mut punch_queue: VecDeque<CardReadout, PsramAllocator> = VecDeque::new_in(PsramAllocator);
         let mut pending_punch: Option<PendingPunch> = None;
 
         loop {
