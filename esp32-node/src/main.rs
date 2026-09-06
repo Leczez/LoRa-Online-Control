@@ -20,19 +20,22 @@ use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi}
 
 // --- Must match whatever lora-server is actually launched with on the RPi
 // (LORA_FREQ / LORA_SF / LORA_BW_HZ / LORA_CR / LORA_SYNC_WORD env vars /
-// CLI flags, see lora-server/src/args.rs) — these are that crate's defaults.
-const FREQ_HZ: u32 = 868_000_000;
+// CLI flags, see lora-server/src/args.rs) — these are lora-3b-2's actual
+// deployed /etc/lora-server/env values, not lora-server's own CLI defaults
+// (which default to 868MHz — this fleet runs 433MHz).
+const FREQ_HZ: u32 = 433_000_000;
 const SPREADING_FACTOR: u8 = 7;
 const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
 const CODING_RATE: CodingRate = CodingRate::Cr4_5;
 const SYNC_WORD: u8 = 0x12;
 const TX_POWER_DBM: i8 = 20;
 
-// This node's own LoRa address and the RPi base station's address. Field
-// nodes in the design doc use 10/11/12...; the RPi is conventionally 1
-// (lora-server's own --dest default). Change NODE_ADDR per physical node.
+// This node's own LoRa address and the target base station's address.
+// lora-3b-2 is itself addr=2 (a relay hop toward addr=1, not address 1
+// itself, per its /etc/lora-server/env) — BASE_ADDR targets it directly so
+// it logs the packet locally instead of only forwarding it onward.
 const NODE_ADDR: u16 = 10;
-const BASE_ADDR: u16 = 1;
+const BASE_ADDR: u16 = 2;
 
 fn main() -> anyhow::Result<()> {
     // Required on every esp-idf-svc std binary before touching any ESP-IDF
