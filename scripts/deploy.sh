@@ -101,6 +101,7 @@ LORA_ADDR=0
 LORA_DEST=1
 LORA_POWER=22
 LORA_HEARTBEAT_INTERVAL=60
+LORA_NETWORK_ID=LOC
 ENV
     echo "Created /etc/lora-server/env (edit to configure)"
 else
@@ -119,7 +120,7 @@ ExecStart=/usr/local/bin/lora-server \
   --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
-  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL}
+  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}"
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

@@ -62,6 +62,14 @@ pub struct Args {
     #[arg(long, env = "LORA_HEARTBEAT_INTERVAL", default_value_t = 60)]
     pub heartbeat_interval: u64,
 
+    /// Shared deployment identifier, prepended to every outgoing frame and
+    /// checked on every received one — a plain-text guard against accidental
+    /// cross-talk with another event running this same firmware nearby, not
+    /// a security mechanism. Change this per event/deployment; every node
+    /// and base station in one deployment must use the same value.
+    #[arg(long, env = "LORA_NETWORK_ID", default_value = "LOC")]
+    pub network_id: String,
+
     /// Unix socket path this daemon binds, for lora-tui (or other clients) to attach to.
     #[arg(long, default_value = "/run/lora-server/control.sock")]
     pub socket: String,

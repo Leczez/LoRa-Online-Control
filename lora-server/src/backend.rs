@@ -50,6 +50,61 @@ pub trait Radio: Send {
     }
 }
 
+// ── Network identification ──────────────────────────────────────────────────
+
+/// Wraps any `Radio` to transparently prepend/strip a shared deployment
+/// network ID on every send/receive (see docs/protocols/
+/// lora_online_control_protocol.md, "Network Identification"). Guards
+/// against accidental cross-talk from another deployment of this same
+/// open-source firmware nearby, or unrelated gear that happens to share our
+/// sync word — a plain-text prefix, not cryptographic, since the actual
+/// threat model here is accidental collision between independent events,
+/// not a deliberate spoofer with access to the source. `Frame::parse`/
+/// `CardReadout::parse_payload` stay completely unaware this exists — they
+/// only ever see a payload after the network ID has already been stripped.
+struct NetworkFilteredRadio<R: Radio> {
+    inner: R,
+    network_id: String,
+}
+
+impl<R: Radio> NetworkFilteredRadio<R> {
+    fn new(inner: R, network_id: String) -> Self {
+        Self { inner, network_id }
+    }
+}
+
+impl<R: Radio> Radio for NetworkFilteredRadio<R> {
+    fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()> {
+        let mut framed = Vec::with_capacity(self.network_id.len() + 1 + payload.len());
+        framed.extend_from_slice(self.network_id.as_bytes());
+        framed.push(b' ');
+        framed.extend_from_slice(payload);
+        self.inner.send(dest, &framed)
+    }
+
+    fn receive(&mut self) -> Result<Option<ReceivedPacket>> {
+        let Some(pkt) = self.inner.receive()? else { return Ok(None) };
+        let Ok(text) = core::str::from_utf8(&pkt.payload) else { return Ok(None) };
+        let Some(rest) = text.strip_prefix(self.network_id.as_str()).and_then(|s| s.strip_prefix(' ')) else {
+            // Not ours — a different deployment, or unrelated traffic that
+            // happens to share our radio settings. Treat as if nothing was
+            // received rather than misparsing someone else's frame.
+            return Ok(None);
+        };
+        let mut payload = heapless::Vec::<u8, 240>::new();
+        let _ = payload.extend_from_slice(rest.as_bytes());
+        Ok(Some(ReceivedPacket { src_addr: pkt.src_addr, payload, rssi: pkt.rssi }))
+    }
+
+    fn set_dest(&mut self, dest: u16) -> Result<()> {
+        self.inner.set_dest(dest)
+    }
+
+    fn poll_status(&mut self) -> Vec<StatusEvent> {
+        self.inner.poll_status()
+    }
+}
+
 // ── Config builder ────────────────────────────────────────────────────────────
 
 fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
@@ -161,11 +216,11 @@ fn run_spi(args: Args) -> Result<()> {
             let dio0 = RppalInputPin(gpio.get(dio0_pin)?.into_input());
             let mut driver = sx127x::Sx127xSpi::new_with_dio0(spi_device, reset, StdDelay, dio0);
             sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(Box::new(driver))
+            Ok(Box::new(NetworkFilteredRadio::new(driver, args.network_id.clone())))
         } else {
             let mut driver = sx127x::Sx127xSpi::new(spi_device, reset, StdDelay);
             sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(Box::new(driver))
+            Ok(Box::new(NetworkFilteredRadio::new(driver, args.network_id.clone())))
         }
     };
 
@@ -319,6 +374,22 @@ struct PendingPunch {
     payload: String,
     sent_at: Instant,
     attempts: u32,
+}
+
+/// Parses a heartbeat payload: bare `HB` (no battery — mains-powered relays,
+/// or a device without battery sensing wired) or `HB <pct> <mv>` (battery
+/// percent 0-100, millivolts — see esp32-node/src/battery.rs). Returns
+/// `None` if `payload` isn't a heartbeat at all; `Some(None)`/`Some(Some(..))`
+/// distinguish "is a heartbeat, no battery data" from "has battery data".
+fn parse_heartbeat(payload: &str) -> Option<Option<(u8, u16)>> {
+    if payload == "HB" {
+        return Some(None);
+    }
+    let rest = payload.strip_prefix("HB ")?;
+    let mut parts = rest.splitn(2, ' ');
+    let pct: u8 = parts.next()?.parse().ok()?;
+    let mv: u16 = parts.next()?.parse().ok()?;
+    Some(Some((pct, mv)))
 }
 
 /// The next batch of local, unsent punches to (re)transmit: the oldest
@@ -618,6 +689,15 @@ fn run_daemon_loop(
                             // Not relaying and not ours — ignore.
                         }
                     }
+                } else if let Some(battery) = parse_heartbeat(&payload) {
+                    match battery {
+                        Some((pct, mv)) => log::info!("HB from {}: battery {}% ({}mV)", pkt.src_addr, pct, mv),
+                        None => log::info!("HB from {} (no battery data)", pkt.src_addr),
+                    }
+                    let battery_field = battery
+                        .map(|(pct, mv)| format!("{} {}", pct, mv))
+                        .unwrap_or_else(|| "-".to_string());
+                    broadcast(&clients, format!("HBRX {} {}", pkt.src_addr, battery_field));
                 }
                 broadcast(&clients, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
             }
@@ -848,5 +928,84 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), "CMD 5 30");
+    }
+
+    #[test]
+    fn test_parse_heartbeat_bare() {
+        assert_eq!(parse_heartbeat("HB"), Some(None));
+    }
+
+    #[test]
+    fn test_parse_heartbeat_with_battery() {
+        assert_eq!(parse_heartbeat("HB 82 3950"), Some(Some((82, 3950))));
+    }
+
+    #[test]
+    fn test_parse_heartbeat_rejects_non_heartbeat() {
+        assert_eq!(parse_heartbeat("PUNCH 5 123456 31:100"), None);
+        assert_eq!(parse_heartbeat(""), None);
+        assert_eq!(parse_heartbeat("HB notanumber 3950"), None);
+        assert_eq!(parse_heartbeat("HB 82"), None);
+    }
+
+    /// A radio double that just records what was sent and lets a test queue
+    /// up canned received packets — enough to test NetworkFilteredRadio's
+    /// prepend/strip logic without any real hardware.
+    struct FakeRadio {
+        sent: Vec<(u16, Vec<u8>)>,
+        to_receive: std::collections::VecDeque<ReceivedPacket>,
+    }
+
+    impl Radio for FakeRadio {
+        fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()> {
+            self.sent.push((dest, payload.to_vec()));
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Option<ReceivedPacket>> {
+            Ok(self.to_receive.pop_front())
+        }
+    }
+
+    fn packet(src_addr: u16, payload: &str) -> ReceivedPacket {
+        let mut p = heapless::Vec::<u8, 240>::new();
+        let _ = p.extend_from_slice(payload.as_bytes());
+        ReceivedPacket { src_addr, payload: p, rssi: None }
+    }
+
+    #[test]
+    fn test_network_filtered_radio_prepends_network_id_on_send() {
+        let inner = FakeRadio { sent: Vec::new(), to_receive: Default::default() };
+        let mut radio = NetworkFilteredRadio::new(inner, "LOC".to_string());
+        radio.send(5, b"PUNCH 10 123456 31:100").unwrap();
+        assert_eq!(radio.inner.sent, vec![(5, b"LOC PUNCH 10 123456 31:100".to_vec())]);
+    }
+
+    #[test]
+    fn test_network_filtered_radio_strips_matching_network_id_on_receive() {
+        let mut inner = FakeRadio { sent: Vec::new(), to_receive: Default::default() };
+        inner.to_receive.push_back(packet(5, "LOC PUNCH 10 123456 31:100"));
+        let mut radio = NetworkFilteredRadio::new(inner, "LOC".to_string());
+
+        let pkt = radio.receive().unwrap().unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"PUNCH 10 123456 31:100");
+        assert_eq!(pkt.src_addr, 5);
+    }
+
+    #[test]
+    fn test_network_filtered_radio_drops_mismatched_network_id() {
+        let mut inner = FakeRadio { sent: Vec::new(), to_receive: Default::default() };
+        inner.to_receive.push_back(packet(5, "OTHERDEPLOY PUNCH 10 123456 31:100"));
+        let mut radio = NetworkFilteredRadio::new(inner, "LOC".to_string());
+
+        assert!(radio.receive().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_network_filtered_radio_drops_payload_with_no_network_id_at_all() {
+        let mut inner = FakeRadio { sent: Vec::new(), to_receive: Default::default() };
+        inner.to_receive.push_back(packet(5, "PUNCH 10 123456 31:100"));
+        let mut radio = NetworkFilteredRadio::new(inner, "LOC".to_string());
+
+        assert!(radio.receive().unwrap().is_none());
     }
 }
