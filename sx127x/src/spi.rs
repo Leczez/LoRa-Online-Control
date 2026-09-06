@@ -36,13 +36,17 @@ const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
 const MODE_TX: u8 = 0x03;
 const MODE_RXCONTINUOUS: u8 = 0x05;
+const MODE_CAD: u8 = 0x07;
 const MODE_MASK: u8 = 0x07;
 
 const IRQ_TX_DONE: u8 = 0x08;
 const IRQ_RX_DONE: u8 = 0x40;
 const IRQ_PAYLOAD_CRC_ERROR: u8 = 0x20;
+const IRQ_CAD_DONE: u8 = 0x04;
+const IRQ_CAD_DETECTED: u8 = 0x01;
 
 const TX_POLL_ITERATIONS: u32 = 100_000;
+const CAD_POLL_ITERATIONS: u32 = 100_000;
 
 pub struct Sx127xSpi<SPI, RESET, DELAY> {
     pub(crate) spi: SPI,
@@ -103,6 +107,26 @@ where
 
     fn set_mode(&mut self, mode: u8) -> Result<(), Sx127xError<SPI::Error>> {
         self.write_register(REG_OP_MODE, LONG_RANGE_MODE | mode)
+    }
+
+    /// Channel Activity Detection: scans for an in-progress LoRa preamble on
+    /// the configured frequency/SF. LoRa itself has no listen-before-talk —
+    /// this is the chip's own optional support for building one, used by
+    /// `send()` as a basic collision check (not a lock/reservation, just a
+    /// "does it look busy right now" read before keying up TX).
+    fn channel_activity_detected(&mut self) -> Result<bool, Sx127xError<SPI::Error>> {
+        self.write_register(REG_IRQ_FLAGS, 0xFF)?;
+        self.set_mode(MODE_CAD)?;
+
+        for _ in 0..CAD_POLL_ITERATIONS {
+            let irq = self.read_register(REG_IRQ_FLAGS)?;
+            if irq & IRQ_CAD_DONE != 0 {
+                let detected = irq & IRQ_CAD_DETECTED != 0;
+                self.write_register(REG_IRQ_FLAGS, 0xFF)?;
+                return Ok(detected);
+            }
+        }
+        Err(Sx127xError::Timeout)
     }
 }
 
@@ -172,6 +196,17 @@ where
         }
 
         self.set_mode(MODE_STDBY)?;
+
+        // LoRa has no built-in collision avoidance — CAD is the closest
+        // thing the chip offers: a scan for an in-progress transmission on
+        // this frequency/SF before we key up. Not a guarantee (a signal
+        // could start between this check and our own TX), just a basic
+        // "don't blindly transmit into an obviously busy channel."
+        if self.channel_activity_detected()? {
+            self.set_mode(MODE_STDBY)?;
+            return Err(Sx127xError::ChannelBusy);
+        }
+
         self.write_register(REG_FIFO_ADDR_PTR, 0x00)?;
 
         // Capacity is guaranteed by the length check above (2-byte prefix +
@@ -286,6 +321,108 @@ mod tests {
         let mut out = [0u8; 3];
         radio.read_fifo(&mut out).unwrap();
         assert_eq!(out, [0xAA, 0xBB, 0xCC]);
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_send_happy_path_clear_channel_transmits_successfully() {
+        let spi = SpiMock::<u8>::new(&[
+            // send(): set_mode(STDBY)
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+            // channel_activity_detected(): clear IRQ flags
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            // channel_activity_detected(): set_mode(CAD)
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_CAD]),
+            SpiTx::transaction_end(),
+            // channel_activity_detected(): poll — CadDone set, CadDetected clear (channel free)
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, IRQ_CAD_DONE]),
+            SpiTx::transaction_end(),
+            // channel_activity_detected(): clear IRQ flags after CAD
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            // send(): write_register(FIFO_ADDR_PTR, 0)
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_FIFO_ADDR_PTR | 0x80, 0x00]),
+            SpiTx::transaction_end(),
+            // send(): write_register(PAYLOAD_LENGTH, 3) — 2 addr bytes + 1 payload byte
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_PAYLOAD_LENGTH | 0x80, 0x03]),
+            SpiTx::transaction_end(),
+            // send(): write_fifo([addr_hi=0, addr_lo=0, 0xAB])
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_FIFO | 0x80, 0x00, 0x00, 0xAB]),
+            SpiTx::transaction_end(),
+            // send(): write_register(IRQ_FLAGS, 0xFF) before TX
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            // send(): set_mode(TX)
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_TX]),
+            SpiTx::transaction_end(),
+            // send(): poll — TxDone set
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, IRQ_TX_DONE]),
+            SpiTx::transaction_end(),
+            // send(): clear IRQ flags after TxDone
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
+
+        radio.send(0, &[0xAB]).unwrap();
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_send_returns_channel_busy_when_cad_detects_activity() {
+        // Proves two things: send() surfaces CAD-detected activity as an
+        // error instead of transmitting over it, and it stops there — no
+        // FIFO write or TX mode transition happens (the mock has no more
+        // expected transactions and would panic on any extra one).
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_CAD]),
+            SpiTx::transaction_end(),
+            // poll — CadDone AND CadDetected set (channel busy)
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(
+                std::vec![REG_IRQ_FLAGS & 0x7F, 0x00],
+                std::vec![0x00, IRQ_CAD_DONE | IRQ_CAD_DETECTED],
+            ),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            // send() returns to STDBY before reporting the error
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
+
+        let err = radio.send(0, &[0xAB]).unwrap_err();
+        assert!(matches!(err, Sx127xError::ChannelBusy));
 
         radio.spi.done();
         radio.reset.done();

@@ -49,6 +49,11 @@ pub enum Sx127xError<E> {
     /// prefix. Rejected up front rather than silently dropped, so a caller
     /// never mistakes "nothing was actually transmitted" for success.
     PayloadTooLarge { len: usize, max: usize },
+    /// Channel Activity Detection found another LoRa transmission already
+    /// in progress — `send()` declined to transmit rather than collide with
+    /// it. Not itself retried inside the driver; callers already have their
+    /// own retry-on-failure logic (this looks like any other failed send).
+    ChannelBusy,
 }
 
 #[cfg(feature = "std")]
@@ -63,6 +68,7 @@ impl<E: core::fmt::Debug> core::fmt::Display for Sx127xError<E> {
             Sx127xError::PayloadTooLarge { len, max } => {
                 write!(f, "payload too large: {} bytes (max {})", len, max)
             }
+            Sx127xError::ChannelBusy => write!(f, "channel busy (CAD detected activity)"),
         }
     }
 }
