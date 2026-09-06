@@ -197,6 +197,13 @@ pub struct SiReader<T: Read + Write> {
 }
 
 impl<T: Read + Write> SiReader<T> {
+    /// Access to the underlying transport — e.g. so a caller can check a
+    /// transport-specific hotplug/disconnect signal (`sportident.rs` itself
+    /// stays generic over `T` and doesn't know about any such signal).
+    pub fn transport(&self) -> &T {
+        &self.port
+    }
+
     pub fn new(port: T) -> Self {
         let mut reader = Self {
             port, buf: Vec::new(), pending: None,

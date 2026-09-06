@@ -113,35 +113,49 @@ fn main() -> anyhow::Result<()> {
     );
 
     cp210x::install()?;
-    log::info!("waiting for SI master (VID {:#06x} PID {:#06x})...", sportident::SI_VID, sportident::SI_PID);
-    let transport = cp210x::wait_for_si_master(sportident::SI_PID, sportident::SI_BAUD);
-    let mut si_reader = sportident::SiReader::new(transport);
-    log::info!("SI master connected");
 
+    // Outer loop: (re)connect to the SI master. Runs again whenever the
+    // inner loop notices a disconnect — mirrors the RPi side's udev-hotplug
+    // reconnect loop in lora-server/src/sportident.rs, just driven by the
+    // CDC-ACM driver's own disconnect event instead of udev.
     loop {
-        match radio.receive() {
-            Ok(Some(pkt)) => {
-                let text = core::str::from_utf8(&pkt.payload).unwrap_or("<non-utf8>");
-                log::info!("RX from {:#06x} rssi={:?}: {}", pkt.src_addr, pkt.rssi, text);
-            }
-            Ok(None) => {}
-            Err(e) => log::warn!("receive() error: {:?}", e),
-        }
+        log::info!("waiting for SI master (VID {:#06x} PID {:#06x})...", sportident::SI_VID, sportident::SI_PID);
+        let transport = cp210x::wait_for_si_master(sportident::SI_PID, sportident::SI_BAUD);
+        let mut si_reader = sportident::SiReader::new(transport);
+        log::info!("SI master connected");
 
-        match si_reader.read_event() {
-            Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
-                log::info!("SI card {} ({} punches)", readout.card_id, readout.punches.len());
-                let payload = readout.to_payload(current.addr);
-                match radio.send(current.dest, payload.as_bytes()) {
-                    Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
-                    Err(e) => log::warn!("send() error: {:?}", e),
+        loop {
+            match radio.receive() {
+                Ok(Some(pkt)) => {
+                    let text = core::str::from_utf8(&pkt.payload).unwrap_or("<non-utf8>");
+                    log::info!("RX from {:#06x} rssi={:?}: {}", pkt.src_addr, pkt.rssi, text);
                 }
+                Ok(None) => {}
+                Err(e) => log::warn!("receive() error: {:?}", e),
             }
-            Ok(Some(sportident::SiEvent::CardRemoved)) => {}
-            Ok(None) => {}
-            Err(e) => log::warn!("SI read error: {:?}", e),
-        }
 
-        std::thread::sleep(Duration::from_millis(50));
+            if si_reader.transport().is_disconnected() {
+                log::warn!("SI master disconnected — will reconnect");
+                break;
+            }
+
+            match si_reader.read_event() {
+                Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
+                    log::info!("SI card {} ({} punches)", readout.card_id, readout.punches.len());
+                    let payload = readout.to_payload(current.addr);
+                    match radio.send(current.dest, payload.as_bytes()) {
+                        Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
+                        Err(e) => log::warn!("send() error: {:?}", e),
+                    }
+                }
+                Ok(Some(sportident::SiEvent::CardRemoved)) => {}
+                Ok(None) => {}
+                Err(e) => log::warn!("SI read error: {:?}", e),
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // si_reader (and its Cp210xTransport) drops here, closing the dead
+        // handle, before the outer loop waits for the device to reappear.
     }
 }
