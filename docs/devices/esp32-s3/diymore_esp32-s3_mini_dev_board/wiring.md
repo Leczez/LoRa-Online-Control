@@ -13,6 +13,12 @@ ESP32-S3FH4R2 datasheet in a couple of places): strapping pins are GPIO0/3/
 GPIO26-32 (GPIO33-37 only matter in octal mode, which this chip doesn't
 use). None of the assignments below conflict with any of those.
 
+**Physical accessibility, separate from electrical reservations:** GPIO14/
+15/16 are broken out on this board only as small SMD probe points clustered
+near a component labeled "C3" close to the chip — not proper header pins.
+Nothing electrically wrong with them, but not realistically solderable for
+a wired connection, so avoid them for anything you actually need to wire.
+
 ## RFM95W (SX1276) SPI wiring — as flashed in `esp32-node`
 
 | Signal | GPIO | Notes |
@@ -22,7 +28,7 @@ use). None of the assignments below conflict with any of those.
 | MISO | 13 | |
 | NSS (CS) | 10 | |
 | RESET | 9 | |
-| DIO0 (interrupt) | 14 | Wired into the firmware (`Sx127xSpi::new_with_dio0` path exists) but **not yet physically connected** on the bench unit — firmware currently falls back to SPI-register polling for TX/CAD completion. Connect this pin and switch `esp32-node/src/main.rs` over to `new_with_dio0` for cheaper GPIO-based waiting. |
+| DIO0 (interrupt) | 7 | Not GPIO14 — see the SMD-probe-point note above. Firmware has the `Sx127xSpi::new_with_dio0` path ready but **not yet physically connected** on the bench unit, so it currently falls back to SPI-register polling for TX/CAD completion. Connect this pin and switch `esp32-node/src/main.rs` over to `new_with_dio0` for cheaper GPIO-based waiting. |
 
 ## Other assignments (planned, not yet wired)
 

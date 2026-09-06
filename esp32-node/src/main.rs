@@ -69,10 +69,12 @@ fn main() -> anyhow::Result<()> {
     let sdi = pins.gpio13; // MISO
     let cs = pins.gpio10; // NSS
     let reset = PinDriver::output(pins.gpio9)?;
-    // DIO0 (GPIO14) isn't wired yet — falls back to SPI-register polling for
-    // TX/CAD completion (Sx127xSpi::new). Once DIO0 is physically connected,
-    // switch to Sx127xSpi::new_with_dio0(..., PinDriver::input(pins.gpio14)?)
-    // for cheaper GPIO-based waiting instead.
+    // DIO0 (GPIO7 — GPIO14/15/16 are SMD probe points on this board, not
+    // usable header pins, see the wiring doc) isn't wired yet — falls back
+    // to SPI-register polling for TX/CAD completion (Sx127xSpi::new). Once
+    // DIO0 is physically connected, switch to
+    // Sx127xSpi::new_with_dio0(..., PinDriver::input(pins.gpio7)?) for
+    // cheaper GPIO-based waiting instead.
 
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
