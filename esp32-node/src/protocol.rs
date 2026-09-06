@@ -16,6 +16,35 @@ pub fn parse_punch_ack(s: &str) -> Option<(u16, u32)> {
     Some((node, card_id))
 }
 
+/// Wraps `radio.send`, prepending the shared deployment network ID (see
+/// docs/protocols/lora_online_control_protocol.md, "Network Identification")
+/// — must match `lora-server`'s `NetworkFilteredRadio::send` exactly, since
+/// that's the same envelope on the other end.
+pub fn send_framed<R: sx127x::LoraRadio>(
+    radio: &mut R, dest: u16, payload: &[u8], network_id: &str,
+) -> Result<(), R::Error> {
+    let mut framed = std::vec::Vec::with_capacity(network_id.len() + 1 + payload.len());
+    framed.extend_from_slice(network_id.as_bytes());
+    framed.push(b' ');
+    framed.extend_from_slice(payload);
+    radio.send(dest, &framed)
+}
+
+/// Wraps `radio.receive`, stripping and validating the network ID before
+/// handing back the inner payload as a `String` — a mismatched or missing ID
+/// is treated as if nothing was received, not misparsed as one of our own
+/// malformed frames. Mirrors `lora-server`'s `NetworkFilteredRadio::receive`.
+pub fn receive_framed<R: sx127x::LoraRadio>(
+    radio: &mut R, network_id: &str,
+) -> Result<Option<(u16, Option<i16>, String)>, R::Error> {
+    let Some(pkt) = radio.receive()? else { return Ok(None) };
+    let Ok(text) = core::str::from_utf8(&pkt.payload) else { return Ok(None) };
+    let Some(rest) = text.strip_prefix(network_id).and_then(|s| s.strip_prefix(' ')) else {
+        return Ok(None);
+    };
+    Ok(Some((pkt.src_addr, pkt.rssi, rest.to_string())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,8 +46,9 @@ pub fn run(
 
     let mut server = EspHttpServer::new(&HttpServerConfig::default())?;
 
+    let render_current = current.clone();
     server.fn_handler::<anyhow::Error, _>("/", Method::Get, move |req| {
-        let html = render_page(&current);
+        let html = render_page(&render_current);
         let mut resp = req.into_ok_response()?;
         resp.write_all(html.as_bytes())?;
         Ok(())
@@ -64,6 +65,7 @@ pub fn run(
             addr: form.get("addr").and_then(|v| v.parse().ok()).unwrap_or(current.addr),
             dest: form.get("dest").and_then(|v| v.parse().ok()).unwrap_or(current.dest),
             freq_hz: form.get("freq").and_then(|v| v.parse().ok()).unwrap_or(current.freq_hz),
+            network_id: form.get("network_id").map(|v| v.to_string()).unwrap_or_else(|| current.network_id.clone()),
         };
         {
             let mut guard = save_nvs.lock().unwrap();
@@ -100,11 +102,13 @@ fn render_page(cfg: &NodeConfig) -> String {
   <label>Node address <input type="number" name="addr" value="{addr}"></label><br>
   <label>Base/dest address <input type="number" name="dest" value="{dest}"></label><br>
   <label>Frequency (Hz) <input type="number" name="freq" value="{freq}"></label><br>
+  <label>Network ID <input type="text" name="network_id" value="{network_id}"></label><br>
   <button type="submit">Save &amp; restart</button>
 </form>
 </body></html>"#,
         addr = cfg.addr,
         dest = cfg.dest,
         freq = cfg.freq_hz,
+        network_id = cfg.network_id,
     )
 }

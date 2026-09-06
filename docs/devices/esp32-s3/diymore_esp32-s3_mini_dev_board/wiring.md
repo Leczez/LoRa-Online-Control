@@ -28,7 +28,13 @@ a wired connection, so avoid them for anything you actually need to wire.
 | MISO | 13 | |
 | NSS (CS) | 10 | |
 | RESET | 9 | |
-| DIO0 (interrupt) | 7 | Not GPIO14 — see the SMD-probe-point note above. Firmware has the `Sx127xSpi::new_with_dio0` path ready but **not yet physically connected** on the bench unit, so it currently falls back to SPI-register polling for TX/CAD completion. Connect this pin and switch `esp32-node/src/main.rs` over to `new_with_dio0` for cheaper GPIO-based waiting. |
+| DIO0 (interrupt) | 7 | Not GPIO14 — see the SMD-probe-point note above. Physically connected; `main.rs` uses `Sx127xSpi::new_with_dio0` for TX/CAD completion instead of SPI-register polling. |
+
+## Battery sensing
+
+| Signal | GPIO | Notes |
+|---|---|---|
+| Battery sense (ADC1) | 4 | **Placeholder** — `esp32-node/src/battery.rs` assumes a 2:1 resistor divider (e.g. two equal resistors, battery+ → R → this pin → R → GND) so a 4.2V full battery reads ~2.1V at the pin. Adjust `DIVIDER_RATIO` in that file if the actual resistor values differ. Divider not built yet as of this writing. |
 
 ## Other assignments (planned, not yet wired)
 

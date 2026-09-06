@@ -28,6 +28,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi};
 
+mod battery;
 mod config;
 mod cp210x;
 mod protocol;
@@ -46,6 +47,13 @@ use sportident::CardReadout;
 /// docs/protocols/lora_online_control_protocol.md's "Punch Delivery".
 const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Matches lora-server's own --heartbeat-interval default. Heartbeats keep
+/// firing across SI-master reconnects (the timer lives outside the outer
+/// reconnect loop) but do pause while actively blocked inside
+/// wait_for_si_master — a known simplification, not a hard requirement, so
+/// long as reconnects are the rare/brief case they're meant to be.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
 struct PendingPunch {
     card_id: u32,
     payload: String,
@@ -62,10 +70,14 @@ const CODING_RATE: CodingRate = CodingRate::Cr4_5;
 const SYNC_WORD: u8 = 0x12;
 const TX_POWER_DBM: i8 = 20;
 
-// First-boot defaults, matching lora-3b-2's actual deployment. addr=10 is
-// this node's own address; dest=2 targets lora-3b-2 directly (it's itself
-// addr=2, a relay hop toward addr=1, not address 1 itself).
-const DEFAULT_CONFIG: NodeConfig = NodeConfig { addr: 10, dest: 2, freq_hz: 433_000_000 };
+/// First-boot defaults, matching lora-3b-2's actual deployment. addr=10 is
+/// this node's own address; dest=2 targets lora-3b-2 directly (it's itself
+/// addr=2, a relay hop toward addr=1, not address 1 itself). A function, not
+/// a const, since NodeConfig::network_id is a heap String — String::from
+/// isn't callable in a const context.
+fn default_config() -> NodeConfig {
+    NodeConfig { addr: 10, dest: 2, freq_hz: 433_000_000, network_id: "LOC".to_string() }
+}
 
 fn main() -> anyhow::Result<()> {
     // Required on every esp-idf-svc std binary before touching any ESP-IDF
@@ -79,13 +91,14 @@ fn main() -> anyhow::Result<()> {
     let nvs = Arc::new(Mutex::new(config::open_nvs()?));
     let current = {
         let guard = nvs.lock().unwrap();
-        NodeConfig::load(&guard, DEFAULT_CONFIG)
+        NodeConfig::load(&guard, default_config())
     };
 
     // Either returns after the window closes with `current` still accurate
     // (nothing saved), or a save inside the portal calls esp_restart()
-    // directly and this call never returns at all.
-    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current)?;
+    // directly and this call never returns at all. Cloned since `current`
+    // (not Copy — network_id is a String) is still needed below.
+    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current.clone())?;
 
     let pins = peripherals.pins;
 
@@ -132,9 +145,14 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("radio configure failed: {:?}", e))?;
 
     log::info!(
-        "esp32-node up: addr={} dest={} freq={}Hz sf={}",
-        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR
+        "esp32-node up: addr={} dest={} freq={}Hz sf={} network_id={}",
+        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.network_id
     );
+
+    // GPIO4: placeholder battery-sense pin, see battery.rs and the wiring
+    // doc — the actual voltage-divider circuit isn't built yet.
+    let mut battery = battery::BatteryMonitor::new(peripherals.adc1, pins.gpio4)?;
+    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL; // send one immediately on boot
 
     cp210x::install()?;
 
@@ -165,22 +183,36 @@ fn main() -> anyhow::Result<()> {
         let mut pending_punch: Option<PendingPunch> = None;
 
         loop {
-            match radio.receive() {
-                Ok(Some(pkt)) => {
-                    let text = core::str::from_utf8(&pkt.payload).unwrap_or("<non-utf8>");
-                    if let Some((node, card_id)) = protocol::parse_punch_ack(text) {
+            match protocol::receive_framed(&mut radio, &current.network_id) {
+                Ok(Some((src_addr, rssi, text))) => {
+                    if let Some((node, card_id)) = protocol::parse_punch_ack(&text) {
                         if node == current.addr
                             && pending_punch.as_ref().is_some_and(|p| p.card_id == card_id)
                         {
-                            log::info!("PUNCH card {} acked by {:#06x}", card_id, pkt.src_addr);
+                            log::info!("PUNCH card {} acked by {:#06x}", card_id, src_addr);
                             pending_punch = None;
                         }
                     } else {
-                        log::info!("RX from {:#06x} rssi={:?}: {}", pkt.src_addr, pkt.rssi, text);
+                        log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
                     }
                 }
                 Ok(None) => {}
                 Err(e) => log::warn!("receive() error: {:?}", e),
+            }
+
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                last_heartbeat = Instant::now();
+                let hb_payload = match battery.read() {
+                    Ok((pct, mv)) => std::format!("HB {} {}", pct, mv),
+                    Err(e) => {
+                        log::warn!("battery read failed ({:?}), sending bare HB", e);
+                        "HB".to_string()
+                    }
+                };
+                match protocol::send_framed(&mut radio, current.dest, hb_payload.as_bytes(), &current.network_id) {
+                    Ok(()) => log::info!("HB to {:#06x}: {}", current.dest, hb_payload),
+                    Err(e) => log::warn!("HB send failed: {:?}", e),
+                }
             }
 
             if si_reader.transport().is_disconnected() {
@@ -203,7 +235,7 @@ fn main() -> anyhow::Result<()> {
             if pending_punch.is_none() {
                 if let Some(readout) = punch_queue.pop_front() {
                     let payload = readout.to_payload(current.addr);
-                    match radio.send(current.dest, payload.as_bytes()) {
+                    match protocol::send_framed(&mut radio, current.dest, payload.as_bytes(), &current.network_id) {
                         Ok(()) => {
                             log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
                             pending_punch = Some(PendingPunch {
@@ -220,7 +252,7 @@ fn main() -> anyhow::Result<()> {
                 if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
                     p.attempts += 1;
                     p.sent_at = Instant::now();
-                    match radio.send(current.dest, p.payload.as_bytes()) {
+                    match protocol::send_framed(&mut radio, current.dest, p.payload.as_bytes(), &current.network_id) {
                         Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
                         Err(e) => log::warn!("PUNCH retry failed: {:?}", e),
                     }
