@@ -4,9 +4,9 @@
 //! config portal first (see wifi_config.rs) — a technician can change
 //! addr/dest/freq there without reflashing; if nothing is saved, Wi-Fi is
 //! stopped and normal operation proceeds with whatever's in NVS (or these
-//! defaults on first boot). USB-host SI-master reading isn't wired in yet —
-//! this still sends a periodic ping placeholder, now driven by the loaded
-//! config instead of hardcoded constants.
+//! defaults on first boot). Reads punches from the SI master over USB
+//! (cp210x.rs + sportident.rs) and relays them to the base station over
+//! LoRa, using the same wire format lora-server already parses.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +22,8 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi};
 
 mod config;
+mod cp210x;
+mod sportident;
 mod wifi_config;
 
 use config::NodeConfig;
@@ -110,7 +112,12 @@ fn main() -> anyhow::Result<()> {
         current.addr, current.dest, current.freq_hz, SPREADING_FACTOR
     );
 
-    let mut ping_count: u32 = 0;
+    cp210x::install()?;
+    log::info!("waiting for SI master (VID {:#06x} PID {:#06x})...", sportident::SI_VID, sportident::SI_PID);
+    let transport = cp210x::wait_for_si_master(sportident::SI_PID, sportident::SI_BAUD);
+    let mut si_reader = sportident::SiReader::new(transport);
+    log::info!("SI master connected");
+
     loop {
         match radio.receive() {
             Ok(Some(pkt)) => {
@@ -121,13 +128,20 @@ fn main() -> anyhow::Result<()> {
             Err(e) => log::warn!("receive() error: {:?}", e),
         }
 
-        ping_count += 1;
-        let payload = std::format!("PING {ping_count} from esp32-s3-super-mini");
-        match radio.send(current.dest, payload.as_bytes()) {
-            Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
-            Err(e) => log::warn!("send() error: {:?}", e),
+        match si_reader.read_event() {
+            Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
+                log::info!("SI card {} ({} punches)", readout.card_id, readout.punches.len());
+                let payload = readout.to_payload(current.addr);
+                match radio.send(current.dest, payload.as_bytes()) {
+                    Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
+                    Err(e) => log::warn!("send() error: {:?}", e),
+                }
+            }
+            Ok(Some(sportident::SiEvent::CardRemoved)) => {}
+            Ok(None) => {}
+            Err(e) => log::warn!("SI read error: {:?}", e),
         }
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

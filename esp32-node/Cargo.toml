@@ -35,6 +35,7 @@ esp-idf-hal = "0.45"
 embedded-hal = "1.0"
 embedded-svc = "0.28"
 anyhow = "1"
+libc = "0.2"
 
 # The same no_std, embedded-hal-generic SX1276 driver lora-server runs on the
 # RPi side — reused as-is, not reimplemented, so both ends speak the same
@@ -44,3 +45,13 @@ sx127x = { path = "../sx127x" }
 
 [build-dependencies]
 embuild = "0.33"
+
+# SI master station identifies as VID 0x10C4 / PID 0x800A — a Silicon Labs
+# CP210x USB-to-UART bridge, not a generic USB-CDC-ACM device. The plain
+# esp-idf usb_host_cdc_acm driver doesn't speak CP210x's vendor-specific
+# protocol, so this pulls in Espressif's own VCP extension for it instead
+# (see docs/superpowers/specs/2026-08-25-esp32-si-punch-node-design.md).
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/usb_host_cp210x_vcp", version = "2.2.0" }
+bindings_header = "src/cp210x_bindings.h"
+bindings_module = "cp210x"
