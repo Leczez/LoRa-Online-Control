@@ -7,6 +7,15 @@ pub struct Args {
     #[arg(long, env = "LORA_RESET_PIN", default_value_t = 25)]
     pub reset_pin: u8,
 
+    /// Optional DIO0 GPIO pin (BCM, Raspberry Pi only). When set, TX/CAD
+    /// completion is detected by polling this pin directly instead of
+    /// IRQ_FLAGS over SPI — cheaper per check, since it's a plain GPIO read
+    /// rather than an SPI transaction. Requires physically wiring the
+    /// module's DIO0 pin to this GPIO; omit to keep polling over SPI as
+    /// before (no extra wiring needed).
+    #[arg(long, env = "LORA_DIO0_PIN")]
+    pub dio0_pin: Option<u8>,
+
     /// LoRa spreading factor for the SPI radio (7-12)
     #[arg(long, env = "LORA_SF", default_value_t = 7)]
     pub sf: u8,

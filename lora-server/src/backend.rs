@@ -95,11 +95,12 @@ fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
 // sx127x::Sx127xSpi is foreign but Radio is our own trait, so implementing
 // it directly is fine — no orphan-rule newtype wrapper needed (that was only
 // ever required to avoid overlapping with sx126x's now-removed blanket impl).
-impl<SPI, RESET, DELAY> Radio for sx127x::Sx127xSpi<SPI, RESET, DELAY>
+impl<SPI, RESET, DELAY, DIO0> Radio for sx127x::Sx127xSpi<SPI, RESET, DELAY, DIO0>
 where
     SPI: embedded_hal::spi::SpiDevice + Send,
     RESET: embedded_hal::digital::OutputPin + Send,
     DELAY: embedded_hal::delay::DelayNs + Send,
+    DIO0: embedded_hal::digital::InputPin + Send,
 {
     fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()> {
         sx127x::LoraRadio::send(self, dest, payload).map_err(|e| anyhow::anyhow!("{}", e))
@@ -125,6 +126,19 @@ impl embedded_hal::digital::OutputPin for RppalPin {
     fn set_low(&mut self) -> Result<(), Self::Error> { self.0.set_low(); Ok(()) }
 }
 
+/// Wraps the module's DIO0 pin for --dio0-pin: sx127x polls this directly
+/// (a plain GPIO read) instead of IRQ_FLAGS over SPI when waiting for
+/// TX/CAD completion — see sx127x::Sx127xSpi::new_with_dio0.
+struct RppalInputPin(rppal::gpio::InputPin);
+
+impl embedded_hal::digital::ErrorType for RppalInputPin {
+    type Error = std::convert::Infallible;
+}
+impl embedded_hal::digital::InputPin for RppalInputPin {
+    fn is_high(&mut self) -> Result<bool, Self::Error> { Ok(self.0.is_high()) }
+    fn is_low(&mut self) -> Result<bool, Self::Error> { Ok(self.0.is_low()) }
+}
+
 fn run_spi(args: Args) -> Result<()> {
     use rppal::gpio::Gpio;
     use rppal::spi::{Bus, Mode, SimpleHalSpiDevice, SlaveSelect, Spi};
@@ -132,32 +146,45 @@ fn run_spi(args: Args) -> Result<()> {
     let config = build_sx127x_config(&args)?;
     let si_rx = crate::sportident::spawn_si_worker();
 
-    let build_driver = || -> Result<sx127x::Sx127xSpi<SimpleHalSpiDevice<Spi>, RppalPin, StdDelay>> {
+    // Boxed to Box<dyn Radio> right here: the DIO0 and no-DIO0 paths build
+    // genuinely different concrete Sx127xSpi<..., DIO0> types, which can't
+    // both be the return type of one closure without unifying them behind
+    // a trait object.
+    let build_driver = || -> Result<Box<dyn Radio>> {
         let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss0, 1_000_000, Mode::Mode0)
             .map_err(|e| anyhow::anyhow!("SPI open failed: {}", e))?;
         let spi_device = SimpleHalSpiDevice::new(spi);
         let gpio = Gpio::new()?;
         let reset = RppalPin(gpio.get(args.reset_pin)?.into_output_high());
-        let mut driver = sx127x::Sx127xSpi::new(spi_device, reset, StdDelay);
-        sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
-        Ok(driver)
+
+        if let Some(dio0_pin) = args.dio0_pin {
+            let dio0 = RppalInputPin(gpio.get(dio0_pin)?.into_input());
+            let mut driver = sx127x::Sx127xSpi::new_with_dio0(spi_device, reset, StdDelay, dio0);
+            sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(Box::new(driver))
+        } else {
+            let mut driver = sx127x::Sx127xSpi::new(spi_device, reset, StdDelay);
+            sx127x::LoraRadio::configure(&mut driver, &config).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(Box::new(driver))
+        }
     };
 
     if std::io::stdout().is_terminal() {
         let driver = build_driver()?;
         let port_info = format!(
-            "SPI0 CE0  freq: {}Hz  sf: {}  bw: {}Hz",
-            config.freq_hz, config.spreading_factor, config.bandwidth.hz()
+            "SPI0 CE0  freq: {}Hz  sf: {}  bw: {}Hz{}",
+            config.freq_hz, config.spreading_factor, config.bandwidth.hz(),
+            if args.dio0_pin.is_some() { "  dio0: wired" } else { "" }
         );
-        return crate::ui::run_app(port_info, args.addr, args.dest, Box::new(driver), args.heartbeat_interval, si_rx);
+        return crate::ui::run_app(port_info, args.addr, args.dest, driver, args.heartbeat_interval, si_rx);
     }
 
     let (clients, cmd_rx) = setup_daemon_socket(&args.socket)?;
     let radio: Box<dyn Radio> = loop {
         match build_driver() {
             Ok(driver) => {
-                log::info!("SX1276 module ready on SPI0 CE0");
-                break Box::new(driver);
+                log::info!("SX1276 module ready on SPI0 CE0{}", if args.dio0_pin.is_some() { " (DIO0 wired)" } else { "" });
+                break driver;
             }
             Err(e) => {
                 log::warn!("SPI module not responding ({}), retrying in 5s", e);

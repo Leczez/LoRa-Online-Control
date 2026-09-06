@@ -2,11 +2,11 @@
 
 use embedded_hal::{
     delay::DelayNs,
-    digital::OutputPin,
+    digital::{InputPin, OutputPin},
     spi::SpiDevice,
 };
 
-use crate::{Config, LoraRadio, ReceivedPacket, Sx127xError};
+use crate::{Config, LoraRadio, NoInputPin, ReceivedPacket, Sx127xError};
 
 const REG_FIFO: u8 = 0x00;
 const REG_OP_MODE: u8 = 0x01;
@@ -30,6 +30,7 @@ const REG_SYNC_WORD: u8 = 0x39;
 const REG_PA_DAC: u8 = 0x4D;
 #[cfg(test)]
 const REG_VERSION: u8 = 0x42;
+const REG_DIO_MAPPING1: u8 = 0x40;
 
 const LONG_RANGE_MODE: u8 = 0x80;
 const MODE_SLEEP: u8 = 0x00;
@@ -45,24 +46,102 @@ const IRQ_PAYLOAD_CRC_ERROR: u8 = 0x20;
 const IRQ_CAD_DONE: u8 = 0x04;
 const IRQ_CAD_DETECTED: u8 = 0x01;
 
+// Dio0Mapping (RegDioMapping1 bits 7:6) — which IRQ_FLAGS event DIO0
+// reflects; only one at a time, so `wait_for` repoints it before each wait.
+// receive()'s own poll stays SPI-based rather than DIO0 deliberately: it's
+// meant to keep observing RxDone continuously while idle, which one shared
+// pin can't do at the same time it's repointed at TxDone/CadDone for a
+// send() or CAD check in between — no RXDONE mapping constant is needed
+// since nothing here ever points DIO0 at it.
+const DIO0_MAPPING_TXDONE: u8 = 0x40;
+const DIO0_MAPPING_CADDONE: u8 = 0x80;
+
 const TX_POLL_ITERATIONS: u32 = 100_000;
 const CAD_POLL_ITERATIONS: u32 = 100_000;
 
-pub struct Sx127xSpi<SPI, RESET, DELAY> {
+/// Which blocking wait `wait_for` is doing, and how to observe it either
+/// way: the IRQ_FLAGS bit to poll over SPI, or how DIO0 should be mapped to
+/// reflect the same event directly when a DIO0 pin is wired.
+enum WaitFor {
+    TxDone,
+    CadDone,
+}
+
+impl WaitFor {
+    fn irq_bit(&self) -> u8 {
+        match self {
+            WaitFor::TxDone => IRQ_TX_DONE,
+            WaitFor::CadDone => IRQ_CAD_DONE,
+        }
+    }
+    fn dio0_mapping(&self) -> u8 {
+        match self {
+            WaitFor::TxDone => DIO0_MAPPING_TXDONE,
+            WaitFor::CadDone => DIO0_MAPPING_CADDONE,
+        }
+    }
+}
+
+pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin> {
     pub(crate) spi: SPI,
     pub(crate) reset: RESET,
     pub(crate) delay: DELAY,
+    dio0: Option<DIO0>,
     addr: u16,
 }
 
-impl<SPI, RESET, DELAY> Sx127xSpi<SPI, RESET, DELAY>
+impl<SPI, RESET, DELAY> Sx127xSpi<SPI, RESET, DELAY, NoInputPin>
 where
     SPI: SpiDevice,
     RESET: OutputPin,
     DELAY: DelayNs,
 {
+    /// Completion (TX/CAD) is detected by polling IRQ_FLAGS over SPI — the
+    /// only option without a DIO0 pin wired. See `new_with_dio0` for the
+    /// lower-overhead alternative.
     pub fn new(spi: SPI, reset: RESET, delay: DELAY) -> Self {
-        Self { spi, reset, delay, addr: 0 }
+        Self { spi, reset, delay, dio0: None, addr: 0 }
+    }
+}
+
+impl<SPI, RESET, DELAY, DIO0> Sx127xSpi<SPI, RESET, DELAY, DIO0>
+where
+    SPI: SpiDevice,
+    RESET: OutputPin,
+    DELAY: DelayNs,
+    DIO0: InputPin,
+{
+    /// Like `new`, but completion (TX/CAD) is detected by polling the
+    /// module's DIO0 pin directly — a plain GPIO read, far cheaper than an
+    /// SPI transaction, so this busy-waits much more efficiently than the
+    /// SPI-polling default. Requires wiring the module's DIO0 pin to `dio0`;
+    /// its mapping (which event it reflects) is reconfigured automatically
+    /// for whichever operation is about to run.
+    pub fn new_with_dio0(spi: SPI, reset: RESET, delay: DELAY, dio0: DIO0) -> Self {
+        Self { spi, reset, delay, dio0: Some(dio0), addr: 0 }
+    }
+
+    fn wait_for(&mut self, event: WaitFor, poll_iterations: u32) -> Result<u8, Sx127xError<SPI::Error>> {
+        if self.dio0.is_some() {
+            self.write_register(REG_DIO_MAPPING1, event.dio0_mapping())?;
+            for _ in 0..poll_iterations {
+                // Safe: confirmed Some above, and this borrow doesn't
+                // overlap the self.read_register(..) call below it.
+                let high = self.dio0.as_mut().unwrap().is_high().map_err(|_| Sx127xError::InvalidConfig)?;
+                if high {
+                    return self.read_register(REG_IRQ_FLAGS);
+                }
+            }
+            return Err(Sx127xError::Timeout);
+        }
+
+        for _ in 0..poll_iterations {
+            let irq = self.read_register(REG_IRQ_FLAGS)?;
+            if irq & event.irq_bit() != 0 {
+                return Ok(irq);
+            }
+        }
+        Err(Sx127xError::Timeout)
     }
 
     fn read_register(&mut self, addr: u8) -> Result<u8, Sx127xError<SPI::Error>> {
@@ -117,24 +196,18 @@ where
     fn channel_activity_detected(&mut self) -> Result<bool, Sx127xError<SPI::Error>> {
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         self.set_mode(MODE_CAD)?;
-
-        for _ in 0..CAD_POLL_ITERATIONS {
-            let irq = self.read_register(REG_IRQ_FLAGS)?;
-            if irq & IRQ_CAD_DONE != 0 {
-                let detected = irq & IRQ_CAD_DETECTED != 0;
-                self.write_register(REG_IRQ_FLAGS, 0xFF)?;
-                return Ok(detected);
-            }
-        }
-        Err(Sx127xError::Timeout)
+        let irq = self.wait_for(WaitFor::CadDone, CAD_POLL_ITERATIONS)?;
+        self.write_register(REG_IRQ_FLAGS, 0xFF)?;
+        Ok(irq & IRQ_CAD_DETECTED != 0)
     }
 }
 
-impl<SPI, RESET, DELAY> LoraRadio for Sx127xSpi<SPI, RESET, DELAY>
+impl<SPI, RESET, DELAY, DIO0> LoraRadio for Sx127xSpi<SPI, RESET, DELAY, DIO0>
 where
     SPI: SpiDevice,
     RESET: OutputPin,
     DELAY: DelayNs,
+    DIO0: InputPin,
 {
     type Error = Sx127xError<SPI::Error>;
 
@@ -223,15 +296,9 @@ where
 
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         self.set_mode(MODE_TX)?;
-
-        for _ in 0..TX_POLL_ITERATIONS {
-            let irq = self.read_register(REG_IRQ_FLAGS)?;
-            if irq & IRQ_TX_DONE != 0 {
-                self.write_register(REG_IRQ_FLAGS, 0xFF)?;
-                return Ok(());
-            }
-        }
-        Err(Sx127xError::Timeout)
+        self.wait_for(WaitFor::TxDone, TX_POLL_ITERATIONS)?;
+        self.write_register(REG_IRQ_FLAGS, 0xFF)?;
+        Ok(())
     }
 
     fn receive(&mut self) -> Result<Option<ReceivedPacket>, Self::Error> {
@@ -426,6 +493,116 @@ mod tests {
 
         radio.spi.done();
         radio.reset.done();
+    }
+
+    #[test]
+    fn test_send_via_dio0_happy_path_clear_channel_transmits_successfully() {
+        // Same scenario as the SPI-polling happy path, but with a DIO0 pin
+        // wired: wait_for should map DIO0 to the right event, poll the pin
+        // (not IRQ_FLAGS) for readiness, and only touch SPI once more per
+        // wait to read the detail bits (CadDetected) or clear flags.
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_CAD]),
+            SpiTx::transaction_end(),
+            // wait_for(CadDone) via DIO0: map DIO0 to CadDone, then (after
+            // the pin goes high, checked via the dio0 mock, not SPI) a
+            // single IRQ_FLAGS read for the CadDetected detail bit.
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_CADDONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, IRQ_CAD_DONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_FIFO_ADDR_PTR | 0x80, 0x00]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_PAYLOAD_LENGTH | 0x80, 0x03]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_FIFO | 0x80, 0x00, 0x00, 0xAB]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_TX]),
+            SpiTx::transaction_end(),
+            // wait_for(TxDone) via DIO0: map DIO0 to TxDone, then one
+            // IRQ_FLAGS read once the pin goes high.
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_TXDONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, IRQ_TX_DONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let dio0 = PinMock::new(&[PinTx::get(State::High), PinTx::get(State::High)]);
+        let mut radio = Sx127xSpi::new_with_dio0(spi, reset, NoopDelay, dio0);
+
+        radio.send(0, &[0xAB]).unwrap();
+
+        radio.spi.done();
+        radio.reset.done();
+        radio.dio0.unwrap().done();
+    }
+
+    #[test]
+    fn test_send_via_dio0_returns_channel_busy_when_cad_detects_activity() {
+        // Mirrors the SPI-polling busy-channel test, but via DIO0: proves
+        // the pin-based path also stops immediately on a detected channel
+        // (no FIFO/TX transactions), and that only a single IRQ_FLAGS read
+        // was needed to learn CadDetected, not a polling loop.
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_CAD]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_CADDONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(
+                std::vec![REG_IRQ_FLAGS & 0x7F, 0x00],
+                std::vec![0x00, IRQ_CAD_DONE | IRQ_CAD_DETECTED],
+            ),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_IRQ_FLAGS | 0x80, 0xFF]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_OP_MODE | 0x80, LONG_RANGE_MODE | MODE_STDBY]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let dio0 = PinMock::new(&[PinTx::get(State::High)]);
+        let mut radio = Sx127xSpi::new_with_dio0(spi, reset, NoopDelay, dio0);
+
+        let err = radio.send(0, &[0xAB]).unwrap_err();
+        assert!(matches!(err, Sx127xError::ChannelBusy));
+
+        radio.spi.done();
+        radio.reset.done();
+        radio.dio0.unwrap().done();
     }
 
     #[test]

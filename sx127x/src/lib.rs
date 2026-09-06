@@ -11,6 +11,29 @@ pub use spi::Sx127xSpi;
 
 use heapless::Vec;
 
+/// Placeholder DIO0 pin for `Sx127xSpi` instances that don't wire up a
+/// hardware interrupt line — completion (TX/CAD done) is detected by
+/// polling IRQ_FLAGS over SPI instead, exactly as before this type existed.
+/// Its `InputPin` impl is never actually exercised (the driver only reads
+/// `dio0` when a real pin was provided via `new_with_dio0`); it exists
+/// purely so `Sx127xSpi`'s default type parameter has something concrete
+/// to be.
+#[derive(Debug, Default)]
+pub struct NoInputPin;
+
+impl embedded_hal::digital::ErrorType for NoInputPin {
+    type Error = core::convert::Infallible;
+}
+
+impl embedded_hal::digital::InputPin for NoInputPin {
+    fn is_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+    fn is_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
 /// A packet received from the radio.
 #[derive(Debug)]
 pub struct ReceivedPacket {
