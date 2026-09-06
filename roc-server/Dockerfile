@@ -7,9 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY sx126x sx126x
 COPY sx127x sx127x
-COPY lora-cli lora-cli
+COPY lora-server lora-server
 COPY roc-server roc-server
 RUN cargo build --release -p roc-server
 
