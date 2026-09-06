@@ -8,8 +8,9 @@
 //! (cp210x.rs + sportident.rs) and relays them to the base station over
 //! LoRa, using the same wire format lora-server already parses.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use embedded_hal::spi::MODE_0;
 use esp_idf_hal::delay::Delay;
@@ -23,10 +24,26 @@ use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi}
 
 mod config;
 mod cp210x;
+mod protocol;
 mod sportident;
 mod wifi_config;
 
 use config::NodeConfig;
+use sportident::CardReadout;
+
+/// How often an unacked punch is retried — matches lora-server's own
+/// PUNCH_RETRY_INTERVAL exactly (not load-bearing for correctness, just
+/// consistent with the rest of the fleet). No give-up count: a punch is
+/// real event data, retried indefinitely rather than dropped, per
+/// docs/protocols/lora_online_control_protocol.md's "Punch Delivery".
+const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PendingPunch {
+    card_id: u32,
+    payload: String,
+    sent_at: Instant,
+    attempts: u32,
+}
 
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
 // page (only addr/dest/freq are; see wifi_config.rs). Must match lora-3b-2's
@@ -72,11 +89,10 @@ fn main() -> anyhow::Result<()> {
     let cs = pins.gpio10; // NSS
     let reset = PinDriver::output(pins.gpio9)?;
     // DIO0 (GPIO7 — GPIO14/15/16 are SMD probe points on this board, not
-    // usable header pins, see the wiring doc) isn't wired yet — falls back
-    // to SPI-register polling for TX/CAD completion (Sx127xSpi::new). Once
-    // DIO0 is physically connected, switch to
-    // Sx127xSpi::new_with_dio0(..., PinDriver::input(pins.gpio7)?) for
-    // cheaper GPIO-based waiting instead.
+    // usable header pins, see the wiring doc) is now physically connected,
+    // so completion (TX/CAD) is detected via this pin instead of polling
+    // IRQ_FLAGS over SPI.
+    let dio0 = PinDriver::input(pins.gpio7)?;
 
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
@@ -91,7 +107,7 @@ fn main() -> anyhow::Result<()> {
         &SpiConfig::new().baudrate(4.MHz().into()).data_mode(MODE_0),
     )?;
 
-    let mut radio = Sx127xSpi::new(spi, reset, Delay::new_default());
+    let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
 
     let radio_config = RadioConfig {
         freq_hz: current.freq_hz,
@@ -124,11 +140,31 @@ fn main() -> anyhow::Result<()> {
         let mut si_reader = sportident::SiReader::new(transport);
         log::info!("SI master connected");
 
+        // Punches read from the SI master land here first — actual
+        // transmission (and its stop-and-wait retry) is driven by this queue
+        // below, mirroring lora-server's own punch_buffer/PendingPunch
+        // design, minus persistence across a reboot (see docs/protocols/
+        // lora_online_control_protocol.md's "Punch Delivery"). Losing this
+        // queue on a crash/power cycle — unlike the RPi's SQLite-backed
+        // buffer — is a known gap, not something worth solving before this
+        // link is proven on real hardware.
+        let mut punch_queue: VecDeque<CardReadout> = VecDeque::new();
+        let mut pending_punch: Option<PendingPunch> = None;
+
         loop {
             match radio.receive() {
                 Ok(Some(pkt)) => {
                     let text = core::str::from_utf8(&pkt.payload).unwrap_or("<non-utf8>");
-                    log::info!("RX from {:#06x} rssi={:?}: {}", pkt.src_addr, pkt.rssi, text);
+                    if let Some((node, card_id)) = protocol::parse_punch_ack(text) {
+                        if node == current.addr
+                            && pending_punch.as_ref().is_some_and(|p| p.card_id == card_id)
+                        {
+                            log::info!("PUNCH card {} acked by {:#06x}", card_id, pkt.src_addr);
+                            pending_punch = None;
+                        }
+                    } else {
+                        log::info!("RX from {:#06x} rssi={:?}: {}", pkt.src_addr, pkt.rssi, text);
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => log::warn!("receive() error: {:?}", e),
@@ -141,16 +177,41 @@ fn main() -> anyhow::Result<()> {
 
             match si_reader.read_event() {
                 Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
-                    log::info!("SI card {} ({} punches)", readout.card_id, readout.punches.len());
-                    let payload = readout.to_payload(current.addr);
-                    match radio.send(current.dest, payload.as_bytes()) {
-                        Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
-                        Err(e) => log::warn!("send() error: {:?}", e),
-                    }
+                    log::info!("buffered SI card {} ({} punches)", readout.card_id, readout.punches.len());
+                    punch_queue.push_back(readout);
                 }
                 Ok(Some(sportident::SiEvent::CardRemoved)) => {}
                 Ok(None) => {}
                 Err(e) => log::warn!("SI read error: {:?}", e),
+            }
+
+            // Stop-and-wait: only one punch outstanding at a time. The next
+            // queued punch isn't even attempted until this one is acked.
+            if pending_punch.is_none() {
+                if let Some(readout) = punch_queue.pop_front() {
+                    let payload = readout.to_payload(current.addr);
+                    match radio.send(current.dest, payload.as_bytes()) {
+                        Ok(()) => {
+                            log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
+                            pending_punch = Some(PendingPunch {
+                                card_id: readout.card_id, payload, sent_at: Instant::now(), attempts: 1,
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!("PUNCH send failed ({:?}), will retry", e);
+                            punch_queue.push_front(readout);
+                        }
+                    }
+                }
+            } else if let Some(p) = &mut pending_punch {
+                if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
+                    p.attempts += 1;
+                    p.sent_at = Instant::now();
+                    match radio.send(current.dest, p.payload.as_bytes()) {
+                        Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
+                        Err(e) => log::warn!("PUNCH retry failed: {:?}", e),
+                    }
+                }
             }
 
             std::thread::sleep(Duration::from_millis(50));
