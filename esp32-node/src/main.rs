@@ -1,12 +1,14 @@
-//! Minimal radio smoke test for the ESP32-S3 Super Mini + RFM95W link.
+//! ESP32-S3 SportIdent punch relay node.
 //!
-//! Scope: prove the SPI wiring and over-the-air config match lora-server on
-//! the RPi side. It sends a text ping every few seconds and logs anything it
-//! receives. It is deliberately NOT the full node from
-//! docs/superpowers/specs/2026-08-25-esp32-si-punch-node-design.md — no USB
-//! host, no OLED, no Wi-Fi config page. Those come after this link is
-//! confirmed working on real hardware.
+//! No physical config switch: the node always boots into a 2-minute Wi-Fi
+//! config portal first (see wifi_config.rs) — a technician can change
+//! addr/dest/freq there without reflashing; if nothing is saved, Wi-Fi is
+//! stopped and normal operation proceeds with whatever's in NVS (or these
+//! defaults on first boot). USB-host SI-master reading isn't wired in yet —
+//! this still sends a periodic ping placeholder, now driven by the loaded
+//! config instead of hardcoded constants.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use embedded_hal::spi::MODE_0;
@@ -15,27 +17,28 @@ use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::prelude::*;
 use esp_idf_hal::spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi};
 
-// --- Must match whatever lora-server is actually launched with on the RPi
-// (LORA_FREQ / LORA_SF / LORA_BW_HZ / LORA_CR / LORA_SYNC_WORD env vars /
-// CLI flags, see lora-server/src/args.rs) — these are lora-3b-2's actual
-// deployed /etc/lora-server/env values, not lora-server's own CLI defaults
-// (which default to 868MHz — this fleet runs 433MHz).
-const FREQ_HZ: u32 = 433_000_000;
+mod config;
+mod wifi_config;
+
+use config::NodeConfig;
+
+// Fixed modem parameters, shared fleet-wide — not exposed via the config
+// page (only addr/dest/freq are; see wifi_config.rs). Must match lora-3b-2's
+// deployed /etc/lora-server/env.
 const SPREADING_FACTOR: u8 = 7;
 const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
 const CODING_RATE: CodingRate = CodingRate::Cr4_5;
 const SYNC_WORD: u8 = 0x12;
 const TX_POWER_DBM: i8 = 20;
 
-// This node's own LoRa address and the target base station's address.
-// lora-3b-2 is itself addr=2 (a relay hop toward addr=1, not address 1
-// itself, per its /etc/lora-server/env) — BASE_ADDR targets it directly so
-// it logs the packet locally instead of only forwarding it onward.
-const NODE_ADDR: u16 = 10;
-const BASE_ADDR: u16 = 2;
+// First-boot defaults, matching lora-3b-2's actual deployment. addr=10 is
+// this node's own address; dest=2 targets lora-3b-2 directly (it's itself
+// addr=2, a relay hop toward addr=1, not address 1 itself).
+const DEFAULT_CONFIG: NodeConfig = NodeConfig { addr: 10, dest: 2, freq_hz: 433_000_000 };
 
 fn main() -> anyhow::Result<()> {
     // Required on every esp-idf-svc std binary before touching any ESP-IDF
@@ -44,6 +47,19 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take()?;
+    let sysloop = EspSystemEventLoop::take()?;
+
+    let nvs = Arc::new(Mutex::new(config::open_nvs()?));
+    let current = {
+        let guard = nvs.lock().unwrap();
+        NodeConfig::load(&guard, DEFAULT_CONFIG)
+    };
+
+    // Either returns after the window closes with `current` still accurate
+    // (nothing saved), or a save inside the portal calls esp_restart()
+    // directly and this call never returns at all.
+    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current)?;
+
     let pins = peripherals.pins;
 
     // Pin assignment matches the schematic's suggested wiring (Note 1: not
@@ -74,8 +90,8 @@ fn main() -> anyhow::Result<()> {
     let mut radio = Sx127xSpi::new(spi, reset, Delay::new_default());
 
     let radio_config = RadioConfig {
-        freq_hz: FREQ_HZ,
-        addr: NODE_ADDR,
+        freq_hz: current.freq_hz,
+        addr: current.addr,
         spreading_factor: SPREADING_FACTOR,
         bandwidth: BANDWIDTH,
         coding_rate: CODING_RATE,
@@ -87,7 +103,10 @@ fn main() -> anyhow::Result<()> {
         .configure(&radio_config)
         .map_err(|e| anyhow::anyhow!("radio configure failed: {:?}", e))?;
 
-    log::info!("esp32-node up: addr={NODE_ADDR} dest={BASE_ADDR} freq={FREQ_HZ}Hz sf={SPREADING_FACTOR}");
+    log::info!(
+        "esp32-node up: addr={} dest={} freq={}Hz sf={}",
+        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR
+    );
 
     let mut ping_count: u32 = 0;
     loop {
@@ -102,8 +121,8 @@ fn main() -> anyhow::Result<()> {
 
         ping_count += 1;
         let payload = std::format!("PING {ping_count} from esp32-s3-super-mini");
-        match radio.send(BASE_ADDR, payload.as_bytes()) {
-            Ok(()) => log::info!("TX -> {:#06x}: {}", BASE_ADDR, payload),
+        match radio.send(current.dest, payload.as_bytes()) {
+            Ok(()) => log::info!("TX -> {:#06x}: {}", current.dest, payload),
             Err(e) => log::warn!("send() error: {:?}", e),
         }
 

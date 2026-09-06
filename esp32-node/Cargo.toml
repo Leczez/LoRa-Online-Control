@@ -33,6 +33,7 @@ log = { version = "0.4", default-features = false }
 esp-idf-svc = { version = "0.51", default-features = false }
 esp-idf-hal = "0.45"
 embedded-hal = "1.0"
+embedded-svc = "0.28"
 anyhow = "1"
 
 # The same no_std, embedded-hal-generic SX1276 driver lora-server runs on the
