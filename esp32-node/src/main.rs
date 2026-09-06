@@ -50,7 +50,10 @@ fn main() -> anyhow::Result<()> {
     let sdi = pins.gpio13; // MISO
     let cs = pins.gpio10; // NSS
     let reset = PinDriver::output(pins.gpio9)?;
-    let dio0 = PinDriver::input(pins.gpio14)?;
+    // DIO0 (GPIO14) isn't wired yet — falls back to SPI-register polling for
+    // TX/CAD completion (Sx127xSpi::new). Once DIO0 is physically connected,
+    // switch to Sx127xSpi::new_with_dio0(..., PinDriver::input(pins.gpio14)?)
+    // for cheaper GPIO-based waiting instead.
 
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
@@ -65,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         &SpiConfig::new().baudrate(4.MHz().into()).data_mode(MODE_0),
     )?;
 
-    let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
+    let mut radio = Sx127xSpi::new(spi, reset, Delay::new_default());
 
     let radio_config = RadioConfig {
         freq_hz: FREQ_HZ,
