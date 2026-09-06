@@ -1,0 +1,45 @@
+[package]
+name = "esp32-node"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+# Kept out of the workspace at the repo root: this crate builds against the
+# Xtensa/esp-idf toolchain (espup), a different compiler entirely from the
+# rest of the workspace (sx127x/lora-server/roc-server, all plain
+# rustc/rustup targets). Declaring [workspace] here marks this directory as
+# its own workspace root so Cargo doesn't try to fold it into the parent's.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "esp32-node"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[features]
+default = ["std", "esp-idf-svc/native"]
+std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+esp-idf-svc = { version = "0.51", default-features = false }
+esp-idf-hal = "0.45"
+embedded-hal = "1.0"
+anyhow = "1"
+
+# The same no_std, embedded-hal-generic SX1276 driver lora-server runs on the
+# RPi side — reused as-is, not reimplemented, so both ends speak the same
+# over-the-air format by construction (see docs/superpowers/specs/2026-08-25-
+# esp32-si-punch-node-design.md, "Risk 1").
+sx127x = { path = "../sx127x" }
+
+[build-dependencies]
+embuild = "0.33"
