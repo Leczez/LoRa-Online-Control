@@ -2,6 +2,13 @@
 
 **Date:** 2026-08-25
 
+**Actual GPIO wiring for the board in hand (diymore ESP32-S3-Zero clone) is
+tracked separately, not in this doc: see
+`docs/devices/esp32-s3/diymore_esp32-s3_mini_dev_board/wiring.md`.** This
+spec's own pin numbers below were always a placeholder ("Note 1: not
+fixed"); the wiring doc reflects what's actually flashed and confirmed
+against Espressif's real pin-reservation list for this chip.
+
 ## 1. Goals & scope
 
 **Goal:** Field units (ESP32-S3 + RFM95W) read punches from a USB-connected SportIdent master station and relay them over LoRa directly to the RPi's bare SX1276/RFM95W module, for start/check control points that can't run a wired PC.
