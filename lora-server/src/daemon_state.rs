@@ -30,6 +30,12 @@ pub struct NodeStatus {
     pub last_heartbeat: Option<SystemTime>,
     pub battery_pct: Option<u8>,
     pub battery_mv: Option<u16>,
+    /// Whether this node's most recent heartbeat that actually reported SI
+    /// status said an SI master was connected. `None` means no heartbeat
+    /// from this node has ever reported SI status at all (a relay with no
+    /// SI-reader concept, or older firmware) — distinct from "reported not
+    /// connected", which is `Some(false)`.
+    pub si_present: Option<bool>,
     pub last_punch: Option<SystemTime>,
     pub last_rssi: Option<i16>,
 }
@@ -50,12 +56,15 @@ impl DaemonState {
         self.log.push_back(LogEntry { seq: self.next_seq, at: SystemTime::now(), line });
     }
 
-    pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>) {
+    pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>, si_present: Option<bool>) {
         let entry = self.nodes.entry(node).or_default();
         entry.last_heartbeat = Some(SystemTime::now());
         if let Some((pct, mv)) = battery {
             entry.battery_pct = Some(pct);
             entry.battery_mv = Some(mv);
+        }
+        if let Some(present) = si_present {
+            entry.si_present = Some(present);
         }
     }
 
@@ -102,11 +111,27 @@ mod tests {
     #[test]
     fn test_record_heartbeat_preserves_battery_when_not_resent() {
         let mut state = DaemonState::default();
-        state.record_heartbeat(5, Some((80, 3900)));
-        state.record_heartbeat(5, None); // bare "HB", no battery data this time
+        state.record_heartbeat(5, Some((80, 3900)), None);
+        state.record_heartbeat(5, None, None); // bare "HB", no battery data this time
         let node = &state.nodes[&5];
         assert_eq!(node.battery_pct, Some(80));
         assert_eq!(node.battery_mv, Some(3900));
+    }
+
+    #[test]
+    fn test_record_heartbeat_preserves_si_present_when_not_resent() {
+        let mut state = DaemonState::default();
+        state.record_heartbeat(5, None, Some(true));
+        state.record_heartbeat(5, None, None); // a later heartbeat that didn't report SI status
+        assert_eq!(state.nodes[&5].si_present, Some(true));
+    }
+
+    #[test]
+    fn test_record_heartbeat_updates_si_present_when_it_changes() {
+        let mut state = DaemonState::default();
+        state.record_heartbeat(5, None, Some(true));
+        state.record_heartbeat(5, None, Some(false));
+        assert_eq!(state.nodes[&5].si_present, Some(false));
     }
 
     #[test]

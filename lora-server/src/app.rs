@@ -11,6 +11,9 @@ pub struct NodeStatus {
     pub last_heartbeat: Option<Instant>,
     pub battery_pct: Option<u8>,
     pub battery_mv: Option<u16>,
+    /// See daemon_state::NodeStatus::si_present's doc comment — same
+    /// semantics, just reset on reconnect like the rest of this struct.
+    pub si_present: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -89,12 +92,15 @@ impl App {
         }
     }
 
-    pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>) {
+    pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>, si_present: Option<bool>) {
         let entry = self.nodes.entry(node).or_default();
         entry.last_heartbeat = Some(Instant::now());
         if let Some((pct, mv)) = battery {
             entry.battery_pct = Some(pct);
             entry.battery_mv = Some(mv);
+        }
+        if let Some(present) = si_present {
+            entry.si_present = Some(present);
         }
     }
 

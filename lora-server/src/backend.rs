@@ -23,6 +23,7 @@ impl embedded_hal::delay::DelayNs for StdDelay {
 /// that isn't an incoming radio packet (its own outgoing heartbeats/sends,
 /// or errors) — lora-tui's HttpRadio reconstructs these from the polled
 /// packet log. Real radio backends have nothing to report here.
+#[derive(Debug, PartialEq)]
 pub enum StatusEvent {
     Heartbeat { dest: u16 },
     Tx { dest: u16, payload: String },
@@ -33,8 +34,9 @@ pub enum StatusEvent {
     CmdErr { target: u16, setting: Setting },
     /// A heartbeat was received from another node — the node-health source
     /// for lora-tui's node table (see app.rs), same data daemon_state.rs
-    /// tracks for the web dashboard.
-    HeartbeatRx { node: u16, battery: Option<(u8, u16)> },
+    /// tracks for the web dashboard. `si_present` is `None` when the sender
+    /// didn't report it (see Heartbeat's own doc comment).
+    HeartbeatRx { node: u16, battery: Option<(u8, u16)>, si_present: Option<bool> },
     /// Confirms a TESTPUNCH this client (or another attached client) sent
     /// was actually recorded.
     TestPunchOk { card_id: u32, station: u8, time_s: u32 },
@@ -371,20 +373,53 @@ struct PendingPunch {
     attempts: u32,
 }
 
-/// Parses a heartbeat payload: bare `HB` (no battery — mains-powered relays,
-/// or a device without battery sensing wired) or `HB <pct> <mv>` (battery
-/// percent 0-100, millivolts — see esp32-node/src/battery.rs). Returns
-/// `None` if `payload` isn't a heartbeat at all; `Some(None)`/`Some(Some(..))`
-/// distinguish "is a heartbeat, no battery data" from "has battery data".
-fn parse_heartbeat(payload: &str) -> Option<Option<(u8, u16)>> {
+/// A parsed heartbeat payload — see parse_heartbeat's doc comment for the
+/// three wire shapes this covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Heartbeat {
+    battery: Option<(u8, u16)>,
+    /// Whether an SI master is currently connected to the sending node —
+    /// only ESP32 punch nodes report this (see esp32-node/src/main.rs's
+    /// spawn_si_reader_thread); `None` means the sender didn't say, either
+    /// because it's a mains-powered relay with no SI-reader concept at all
+    /// (lora-server's own bare "HB") or older firmware.
+    si_present: Option<bool>,
+}
+
+/// Parses a heartbeat payload. Three shapes: bare `HB` (mains-powered
+/// relays, or any node without an SI-master-presence concept — no battery,
+/// no SI status), legacy `HB <pct> <mv>` (battery only, kept for backward
+/// compatibility though nothing currently emits it), and `HB <pct-or-"-">
+/// <mv-or-"-"> <0-or-1>` — the shape ESP32 punch nodes actually send, where
+/// the battery pair is `-` `-` if the read failed and the trailing field is
+/// whether an SI master is currently connected (see esp32-node/src/main.rs).
+/// Returns `None` if `payload` isn't a heartbeat at all.
+fn parse_heartbeat(payload: &str) -> Option<Heartbeat> {
     if payload == "HB" {
-        return Some(None);
+        return Some(Heartbeat { battery: None, si_present: None });
     }
     let rest = payload.strip_prefix("HB ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let pct: u8 = parts.next()?.parse().ok()?;
-    let mv: u16 = parts.next()?.parse().ok()?;
-    Some(Some((pct, mv)))
+    let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+    match parts.as_slice() {
+        [pct, mv] => {
+            let battery = Some((pct.parse().ok()?, mv.parse().ok()?));
+            Some(Heartbeat { battery, si_present: None })
+        }
+        [pct, mv, si] => {
+            let battery = if *pct == "-" && *mv == "-" {
+                None
+            } else {
+                Some((pct.parse().ok()?, mv.parse().ok()?))
+            };
+            let si_present = match *si {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => return None,
+            };
+            Some(Heartbeat { battery, si_present })
+        }
+        _ => None,
+    }
 }
 
 /// The next batch of local, unsent punches to (re)transmit: the oldest
@@ -749,21 +784,34 @@ fn run_daemon_loop(
                             // Not relaying and not ours — ignore.
                         }
                     }
-                } else if let Some(battery) = parse_heartbeat(&payload) {
-                    match battery {
-                        Some((pct, mv)) => log::info!("HB from {}: battery {}% ({}mV)", pkt.src_addr, pct, mv),
-                        None => log::info!("HB from {} (no battery data)", pkt.src_addr),
+                } else if let Some(hb) = parse_heartbeat(&payload) {
+                    match (hb.battery, hb.si_present) {
+                        (Some((pct, mv)), Some(si)) => log::info!(
+                            "HB from {}: battery {}% ({}mV), SI master {}",
+                            pkt.src_addr, pct, mv, if si { "connected" } else { "not connected" }
+                        ),
+                        (Some((pct, mv)), None) => log::info!("HB from {}: battery {}% ({}mV)", pkt.src_addr, pct, mv),
+                        (None, Some(si)) => log::info!(
+                            "HB from {} (no battery data), SI master {}",
+                            pkt.src_addr, if si { "connected" } else { "not connected" }
+                        ),
+                        (None, None) => log::info!("HB from {} (no battery data)", pkt.src_addr),
                     }
                     // Heartbeats don't carry an origin field yet (they can't
                     // relay — see docs/protocols/lora_online_control_protocol.md),
                     // so pkt.src_addr is always the true origin here, unlike
                     // the punch/command branches which use an explicit
                     // `origin`/`commander` field for exactly this reason.
-                    state.lock().unwrap().record_heartbeat(pkt.src_addr, battery);
-                    let battery_field = battery
+                    state.lock().unwrap().record_heartbeat(pkt.src_addr, hb.battery, hb.si_present);
+                    let battery_field = hb.battery
                         .map(|(pct, mv)| format!("{} {}", pct, mv))
                         .unwrap_or_else(|| "-".to_string());
-                    log_event(&state, format!("HBRX {} {}", pkt.src_addr, battery_field));
+                    let si_field = match hb.si_present {
+                        Some(true) => "1",
+                        Some(false) => "0",
+                        None => "-",
+                    };
+                    log_event(&state, format!("HBRX {} {} {}", pkt.src_addr, battery_field, si_field));
                 }
                 log_event(&state, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
             }
@@ -819,18 +867,23 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
         return Some(StatusEvent::CmdErr { target, setting });
     }
     if let Some(rest) = line.strip_prefix("HBRX ") {
-        let mut parts = rest.splitn(2, ' ');
-        let node: u16 = parts.next()?.parse().ok()?;
-        let battery_field = parts.next()?;
-        let battery = if battery_field == "-" {
-            None
-        } else {
-            let mut bparts = battery_field.splitn(2, ' ');
-            let pct: u8 = bparts.next()?.parse().ok()?;
-            let mv: u16 = bparts.next()?.parse().ok()?;
-            Some((pct, mv))
+        // "<node> - <si>" (battery absent) or "<node> <pct> <mv> <si>"
+        // (battery present) — token count tells the two apart, since the
+        // battery field is a single "-" or a "<pct> <mv>" pair.
+        let tokens: Vec<&str> = rest.split(' ').collect();
+        let node: u16 = tokens.first()?.parse().ok()?;
+        let (battery, si_str) = match tokens.as_slice() {
+            [_, "-", si] => (None, *si),
+            [_, pct, mv, si] => (Some((pct.parse().ok()?, mv.parse().ok()?)), *si),
+            _ => return None,
         };
-        return Some(StatusEvent::HeartbeatRx { node, battery });
+        let si_present = match si_str {
+            "1" => Some(true),
+            "0" => Some(false),
+            "-" => None,
+            _ => return None,
+        };
+        return Some(StatusEvent::HeartbeatRx { node, battery, si_present });
     }
     if let Some(rest) = line.strip_prefix("TESTPUNCHOK ") {
         let mut parts = rest.splitn(3, ' ');
@@ -1083,6 +1136,26 @@ mod tests {
         assert!(parse_status_line("garbage").is_none());
     }
 
+    #[test]
+    fn test_parse_status_line_hbrx_with_battery_and_si() {
+        let evt = parse_status_line("HBRX 5 82 3950 1").unwrap();
+        assert_eq!(evt, StatusEvent::HeartbeatRx { node: 5, battery: Some((82, 3950)), si_present: Some(true) });
+    }
+
+    #[test]
+    fn test_parse_status_line_hbrx_no_battery_si_absent() {
+        let evt = parse_status_line("HBRX 5 - 0").unwrap();
+        assert_eq!(evt, StatusEvent::HeartbeatRx { node: 5, battery: None, si_present: Some(false) });
+    }
+
+    #[test]
+    fn test_parse_status_line_hbrx_no_si_reported() {
+        // Old-style relay/no-SI-concept heartbeat forward: "-" for si means
+        // "not reported", distinct from an explicit "0" (SI master absent).
+        let evt = parse_status_line("HBRX 5 - -").unwrap();
+        assert_eq!(evt, StatusEvent::HeartbeatRx { node: 5, battery: None, si_present: None });
+    }
+
     fn free_test_listen_addr() -> String {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         format!("127.0.0.1:{port}")
@@ -1140,7 +1213,7 @@ mod tests {
         let mut radio = HttpRadio::new(base_url).unwrap();
 
         state.lock().unwrap().push_log("RX 5 -80 PUNCH 5 123456 31:100".to_string());
-        state.lock().unwrap().push_log("HBRX 5 77 3900".to_string());
+        state.lock().unwrap().push_log("HBRX 5 77 3900 1".to_string());
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut got_pkt = false;
@@ -1151,9 +1224,10 @@ mod tests {
                 got_pkt = true;
             }
             for evt in radio.poll_status() {
-                if let StatusEvent::HeartbeatRx { node, battery } = evt {
+                if let StatusEvent::HeartbeatRx { node, battery, si_present } = evt {
                     assert_eq!(node, 5);
                     assert_eq!(battery, Some((77, 3900)));
+                    assert_eq!(si_present, Some(true));
                     got_evt = true;
                 }
             }
@@ -1165,12 +1239,35 @@ mod tests {
 
     #[test]
     fn test_parse_heartbeat_bare() {
-        assert_eq!(parse_heartbeat("HB"), Some(None));
+        assert_eq!(parse_heartbeat("HB"), Some(Heartbeat { battery: None, si_present: None }));
     }
 
     #[test]
-    fn test_parse_heartbeat_with_battery() {
-        assert_eq!(parse_heartbeat("HB 82 3950"), Some(Some((82, 3950))));
+    fn test_parse_heartbeat_legacy_battery_only() {
+        assert_eq!(
+            parse_heartbeat("HB 82 3950"),
+            Some(Heartbeat { battery: Some((82, 3950)), si_present: None })
+        );
+    }
+
+    #[test]
+    fn test_parse_heartbeat_with_battery_and_si_present() {
+        assert_eq!(
+            parse_heartbeat("HB 82 3950 1"),
+            Some(Heartbeat { battery: Some((82, 3950)), si_present: Some(true) })
+        );
+        assert_eq!(
+            parse_heartbeat("HB 82 3950 0"),
+            Some(Heartbeat { battery: Some((82, 3950)), si_present: Some(false) })
+        );
+    }
+
+    #[test]
+    fn test_parse_heartbeat_no_battery_but_si_present() {
+        assert_eq!(
+            parse_heartbeat("HB - - 1"),
+            Some(Heartbeat { battery: None, si_present: Some(true) })
+        );
     }
 
     #[test]
@@ -1179,6 +1276,7 @@ mod tests {
         assert_eq!(parse_heartbeat(""), None);
         assert_eq!(parse_heartbeat("HB notanumber 3950"), None);
         assert_eq!(parse_heartbeat("HB 82"), None);
+        assert_eq!(parse_heartbeat("HB 82 3950 maybe"), None);
     }
 
     /// A radio double that just records what was sent and lets a test queue

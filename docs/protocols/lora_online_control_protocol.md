@@ -148,12 +148,28 @@ same underlying commands.
 ## Heartbeats
 
 Uplink, `HB` — plain and untracked, no ack, no retry, just a liveness
-signal. Battery-powered devices (field nodes; not the base station) append
-their status: `HB <battery_pct> <battery_mv>`, e.g. `HB 82 3950`. A device
-with no battery, or without battery sensing wired, sends bare `HB`, same as
-today — `parse_heartbeat` in `backend.rs` accepts both. **Heartbeats don't
-carry an origin field, so they can't relay** (same limitation as noted under
-Relay Nodes below).
+signal. `parse_heartbeat` in `backend.rs` accepts three shapes:
+
+- Bare `HB` — no battery, no SI-master status. What `lora-server` itself
+  sends (a relay has neither concept), and older firmware.
+- `HB <battery_pct> <battery_mv>`, e.g. `HB 82 3950` — legacy battery-only
+  shape, kept for backward compatibility though nothing currently emits it.
+- `HB <battery_pct-or-"-"> <battery_mv-or-"-"> <0-or-1>` — what ESP32 punch
+  nodes actually send (`esp32-node/src/main.rs`), e.g. `HB 82 3950 1` or
+  `HB - - 0` if the battery read failed. The trailing field is whether an SI
+  master is currently connected to that node, reported independently of
+  battery data — `-` `-` (not omitting the fields) keeps the count fixed at
+  three so the parser doesn't have to guess which fields are missing.
+
+Heartbeats and SI-master connectivity are sent from the node's radio/main
+thread, entirely independent of whether an SI master is actually plugged in
+(SI reading runs on its own thread — see `spawn_si_reader_thread` in
+`esp32-node/src/main.rs`): a node with a dead or unplugged reader but a
+healthy radio still shows up as alive, just flagged as having no reader,
+rather than going silent and looking indistinguishable from a dead node.
+
+**Heartbeats don't carry an origin field, so they can't relay** (same
+limitation as noted under Relay Nodes below).
 
 ## Command Packets
 

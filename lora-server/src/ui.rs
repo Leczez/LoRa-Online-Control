@@ -81,6 +81,11 @@ fn render_nodes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     (Some(pct), Some(mv)) => format!("{pct}% ({mv}mV)"),
                     _ => "-".to_string(),
                 };
+                let (si_text, si_color) = match status.si_present {
+                    Some(true) => ("SI ok", Color::Green),
+                    Some(false) => ("no SI", Color::Red),
+                    None => ("", Color::DarkGray), // never reported — not every node has an SI reader
+                };
                 Line::from(vec![
                     Span::styled(format!("{:#06x}  ", addr), Style::default().fg(Color::White)),
                     Span::styled(
@@ -88,6 +93,7 @@ fn render_nodes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                         Style::default().fg(ago_color),
                     ),
                     Span::styled(format!("  {battery}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("  {si_text}"), Style::default().fg(si_color)),
                 ])
                 .into()
             })
@@ -498,8 +504,8 @@ pub fn run_app(
                             ok: false,
                         });
                     }
-                    crate::backend::StatusEvent::HeartbeatRx { node, battery } => {
-                        app.record_heartbeat(node, battery);
+                    crate::backend::StatusEvent::HeartbeatRx { node, battery, si_present } => {
+                        app.record_heartbeat(node, battery, si_present);
                     }
                     crate::backend::StatusEvent::TestPunchOk { card_id, station, time_s } => {
                         app.push_log(LogEntry::TestPunchResult {

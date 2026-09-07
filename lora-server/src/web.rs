@@ -25,6 +25,9 @@ struct NodeView {
     last_heartbeat_secs_ago: Option<u64>,
     battery_pct: Option<u8>,
     battery_mv: Option<u16>,
+    /// See daemon_state::NodeStatus::si_present — null means never reported
+    /// (not every node has an SI reader), distinct from `false`.
+    si_present: Option<bool>,
     last_punch_secs_ago: Option<u64>,
     last_rssi: Option<i16>,
 }
@@ -65,6 +68,7 @@ fn build_status(state: &SharedState, radio_ready: &RadioReady, roc_health_url: &
             last_heartbeat_secs_ago: s.last_heartbeat.map(secs_ago),
             battery_pct: s.battery_pct,
             battery_mv: s.battery_mv,
+            si_present: s.si_present,
             last_punch_secs_ago: s.last_punch.map(secs_ago),
             last_rssi: s.last_rssi,
         })
@@ -108,17 +112,23 @@ fn render_html(v: &StatusView) -> String {
             (Some(pct), Some(mv)) => format!("{pct}% ({mv}mV)"),
             _ => "-".to_string(),
         };
+        let si_cell = match n.si_present {
+            Some(true) => "<td style=\"color:green\">connected</td>".to_string(),
+            Some(false) => "<td style=\"color:red\">not connected</td>".to_string(),
+            None => "<td>-</td>".to_string(),
+        };
         node_rows.push_str(&format!(
-            "<tr><td>{:#06x}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<tr><td>{:#06x}</td><td>{}</td><td>{}</td>{}<td>{}</td><td>{}</td></tr>\n",
             n.addr,
             n.last_heartbeat_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             battery,
+            si_cell,
             n.last_punch_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             n.last_rssi.map(|r| format!("{r}dBm")).unwrap_or_else(|| "-".to_string()),
         ));
     }
     if node_rows.is_empty() {
-        node_rows = "<tr><td colspan=\"5\">no nodes heard from yet</td></tr>\n".to_string();
+        node_rows = "<tr><td colspan=\"6\">no nodes heard from yet</td></tr>\n".to_string();
     }
 
     let mut log_lines = String::new();
@@ -139,7 +149,7 @@ fn render_html(v: &StatusView) -> String {
 
 <h2>Nodes</h2>
 <table border="1" cellpadding="4">
-<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>Last punch</th><th>RSSI</th></tr>
+<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th></tr>
 {node_rows}
 </table>
 
@@ -315,7 +325,7 @@ mod tests {
     #[test]
     fn test_status_json_and_testpunch_against_real_server() {
         let state = crate::daemon_state::new_shared();
-        state.lock().unwrap().record_heartbeat(10, Some((77, 3850)));
+        state.lock().unwrap().record_heartbeat(10, Some((77, 3850)), Some(true));
         state.lock().unwrap().push_log("RX 10 -80 HB 77 3850".to_string());
 
         let radio_ready = Arc::new(AtomicBool::new(true));
@@ -334,11 +344,13 @@ mod tests {
         };
         assert!(json.contains("\"addr\": 10"), "status.json was: {json}");
         assert!(json.contains("\"battery_pct\": 77"), "status.json was: {json}");
+        assert!(json.contains("\"si_present\": true"), "status.json was: {json}");
         assert!(json.contains("\"radio_ready\": true"), "status.json was: {json}");
 
         let html = ureq::get(&format!("http://{listen}/")).call().unwrap().into_string().unwrap();
         assert!(html.contains("0x000a") || html.contains("0xa"), "HTML was: {html}");
         assert!(html.contains("RX 10 -80 HB 77 3850"), "HTML was: {html}");
+        assert!(html.contains("connected"), "HTML was: {html}");
 
         ureq::post(&format!("http://{listen}/testpunch"))
             .send_string("card_id=555&station=9&time_s=1234")
