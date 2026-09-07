@@ -125,18 +125,22 @@ After=multi-user.target
 [Service]
 RuntimeDirectory=lora-server
 EnvironmentFile=/etc/lora-server/env
-# LORA_ROC_HEALTH_URL is deliberately NOT passed as an explicit --flag here:
-# it has no default (an unset optional arg), and referencing an unset
-# ${VAR} in ExecStart substitutes an empty string, which clap would treat
-# as an explicitly-provided empty URL rather than "not set". Left for
-# clap's own `env = "LORA_ROC_HEALTH_URL"` to pick up directly from the
-# process environment instead, which correctly distinguishes the two.
+# None of LORA_ROC_HEALTH_URL, LORA_HEALTH_LISTEN, LORA_HEALTH_CHECK_INTERVAL_SECS,
+# or LORA_WEB_LISTEN are passed as explicit --flags here, even though the
+# latter three do have defaults: referencing ${VAR} in ExecStart for a var
+# that's genuinely unset in /etc/lora-server/env (e.g. an existing
+# deployment's env file predating one of these settings, preserved as-is on
+# redeploy — see below) substitutes an empty string, which clap treats as an
+# explicitly-provided empty value, not "not set" — so an old env file with a
+# newly-added-since var missing crashes the daemon instead of silently using
+# the default. Left for clap's own `env = "..."` on each of these args to
+# pick up directly from the process environment instead, which correctly
+# distinguishes "unset" from "set to empty" and falls back to the default.
 ExecStart=/usr/local/bin/lora-server \
   --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
-  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}" \
-  --health-listen ${LORA_HEALTH_LISTEN} --health-check-interval-secs ${LORA_HEALTH_CHECK_INTERVAL_SECS}
+  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}"
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
