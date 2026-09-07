@@ -261,9 +261,10 @@ fn run_spi(args: Args) -> Result<()> {
     };
 
     let punch_buffer = setup_punch_pipeline(&args)?;
+    let state = crate::daemon_state::new_shared();
     run_daemon_loop(
         DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
-        clients, cmd_rx, radio, si_rx, punch_buffer,
+        clients, cmd_rx, radio, si_rx, punch_buffer, state,
     )
 }
 
@@ -274,6 +275,14 @@ type Clients = Arc<Mutex<Vec<std::sync::mpsc::SyncSender<String>>>>;
 fn broadcast(clients: &Clients, msg: String) {
     let mut guard = clients.lock().unwrap();
     guard.retain(|tx| tx.try_send(msg.clone()).is_ok());
+}
+
+/// Every place that already calls `broadcast` for lora-tui's live stream
+/// also wants this same line in the packet log the web dashboard reads —
+/// one call covers both instead of duplicating a push_log at every site.
+fn log_and_broadcast(clients: &Clients, state: &crate::daemon_state::SharedState, msg: String) {
+    state.lock().unwrap().push_log(msg.clone());
+    broadcast(clients, msg);
 }
 
 fn setup_daemon_socket(
@@ -320,7 +329,8 @@ fn handle_client(
     std::thread::spawn(move || {
         let reader = BufReader::new(read_stream);
         for line in reader.lines().flatten() {
-            if line.starts_with("SEND ") || line.starts_with("SET_DEST ") || line.starts_with("CMD ") {
+            if line.starts_with("SEND ") || line.starts_with("SET_DEST ") || line.starts_with("CMD ")
+                || line.starts_with("TESTPUNCH ") {
                 let _ = cmd_tx.send(line);
             }
         }
@@ -433,17 +443,20 @@ fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16) ->
 /// a `SET_DEST` first, same as the existing `SEND` socket command already
 /// requires — this makes `CMD` consistent with the rest of the protocol
 /// instead of being the one exception that assumed direct reach.
-fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, dest: u16, target: u16, commander: u16, setting: Setting) {
+fn send_command_frame(
+    radio: &mut dyn Radio, clients: &Clients, state: &crate::daemon_state::SharedState,
+    dest: u16, target: u16, commander: u16, setting: Setting,
+) {
     let frame = Frame::Command { target, commander, setting };
     let payload = frame.encode();
     match radio.send(dest, payload.as_bytes()) {
         Ok(()) => {
             log::info!("CMD to {} (via {}): {}", target, dest, payload);
-            broadcast(clients, format!("TX {} {}", dest, payload));
+            log_and_broadcast(clients, state, format!("TX {} {}", dest, payload));
         }
         Err(e) => {
             log::error!("CMD send failed: {}", e);
-            broadcast(clients, format!("ERR CMD: {}", e));
+            log_and_broadcast(clients, state, format!("ERR CMD: {}", e));
         }
     }
 }
@@ -454,15 +467,18 @@ fn send_command_frame(radio: &mut dyn Radio, clients: &Clients, dest: u16, targe
 /// wait between the original sender and the final consumer; a lost forward
 /// just means that sender's own retry resends the punch, which gets
 /// forwarded again.
-fn forward(radio: &mut dyn Radio, clients: &Clients, next_hop: u16, raw_payload: &str) {
+fn forward(
+    radio: &mut dyn Radio, clients: &Clients, state: &crate::daemon_state::SharedState,
+    next_hop: u16, raw_payload: &str,
+) {
     match radio.send(next_hop, raw_payload.as_bytes()) {
         Ok(()) => {
             log::info!("relayed to {}: {}", next_hop, raw_payload);
-            broadcast(clients, format!("TX {} {}", next_hop, raw_payload));
+            log_and_broadcast(clients, state, format!("TX {} {}", next_hop, raw_payload));
         }
         Err(e) => {
             log::error!("relay forward failed: {}", e);
-            broadcast(clients, format!("ERR TX: {}", e));
+            log_and_broadcast(clients, state, format!("ERR TX: {}", e));
         }
     }
 }
@@ -483,6 +499,7 @@ fn run_daemon_loop(
     mut radio: Box<dyn Radio>,
     si_rx: std::sync::mpsc::Receiver<crate::sportident::CardReadout>,
     punch_buffer: Arc<crate::punch_buffer::PunchBuffer>,
+    state: crate::daemon_state::SharedState,
 ) -> Result<()> {
     let DaemonIdentity { own_addr, dest, heartbeat_interval, relay } = identity;
     let mut heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
@@ -502,11 +519,11 @@ fn run_daemon_loop(
                 match radio.send(dest, payload.as_bytes()) {
                     Ok(()) => {
                         log::info!("TX to {}: {}", dest, payload);
-                        broadcast(&clients, format!("TX {} {}", dest, payload));
+                        log_and_broadcast(&clients, &state, format!("TX {} {}", dest, payload));
                     }
                     Err(e) => {
                         log::error!("TX failed: {}", e);
-                        broadcast(&clients, format!("ERR TX: {}", e));
+                        log_and_broadcast(&clients, &state, format!("ERR TX: {}", e));
                     }
                 }
             } else if let Some(rest) = cmd.strip_prefix("CMD ") {
@@ -514,9 +531,36 @@ fn run_daemon_loop(
                 if let (Some(target_str), Some(secs_str)) = (parts.next(), parts.next()) {
                     if let (Ok(target), Ok(secs)) = (target_str.parse::<u16>(), secs_str.parse::<u32>()) {
                         let setting = Setting::HeartbeatIntervalSecs(secs);
-                        send_command_frame(radio.as_mut(), &clients, dest, target, own_addr, setting);
+                        send_command_frame(radio.as_mut(), &clients, &state, dest, target, own_addr, setting);
                         pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
                     }
+                }
+            } else if let Some(rest) = cmd.strip_prefix("TESTPUNCH ") {
+                // Recorded as "test", not "local" — deliberately flows
+                // through the exact same buffer/send/retry/ack pipeline as
+                // a genuine local punch (see unsent_local's doc comment in
+                // punch_buffer.rs), but stays identifiable as synthetic
+                // rather than indistinguishable from a real card tap.
+                let mut parts = rest.splitn(3, ' ');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(card_str), Some(station_str), Some(time_str)) => {
+                        match (card_str.parse::<u32>(), station_str.parse::<u8>(), time_str.parse::<u32>()) {
+                            (Ok(card_id), Ok(station), Ok(time_s)) => {
+                                match punch_buffer.record(card_id, station, time_s, "test") {
+                                    Ok(_) => {
+                                        log::info!("test punch recorded: card {} station {} time {}", card_id, station, time_s);
+                                        log_and_broadcast(&clients, &state, format!("TESTPUNCHOK {} {} {}", card_id, station, time_s));
+                                    }
+                                    Err(e) => {
+                                        log::error!("failed to record test punch: {}", e);
+                                        log_and_broadcast(&clients, &state, format!("ERR TESTPUNCH: {}", e));
+                                    }
+                                }
+                            }
+                            _ => log_and_broadcast(&clients, &state, "ERR TESTPUNCH: bad numeric fields".to_string()),
+                        }
+                    }
+                    _ => log_and_broadcast(&clients, &state, "ERR TESTPUNCH: usage TESTPUNCH <card_id> <station> <time_s>".to_string()),
                 }
             }
         }
@@ -527,12 +571,12 @@ fn run_daemon_loop(
             }
             if cmd.attempts >= CMD_MAX_ATTEMPTS {
                 log::warn!("CMD to {} ({:?}) gave up after {} attempts", cmd.target, cmd.setting, cmd.attempts);
-                broadcast(&clients, format!("CMDERR {} {}", cmd.target, cmd.setting.encode()));
+                log_and_broadcast(&clients, &state, format!("CMDERR {} {}", cmd.target, cmd.setting.encode()));
                 return false;
             }
             cmd.attempts += 1;
             cmd.sent_at = Instant::now();
-            send_command_frame(radio.as_mut(), &clients, dest, cmd.target, own_addr, cmd.setting);
+            send_command_frame(radio.as_mut(), &clients, &state, dest, cmd.target, own_addr, cmd.setting);
             true
         });
 
@@ -542,11 +586,11 @@ fn run_daemon_loop(
                 match radio.send(dest, b"HB") {
                     Ok(()) => {
                         log::info!("HB sent to {}", dest);
-                        broadcast(&clients, format!("HB {}", dest));
+                        log_and_broadcast(&clients, &state, format!("HB {}", dest));
                     }
                     Err(e) => {
                         log::error!("HB send failed: {}", e);
-                        broadcast(&clients, format!("ERR HB: {}", e));
+                        log_and_broadcast(&clients, &state, format!("ERR HB: {}", e));
                     }
                 }
             }
@@ -571,12 +615,12 @@ fn run_daemon_loop(
                     match radio.send(dest, payload.as_bytes()) {
                         Ok(()) => {
                             log::info!("PUNCH to {}: {}", dest, payload);
-                            broadcast(&clients, format!("TX {} {}", dest, payload));
+                            log_and_broadcast(&clients, &state, format!("TX {} {}", dest, payload));
                             pending_punch = Some(PendingPunch { card_id, row_ids, payload, sent_at: Instant::now(), attempts: 1 });
                         }
                         Err(e) => {
                             log::error!("PUNCH send failed: {}", e);
-                            broadcast(&clients, format!("ERR TX: {}", e));
+                            log_and_broadcast(&clients, &state, format!("ERR TX: {}", e));
                         }
                     }
                 }
@@ -590,11 +634,11 @@ fn run_daemon_loop(
                 match radio.send(dest, p.payload.as_bytes()) {
                     Ok(()) => {
                         log::info!("PUNCH retry #{} to {}: {}", p.attempts, dest, p.payload);
-                        broadcast(&clients, format!("TX {} {}", dest, p.payload));
+                        log_and_broadcast(&clients, &state, format!("TX {} {}", dest, p.payload));
                     }
                     Err(e) => {
                         log::error!("PUNCH retry failed: {}", e);
-                        broadcast(&clients, format!("ERR TX: {}", e));
+                        log_and_broadcast(&clients, &state, format!("ERR TX: {}", e));
                     }
                 }
             }
@@ -615,8 +659,9 @@ fn run_daemon_loop(
                         // ends up being) does the buffering; a relay hop
                         // doesn't duplicate that bookkeeping for traffic
                         // that isn't its own.
-                        forward(radio.as_mut(), &clients, dest, &payload);
+                        forward(radio.as_mut(), &clients, &state, dest, &payload);
                     } else {
+                        state.lock().unwrap().record_punch(origin, pkt.rssi);
                         for p in &readout.punches {
                             if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &origin.to_string()) {
                                 log::error!("failed to buffer remote punch: {}", e);
@@ -652,13 +697,13 @@ fn run_daemon_loop(
                             if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
                                 log::error!("failed to ack command: {}", e);
                             }
-                            broadcast(&clients, format!("CMDAPPLIED {:?}", setting));
+                            log_and_broadcast(&clients, &state, format!("CMDAPPLIED {:?}", setting));
                         }
                         Frame::Command { target, .. } if relay => {
                             // Not addressed to us — pass it on toward the
                             // named target directly (single-hop relay:
                             // assumed within direct reach downstream).
-                            forward(radio.as_mut(), &clients, target, &payload);
+                            forward(radio.as_mut(), &clients, &state, target, &payload);
                         }
                         Frame::Command { .. } => {
                             // Not addressed to us and not relaying — ignore.
@@ -668,13 +713,13 @@ fn run_daemon_loop(
                             pending_commands.retain(|p| !(p.target == origin && p.setting == setting));
                             if pending_commands.len() < had {
                                 log::info!("CMD to {} ({:?}) acked", origin, setting);
-                                broadcast(&clients, format!("CMDOK {} {}", origin, setting.encode()));
+                                log_and_broadcast(&clients, &state, format!("CMDOK {} {}", origin, setting.encode()));
                             }
                         }
                         Frame::Ack { commander, .. } if relay => {
                             // Not for us — forward toward the commander who
                             // originally issued this command.
-                            forward(radio.as_mut(), &clients, commander, &payload);
+                            forward(radio.as_mut(), &clients, &state, commander, &payload);
                         }
                         Frame::Ack { .. } => {
                             // Not relaying and not ours — ignore.
@@ -688,14 +733,14 @@ fn run_daemon_loop(
                                     }
                                 }
                                 log::info!("PUNCH card {} acked by {}", card_id, pkt.src_addr);
-                                broadcast(&clients, format!("PACKOK {}", card_id));
+                                log_and_broadcast(&clients, &state, format!("PACKOK {}", card_id));
                             }
                         }
                         Frame::PunchAck { node, .. } if relay => {
                             // Named node isn't us — pass the ack on toward
                             // it directly (single-hop relay: assumed within
                             // direct reach downstream of this relay).
-                            forward(radio.as_mut(), &clients, node, &payload);
+                            forward(radio.as_mut(), &clients, &state, node, &payload);
                         }
                         Frame::PunchAck { .. } => {
                             // Not relaying and not ours — ignore.
@@ -706,17 +751,23 @@ fn run_daemon_loop(
                         Some((pct, mv)) => log::info!("HB from {}: battery {}% ({}mV)", pkt.src_addr, pct, mv),
                         None => log::info!("HB from {} (no battery data)", pkt.src_addr),
                     }
+                    // Heartbeats don't carry an origin field yet (they can't
+                    // relay — see docs/protocols/lora_online_control_protocol.md),
+                    // so pkt.src_addr is always the true origin here, unlike
+                    // the punch/command branches which use an explicit
+                    // `origin`/`commander` field for exactly this reason.
+                    state.lock().unwrap().record_heartbeat(pkt.src_addr, battery);
                     let battery_field = battery
                         .map(|(pct, mv)| format!("{} {}", pct, mv))
                         .unwrap_or_else(|| "-".to_string());
-                    broadcast(&clients, format!("HBRX {} {}", pkt.src_addr, battery_field));
+                    log_and_broadcast(&clients, &state, format!("HBRX {} {}", pkt.src_addr, battery_field));
                 }
-                broadcast(&clients, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
+                log_and_broadcast(&clients, &state, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
             }
             Ok(None) => {}
             Err(e) => {
                 log::error!("RX error: {}", e);
-                broadcast(&clients, format!("ERR RX: {}", e));
+                log_and_broadcast(&clients, &state, format!("ERR RX: {}", e));
             }
         }
 

@@ -70,14 +70,22 @@ impl PunchBuffer {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Unsent punches from this node's own local SI reader (source == "local"),
-    /// oldest first — the candidates for radio (re)transmission. Distinct from
-    /// `unsent()`, which also includes remote-sourced punches relevant to the
-    /// HTTP push path but not to what this node itself needs to transmit.
+    /// Unsent punches this node itself should transmit — its own local SI
+    /// reader (source == "local") plus any operator-triggered test punches
+    /// (source == "test", see the TESTPUNCH socket command in backend.rs),
+    /// oldest first. Test punches deliberately flow through the exact same
+    /// send/retry/ack path as a real one — that's the point, verifying the
+    /// real pipeline — but keep a distinct `source` tag rather than being
+    /// recorded as "local" outright, so they stay identifiable later (e.g.
+    /// auditing the buffer, or filtering them out of real event data)
+    /// instead of being indistinguishable from a genuine card tap. Distinct
+    /// from `unsent()`, which also includes remote-sourced punches relevant
+    /// to the HTTP push path but not to what this node itself needs to
+    /// transmit.
     pub fn unsent_local(&self) -> Result<Vec<BufferedPunch>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, card_id, station, time_s, source FROM punches WHERE sent = 0 AND source = 'local' ORDER BY id ASC",
+            "SELECT id, card_id, station, time_s, source FROM punches WHERE sent = 0 AND source IN ('local', 'test') ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(BufferedPunch {
@@ -148,6 +156,21 @@ mod tests {
 
         let ids: Vec<u32> = buf.unsent_local().unwrap().iter().map(|p| p.card_id).collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    /// TESTPUNCH (backend.rs) records with source="test" specifically so it
+    /// stays identifiable from a genuine card tap, but it still needs to
+    /// flow through the same send pipeline as "local" — this is the query
+    /// that pipeline reads from.
+    #[test]
+    fn test_unsent_local_includes_test_sourced_punches() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        buf.record(1, 1, 100, "local").unwrap();
+        buf.record(2, 2, 200, "test").unwrap();
+        buf.record(3, 3, 300, "192.168.1.5").unwrap();
+
+        let ids: Vec<u32> = buf.unsent_local().unwrap().iter().map(|p| p.card_id).collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]
