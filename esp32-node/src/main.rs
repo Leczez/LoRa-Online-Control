@@ -15,6 +15,8 @@
 #![feature(allocator_api)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,11 +49,11 @@ use sportident::CardReadout;
 /// docs/protocols/lora_online_control_protocol.md's "Punch Delivery".
 const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Matches lora-server's own --heartbeat-interval default. Heartbeats keep
-/// firing across SI-master reconnects (the timer lives outside the outer
-/// reconnect loop) but do pause while actively blocked inside
-/// wait_for_si_master — a known simplification, not a hard requirement, so
-/// long as reconnects are the rare/brief case they're meant to be.
+/// Matches lora-server's own --heartbeat-interval default. Sent from the
+/// main thread, entirely independent of whether an SI master is connected
+/// (see spawn_si_reader_thread) — a node with a dead/unplugged reader but a
+/// healthy radio should still show up as alive to the base station, not go
+/// silent just because wait_for_si_master is blocked.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 struct PendingPunch {
@@ -59,6 +61,52 @@ struct PendingPunch {
     payload: String,
     sent_at: Instant,
     attempts: u32,
+}
+
+/// Owns the SI master connection end-to-end: (re)connecting, reading
+/// punches, and noticing disconnects — entirely on its own thread, so a
+/// missing/dead SI master never blocks the radio/heartbeat loop in main()
+/// (see HEARTBEAT_INTERVAL's doc comment). Hands punches to the main thread
+/// over `punch_tx` rather than touching the radio directly, mirroring
+/// lora-server's own split between sportident.rs's hotplug thread and
+/// run_daemon_loop's radio ownership. `si_present` is flipped false the
+/// instant a connection is lost or not yet established, true only once the
+/// SI master actually answers — main() reports this as-is in every
+/// heartbeat rather than only while actively reading punches.
+fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("si-reader".into())
+        .spawn(move || loop {
+            log::info!("waiting for SI master (VID {:#06x} PID {:#06x})...", sportident::SI_VID, sportident::SI_PID);
+            si_present.store(false, Ordering::SeqCst);
+            let transport = cp210x::wait_for_si_master(sportident::SI_PID, sportident::SI_BAUD);
+            si_present.store(true, Ordering::SeqCst);
+            log::info!("SI master connected");
+            let mut si_reader = sportident::SiReader::new(transport);
+
+            loop {
+                if si_reader.transport().is_disconnected() {
+                    log::warn!("SI master disconnected — will reconnect");
+                    si_present.store(false, Ordering::SeqCst);
+                    break;
+                }
+                match si_reader.read_event() {
+                    Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
+                        log::info!("read SI card {} ({} punches)", readout.card_id, readout.punches.len());
+                        if punch_tx.send(readout).is_err() {
+                            // Main thread is gone (panicked/exited) — nothing
+                            // left to hand punches to.
+                            return;
+                        }
+                    }
+                    Ok(Some(sportident::SiEvent::CardRemoved)) => {}
+                    Ok(None) => {}
+                    Err(e) => log::warn!("SI read error: {:?}", e),
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .expect("failed to spawn SI reader thread");
 }
 
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
@@ -163,112 +211,101 @@ fn main() -> anyhow::Result<()> {
 
     cp210x::install()?;
 
-    // Outer loop: (re)connect to the SI master. Runs again whenever the
-    // inner loop notices a disconnect — mirrors the RPi side's udev-hotplug
-    // reconnect loop in lora-server/src/sportident.rs, just driven by the
-    // CDC-ACM driver's own disconnect event instead of udev.
+    // SI master connection lives entirely on its own thread now (see
+    // spawn_si_reader_thread's doc comment) — this thread never blocks on
+    // it, so radio RX/ack handling and heartbeats keep running even with no
+    // reader plugged in at all.
+    let (punch_tx, punch_rx) = mpsc::channel::<CardReadout>();
+    let si_present = Arc::new(AtomicBool::new(false));
+    spawn_si_reader_thread(punch_tx, Arc::clone(&si_present));
+
+    // Punches read from the SI master land here first — actual transmission
+    // (and its stop-and-wait retry) is driven by this queue below, mirroring
+    // lora-server's own punch_buffer/PendingPunch design, minus persistence
+    // across a reboot (see docs/protocols/lora_online_control_protocol.md's
+    // "Punch Delivery"). Losing this queue on a crash/power cycle — unlike
+    // the RPi's SQLite-backed buffer — is a known gap, not something worth
+    // solving before this link is proven on real hardware.
+    //
+    // Allocated in PSRAM (see psram.rs), not the main heap — this queue is
+    // the one place a backlog could actually grow (a burst of punches
+    // arriving faster than the stop-and-wait ack lets them drain), so it's
+    // the one worth pinning off the scarce internal RAM.
+    let mut punch_queue: VecDeque<CardReadout, PsramAllocator> = VecDeque::new_in(PsramAllocator);
+    let mut pending_punch: Option<PendingPunch> = None;
+
     loop {
-        log::info!("waiting for SI master (VID {:#06x} PID {:#06x})...", sportident::SI_VID, sportident::SI_PID);
-        let transport = cp210x::wait_for_si_master(sportident::SI_PID, sportident::SI_BAUD);
-        let mut si_reader = sportident::SiReader::new(transport);
-        log::info!("SI master connected");
-
-        // Punches read from the SI master land here first — actual
-        // transmission (and its stop-and-wait retry) is driven by this queue
-        // below, mirroring lora-server's own punch_buffer/PendingPunch
-        // design, minus persistence across a reboot (see docs/protocols/
-        // lora_online_control_protocol.md's "Punch Delivery"). Losing this
-        // queue on a crash/power cycle — unlike the RPi's SQLite-backed
-        // buffer — is a known gap, not something worth solving before this
-        // link is proven on real hardware.
-        //
-        // Allocated in PSRAM (see psram.rs), not the main heap — this queue
-        // is the one place a backlog could actually grow (a burst of punches
-        // arriving faster than the stop-and-wait ack lets them drain), so
-        // it's the one worth pinning off the scarce internal RAM.
-        let mut punch_queue: VecDeque<CardReadout, PsramAllocator> = VecDeque::new_in(PsramAllocator);
-        let mut pending_punch: Option<PendingPunch> = None;
-
-        loop {
-            match protocol::receive_framed(&mut radio, &current.network_id) {
-                Ok(Some((src_addr, rssi, text))) => {
-                    if let Some((node, card_id)) = protocol::parse_punch_ack(&text) {
-                        if node == current.addr
-                            && pending_punch.as_ref().is_some_and(|p| p.card_id == card_id)
-                        {
-                            log::info!("PUNCH card {} acked by {:#06x}", card_id, src_addr);
-                            pending_punch = None;
-                        }
-                    } else {
-                        log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
+        match protocol::receive_framed(&mut radio, &current.network_id) {
+            Ok(Some((src_addr, rssi, text))) => {
+                if let Some((node, card_id)) = protocol::parse_punch_ack(&text) {
+                    if node == current.addr
+                        && pending_punch.as_ref().is_some_and(|p| p.card_id == card_id)
+                    {
+                        log::info!("PUNCH card {} acked by {:#06x}", card_id, src_addr);
+                        pending_punch = None;
                     }
-                }
-                Ok(None) => {}
-                Err(e) => log::warn!("receive() error: {:?}", e),
-            }
-
-            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                last_heartbeat = Instant::now();
-                let hb_payload = match battery.read() {
-                    Ok((pct, mv)) => std::format!("HB {} {}", pct, mv),
-                    Err(e) => {
-                        log::warn!("battery read failed ({:?}), sending bare HB", e);
-                        "HB".to_string()
-                    }
-                };
-                match protocol::send_framed(&mut radio, current.dest, hb_payload.as_bytes(), &current.network_id) {
-                    Ok(()) => log::info!("HB to {:#06x}: {}", current.dest, hb_payload),
-                    Err(e) => log::warn!("HB send failed: {:?}", e),
+                } else {
+                    log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
                 }
             }
-
-            if si_reader.transport().is_disconnected() {
-                log::warn!("SI master disconnected — will reconnect");
-                break;
-            }
-
-            match si_reader.read_event() {
-                Ok(Some(sportident::SiEvent::CardReadout(readout))) => {
-                    log::info!("buffered SI card {} ({} punches)", readout.card_id, readout.punches.len());
-                    punch_queue.push_back(readout);
-                }
-                Ok(Some(sportident::SiEvent::CardRemoved)) => {}
-                Ok(None) => {}
-                Err(e) => log::warn!("SI read error: {:?}", e),
-            }
-
-            // Stop-and-wait: only one punch outstanding at a time. The next
-            // queued punch isn't even attempted until this one is acked.
-            if pending_punch.is_none() {
-                if let Some(readout) = punch_queue.pop_front() {
-                    let payload = readout.to_payload(current.addr);
-                    match protocol::send_framed(&mut radio, current.dest, payload.as_bytes(), &current.network_id) {
-                        Ok(()) => {
-                            log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
-                            pending_punch = Some(PendingPunch {
-                                card_id: readout.card_id, payload, sent_at: Instant::now(), attempts: 1,
-                            });
-                        }
-                        Err(e) => {
-                            log::warn!("PUNCH send failed ({:?}), will retry", e);
-                            punch_queue.push_front(readout);
-                        }
-                    }
-                }
-            } else if let Some(p) = &mut pending_punch {
-                if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
-                    p.attempts += 1;
-                    p.sent_at = Instant::now();
-                    match protocol::send_framed(&mut radio, current.dest, p.payload.as_bytes(), &current.network_id) {
-                        Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
-                        Err(e) => log::warn!("PUNCH retry failed: {:?}", e),
-                    }
-                }
-            }
-
-            std::thread::sleep(Duration::from_millis(50));
+            Ok(None) => {}
+            Err(e) => log::warn!("receive() error: {:?}", e),
         }
-        // si_reader (and its Cp210xTransport) drops here, closing the dead
-        // handle, before the outer loop waits for the device to reappear.
+
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            last_heartbeat = Instant::now();
+            // "- -" (not bare tokens) keeps the field count fixed at three
+            // whether or not the read succeeded, so lora-server's parser
+            // doesn't need to guess which two of three fields are missing.
+            let battery_field = match battery.read() {
+                Ok((pct, mv)) => std::format!("{} {}", pct, mv),
+                Err(e) => {
+                    log::warn!("battery read failed ({:?}), reporting no battery data", e);
+                    "- -".to_string()
+                }
+            };
+            let si_flag = if si_present.load(Ordering::SeqCst) { '1' } else { '0' };
+            let hb_payload = std::format!("HB {} {}", battery_field, si_flag);
+            match protocol::send_framed(&mut radio, current.dest, hb_payload.as_bytes(), &current.network_id) {
+                Ok(()) => log::info!("HB to {:#06x}: {}", current.dest, hb_payload),
+                Err(e) => log::warn!("HB send failed: {:?}", e),
+            }
+        }
+
+        while let Ok(readout) = punch_rx.try_recv() {
+            log::info!("buffered SI card {} ({} punches)", readout.card_id, readout.punches.len());
+            punch_queue.push_back(readout);
+        }
+
+        // Stop-and-wait: only one punch outstanding at a time. The next
+        // queued punch isn't even attempted until this one is acked.
+        if pending_punch.is_none() {
+            if let Some(readout) = punch_queue.pop_front() {
+                let payload = readout.to_payload(current.addr);
+                match protocol::send_framed(&mut radio, current.dest, payload.as_bytes(), &current.network_id) {
+                    Ok(()) => {
+                        log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
+                        pending_punch = Some(PendingPunch {
+                            card_id: readout.card_id, payload, sent_at: Instant::now(), attempts: 1,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("PUNCH send failed ({:?}), will retry", e);
+                        punch_queue.push_front(readout);
+                    }
+                }
+            }
+        } else if let Some(p) = &mut pending_punch {
+            if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
+                p.attempts += 1;
+                p.sent_at = Instant::now();
+                match protocol::send_framed(&mut radio, current.dest, p.payload.as_bytes(), &current.network_id) {
+                    Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
+                    Err(e) => log::warn!("PUNCH retry failed: {:?}", e),
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
