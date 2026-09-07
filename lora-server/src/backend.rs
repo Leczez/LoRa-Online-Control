@@ -245,7 +245,12 @@ fn run_spi(args: Args) -> Result<()> {
         return crate::ui::run_app(port_info, args.addr, args.dest, driver, args.heartbeat_interval, si_rx);
     }
 
-    let (clients, cmd_rx) = setup_daemon_socket(&args.socket)?;
+    let (clients, cmd_rx, cmd_tx_for_web) = setup_daemon_socket(&args.socket)?;
+    let state = crate::daemon_state::new_shared();
+    crate::web::spawn_server(
+        args.web_listen.clone(), Arc::clone(&state), Arc::clone(&radio_ready), args.roc_health_url.clone(), cmd_tx_for_web,
+    );
+
     let radio: Box<dyn Radio> = loop {
         match build_driver() {
             Ok(driver) => {
@@ -261,7 +266,6 @@ fn run_spi(args: Args) -> Result<()> {
     };
 
     let punch_buffer = setup_punch_pipeline(&args)?;
-    let state = crate::daemon_state::new_shared();
     run_daemon_loop(
         DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
         clients, cmd_rx, radio, si_rx, punch_buffer, state,
@@ -287,7 +291,7 @@ fn log_and_broadcast(clients: &Clients, state: &crate::daemon_state::SharedState
 
 fn setup_daemon_socket(
     socket_path: &str,
-) -> Result<(Clients, std::sync::mpsc::Receiver<String>)> {
+) -> Result<(Clients, std::sync::mpsc::Receiver<String>, std::sync::mpsc::Sender<String>)> {
     use std::os::unix::net::UnixListener;
     use std::os::unix::fs::PermissionsExt;
 
@@ -300,6 +304,10 @@ fn setup_daemon_socket(
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+    // Kept for the web server (web.rs) to inject TESTPUNCH through the same
+    // command channel real socket clients use — one parsing/validation path
+    // for the command regardless of which interface triggered it.
+    let cmd_tx_for_web = cmd_tx.clone();
 
     let listener_clients = Arc::clone(&clients);
     std::thread::spawn(move || {
@@ -311,7 +319,7 @@ fn setup_daemon_socket(
     });
 
     log::info!("socket ready at {}", socket_path);
-    Ok((clients, cmd_rx))
+    Ok((clients, cmd_rx, cmd_tx_for_web))
 }
 
 fn handle_client(

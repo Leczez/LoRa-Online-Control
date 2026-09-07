@@ -86,6 +86,12 @@ pub struct Args {
     #[arg(long, env = "LORA_HEALTH_CHECK_INTERVAL_SECS", default_value_t = 30)]
     pub health_check_interval_secs: u64,
 
+    /// Address:port for the browser-facing status dashboard (node health,
+    /// packet log, send-a-test-punch form) — separate from --health-listen,
+    /// which is deliberately minimal/machine-readable only.
+    #[arg(long, env = "LORA_WEB_LISTEN", default_value = "0.0.0.0:8082")]
+    pub web_listen: String,
+
     /// Unix socket path this daemon binds, for lora-tui (or other clients) to attach to.
     #[arg(long, default_value = "/run/lora-server/control.sock")]
     pub socket: String,
