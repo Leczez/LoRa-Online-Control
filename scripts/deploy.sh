@@ -102,6 +102,15 @@ LORA_DEST=1
 LORA_POWER=22
 LORA_HEARTBEAT_INTERVAL=60
 LORA_NETWORK_ID=LOC
+LORA_HEALTH_LISTEN=0.0.0.0:8081
+LORA_HEALTH_CHECK_INTERVAL_SECS=30
+# Uncomment and point at roc-server's own /health to enable the mutual
+# reachability check (e.g. http://100.x.y.z:8080/health, or
+# http://host.docker.internal:8080/health if roc-server runs in Docker on
+# this same host — see roc-server/docker-compose.yml). Left unset by
+# default: lora-server still serves its own /health on LORA_HEALTH_LISTEN
+# regardless, it just won't check roc-server's.
+#LORA_ROC_HEALTH_URL=http://127.0.0.1:8080/health
 ENV
     echo "Created /etc/lora-server/env (edit to configure)"
 else
@@ -116,11 +125,18 @@ After=multi-user.target
 [Service]
 RuntimeDirectory=lora-server
 EnvironmentFile=/etc/lora-server/env
+# LORA_ROC_HEALTH_URL is deliberately NOT passed as an explicit --flag here:
+# it has no default (an unset optional arg), and referencing an unset
+# ${VAR} in ExecStart substitutes an empty string, which clap would treat
+# as an explicitly-provided empty URL rather than "not set". Left for
+# clap's own `env = "LORA_ROC_HEALTH_URL"` to pick up directly from the
+# process environment instead, which correctly distinguishes the two.
 ExecStart=/usr/local/bin/lora-server \
   --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
-  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}"
+  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}" \
+  --health-listen ${LORA_HEALTH_LISTEN} --health-check-interval-secs ${LORA_HEALTH_CHECK_INTERVAL_SECS}
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

@@ -77,6 +77,22 @@ transmitted. Delivery over the radio link itself works as **stop-and-wait**:
   only needs to name it — no separate sequence number was needed on top of
   what `PUNCH` already carries.
 
+## lora-server ↔ roc-server reachability
+
+Separate from the LoRa-radio heartbeat below: `lora-server` and `roc-server`
+each expose a plain `GET /health` (→ `200 ok`) over HTTP, and each can
+optionally run a background thread that polls the *other's* `/health` on an
+interval (`--roc-health-url` on lora-server, `--lora-health-url` on
+roc-server; both default-off, and logging only on state transitions so a
+healthy link doesn't spam the log). This checks the network path between
+the two servers, independent of whether punches are actually flowing — a
+`lora-server` with nothing to push would otherwise give no signal at all
+that its link to `roc-server` is down until a punch actually needed to go
+out. If both processes run on the same host (e.g. the planned Pi 5
+consolidation) and `roc-server` runs in Docker, see the `extra_hosts` note
+in `roc-server/docker-compose.yml` — a container's own `localhost` won't
+reach a native process on the same machine.
+
 ## Heartbeats
 
 Uplink, `HB` — plain and untracked, no ack, no retry, just a liveness

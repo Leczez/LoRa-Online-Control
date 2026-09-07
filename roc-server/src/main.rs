@@ -20,6 +20,47 @@ struct Args {
     /// Path to this server's own SQLite punch log.
     #[arg(long, env = "ROC_SERVER_DB", default_value = "/var/lib/roc-server/punches.db")]
     db: String,
+
+    /// lora-server's health-check URL (e.g. http://100.x.y.z:8081/health).
+    /// If unset, this server doesn't check lora-server's reachability at all
+    /// (it still serves its own /health regardless).
+    #[arg(long, env = "ROC_SERVER_LORA_HEALTH_URL")]
+    lora_health_url: Option<String>,
+
+    /// How often to check lora-server's health endpoint, in seconds.
+    #[arg(long, env = "ROC_SERVER_HEALTH_CHECK_INTERVAL_SECS", default_value_t = 30)]
+    health_check_interval_secs: u64,
+}
+
+/// Mirrors lora-server's own health-check thread (lora-server/src/
+/// health.rs) — see docs/protocols/lora_online_control_protocol.md,
+/// "Network Identification" for the sibling design note on why this stays
+/// a plain reachability check, not anything more elaborate. Logs only on
+/// state changes so a healthy link doesn't spam the log every interval.
+fn spawn_health_checker(lora_health_url: String, interval: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("lora-health-check".into())
+        .spawn(move || {
+            let mut last_reachable: Option<bool> = None;
+            loop {
+                let reachable = ureq::get(&lora_health_url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .call()
+                    .is_ok();
+
+                if last_reachable != Some(reachable) {
+                    if reachable {
+                        log::info!("lora-server reachable at {}", lora_health_url);
+                    } else {
+                        log::warn!("lora-server unreachable at {}", lora_health_url);
+                    }
+                    last_reachable = Some(reachable);
+                }
+
+                std::thread::sleep(interval);
+            }
+        })
+        .expect("failed to spawn lora-server health-check thread");
 }
 
 #[derive(Deserialize)]
@@ -44,6 +85,10 @@ fn main() -> Result<()> {
     }
     let store = Arc::new(Store::open(&args.db)?);
 
+    if let Some(lora_health_url) = args.lora_health_url.clone() {
+        spawn_health_checker(lora_health_url, std::time::Duration::from_secs(args.health_check_interval_secs));
+    }
+
     log::info!("roc-server listening on {} (db {})", args.listen, args.db);
     let server = Server::http(&args.listen).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -56,6 +101,7 @@ fn main() -> Result<()> {
             (Method::Post, "/punches") => handle_punches(&mut request, &store),
             (Method::Get, "/mip") => handle_mip(&request, &url, &store),
             (Method::Get, "/roc") => handle_roc(&url, &store),
+            (Method::Get, "/health") => text_response(200, "ok"),
             _ => text_response(404, "not found"),
         };
 

@@ -7,6 +7,17 @@ services:
       - "8080:8080"
     volumes:
       - roc-server-data:/data
+    # Lets this container reach a native (non-Docker) process on the same
+    # host via `host.docker.internal` — needed for ROC_SERVER_LORA_HEALTH_URL
+    # if lora-server runs directly on this machine rather than in Docker
+    # too (e.g. the planned Pi 5 setup running both services on one box).
+    # Plain `localhost` inside this container refers to the container
+    # itself, not the host, so that won't reach lora-server.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # ROC_SERVER_LORA_HEALTH_URL: "http://host.docker.internal:8081/health"
+      ROC_SERVER_LISTEN: "0.0.0.0:8080"
     restart: unless-stopped
 
 volumes:

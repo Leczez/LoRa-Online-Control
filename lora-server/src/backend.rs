@@ -248,6 +248,11 @@ fn run_spi(args: Args) -> Result<()> {
         }
     };
 
+    crate::health::spawn_server(args.health_listen.clone());
+    if let Some(roc_health_url) = args.roc_health_url.clone() {
+        crate::health::spawn_checker(roc_health_url, Duration::from_secs(args.health_check_interval_secs));
+    }
+
     let punch_buffer = setup_punch_pipeline(&args)?;
     run_daemon_loop(
         DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },

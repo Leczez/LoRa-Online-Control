@@ -70,6 +70,22 @@ pub struct Args {
     #[arg(long, env = "LORA_NETWORK_ID", default_value = "LOC")]
     pub network_id: String,
 
+    /// Address:port this daemon's own GET /health check server binds, so
+    /// roc-server (or an operator) can confirm it's alive over the network —
+    /// separate from the LoRa radio link's own liveness signal.
+    #[arg(long, env = "LORA_HEALTH_LISTEN", default_value = "0.0.0.0:8081")]
+    pub health_listen: String,
+
+    /// roc-server's health-check URL (e.g. http://100.x.y.z:8080/health).
+    /// If unset, this daemon doesn't check roc-server's reachability at all
+    /// (it still serves its own /health regardless).
+    #[arg(long, env = "LORA_ROC_HEALTH_URL")]
+    pub roc_health_url: Option<String>,
+
+    /// How often to check roc-server's health endpoint, in seconds.
+    #[arg(long, env = "LORA_HEALTH_CHECK_INTERVAL_SECS", default_value_t = 30)]
+    pub health_check_interval_secs: u64,
+
     /// Unix socket path this daemon binds, for lora-tui (or other clients) to attach to.
     #[arg(long, default_value = "/run/lora-server/control.sock")]
     pub socket: String,
