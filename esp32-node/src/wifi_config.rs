@@ -15,7 +15,6 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::http::server::{Configuration as HttpServerConfig, EspHttpServer};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
-use esp_idf_svc::sys::esp_restart;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, BlockingWifi, Configuration, EspWifi};
 
 use crate::config::NodeConfig;
@@ -77,13 +76,17 @@ pub fn run(
             let mut guard = save_nvs.lock().unwrap();
             updated.save(&mut guard)?;
         }
+        log::info!(
+            "config saved (addr={} dest={} freq={} network_id={}), rebooting to apply",
+            updated.addr, updated.dest, updated.freq_hz, updated.network_id
+        );
 
         let mut resp = req.into_ok_response()?;
         resp.write_all(b"<html><body>Saved. Restarting...</body></html>")?;
         drop(resp);
 
         std::thread::sleep(Duration::from_millis(500));
-        unsafe { esp_restart() };
+        esp_idf_hal::reset::restart();
     })?;
 
     std::thread::sleep(CONFIG_WINDOW);

@@ -85,6 +85,13 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // First line out on every boot, deliberately before anything else can
+    // fail — an unattended field node rebooting on its own (brownout,
+    // watchdog, panic) is otherwise invisible; this is the only way to tell
+    // "power-cycled on purpose" apart from "crashed" after the fact from a
+    // serial log.
+    log::info!("esp32-node booting (reset reason: {:?})", esp_idf_hal::reset::ResetReason::get());
+
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
 
