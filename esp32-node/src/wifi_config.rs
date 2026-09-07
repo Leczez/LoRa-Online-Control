@@ -42,7 +42,13 @@ pub fn run(
     wifi.start()?;
     wifi.wait_netif_up()?;
 
-    log::info!("config portal up: connect to Wi-Fi \"{}\", browse to http://192.168.4.1/", ssid);
+    // Don't assume the AP got ESP-IDF's textbook-default 192.168.4.1 — it
+    // didn't on this board (came up on 192.168.71.1 instead, presumably an
+    // esp-idf-svc/sdkconfig default that differs from the raw-C SDK
+    // example), and a hardcoded IP here would send a technician to a
+    // subnet their client was never given an address on.
+    let ip = wifi.wifi().ap_netif().get_ip_info()?.ip;
+    log::info!("config portal up: connect to Wi-Fi \"{}\", browse to http://{}/", ssid, ip);
 
     let mut server = EspHttpServer::new(&HttpServerConfig::default())?;
 
