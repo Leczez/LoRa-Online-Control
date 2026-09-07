@@ -164,6 +164,15 @@ fn parse_form(body: &str) -> HashMap<&str, &str> {
     body.split('&').filter_map(|pair| pair.split_once('=')).collect()
 }
 
+/// The command channel's only failure mode is the daemon loop's receiver
+/// having been dropped, i.e. run_daemon_loop panicked or exited — the
+/// command was NOT applied. Callers must not report success in that case,
+/// even though the send() itself "succeeded" from cmd_tx's point of view.
+fn command_channel_down() -> Response<std::io::Cursor<Vec<u8>>> {
+    log::error!("dropped a command: daemon command channel receiver is gone");
+    Response::from_string("daemon command loop is not running").with_status_code(503)
+}
+
 /// Spawns the browser-facing status dashboard. `roc_health_url` mirrors
 /// whatever `--roc-health-url` was configured with (may be the same value
 /// health::spawn_checker already uses) — `None` means "don't check,
@@ -206,9 +215,13 @@ pub fn spawn_server(
                         let form = parse_form(&body);
                         match (form.get("card_id"), form.get("station"), form.get("time_s")) {
                             (Some(c), Some(s), Some(t)) => {
-                                let _ = cmd_tx.send(format!("TESTPUNCH {} {} {}", c, s, t));
-                                let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
-                                Response::from_string("<html><body>Sent. <a href=\"/\">Back</a></body></html>").with_header(header)
+                                match cmd_tx.send(format!("TESTPUNCH {} {} {}", c, s, t)) {
+                                    Ok(()) => {
+                                        let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+                                        Response::from_string("<html><body>Sent. <a href=\"/\">Back</a></body></html>").with_header(header)
+                                    }
+                                    Err(_) => command_channel_down(),
+                                }
                             }
                             _ => Response::from_string("missing card_id/station/time_s").with_status_code(400),
                         }
@@ -223,8 +236,10 @@ pub fn spawn_server(
                         if payload.is_empty() {
                             Response::from_string("empty payload").with_status_code(400)
                         } else {
-                            let _ = cmd_tx.send(format!("SEND {}", payload));
-                            Response::from_string("ok")
+                            match cmd_tx.send(format!("SEND {}", payload)) {
+                                Ok(()) => Response::from_string("ok"),
+                                Err(_) => command_channel_down(),
+                            }
                         }
                     }
                     (Method::Post, "/setdest") => {
@@ -232,10 +247,10 @@ pub fn spawn_server(
                         let _ = request.as_reader().read_to_string(&mut body);
                         let form = parse_form(&body);
                         match form.get("dest").and_then(|s| s.parse::<u16>().ok()) {
-                            Some(dest) => {
-                                let _ = cmd_tx.send(format!("SET_DEST {}", dest));
-                                Response::from_string("ok")
-                            }
+                            Some(dest) => match cmd_tx.send(format!("SET_DEST {}", dest)) {
+                                Ok(()) => Response::from_string("ok"),
+                                Err(_) => command_channel_down(),
+                            },
                             None => Response::from_string("missing/invalid dest").with_status_code(400),
                         }
                     }
@@ -247,10 +262,10 @@ pub fn spawn_server(
                             form.get("target").and_then(|s| s.parse::<u16>().ok()),
                             form.get("heartbeat_interval_secs").and_then(|s| s.parse::<u32>().ok()),
                         ) {
-                            (Some(target), Some(secs)) => {
-                                let _ = cmd_tx.send(format!("CMD {} {}", target, secs));
-                                Response::from_string("ok")
-                            }
+                            (Some(target), Some(secs)) => match cmd_tx.send(format!("CMD {} {}", target, secs)) {
+                                Ok(()) => Response::from_string("ok"),
+                                Err(_) => command_channel_down(),
+                            },
                             _ => Response::from_string("missing/invalid target/heartbeat_interval_secs").with_status_code(400),
                         }
                     }
@@ -350,5 +365,40 @@ mod tests {
 
         ureq::post(&format!("http://{listen}/cmd")).send_string("target=5&heartbeat_interval_secs=60").unwrap();
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CMD 5 60");
+    }
+
+    /// If the daemon loop's receiver is gone (it panicked or exited), a
+    /// command send truly failed — every command endpoint must report that
+    /// as a 503, not silently answer "ok" as if the command had gone
+    /// through (see command_channel_down's doc comment).
+    #[test]
+    fn test_command_endpoints_503_when_command_channel_receiver_is_gone() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        drop(cmd_rx); // simulates the daemon loop having died
+        let listen = free_listen_addr();
+        spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ureq::get(&format!("http://{listen}/status.json")).call() {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("web dashboard never came up: {e}"),
+            }
+        }
+
+        for (path, body) in [
+            ("/send", "PUNCH 5 123456 31:100".to_string()),
+            ("/setdest", "dest=7".to_string()),
+            ("/cmd", "target=5&heartbeat_interval_secs=60".to_string()),
+            ("/testpunch", "card_id=1&station=2&time_s=3".to_string()),
+        ] {
+            match ureq::post(&format!("http://{listen}{path}")).send_string(&body) {
+                Err(ureq::Error::Status(503, _)) => {}
+                other => panic!("{path} did not 503 with a dead command channel: {other:?}"),
+            }
+        }
     }
 }

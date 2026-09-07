@@ -60,7 +60,9 @@ impl Store {
                 time_s: row.get(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows
+            .filter_map(|r| r.inspect_err(|e| log::error!("corrupt punch row skipped: {e}")).ok())
+            .collect())
     }
 
     /// Timestamp string (`YYYY-MM-DD HH:MM:SS`) for the ROC format, computed
@@ -92,6 +94,30 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].card_id, 111);
         assert_eq!(all[1].card_id, 222);
+    }
+
+    /// A row that can't deserialize (here: a station value that overflows
+    /// u8, inserted via raw SQL to bypass record()'s type-safe API) must be
+    /// skipped, not panic the whole since() call — surrounding valid rows
+    /// still come back. This is what feeds MEOS via /mip and /roc, so a
+    /// corrupt row silently taking the rest of the batch down with it would
+    /// mean every later punch in that poll also vanishes from MEOS's view.
+    #[test]
+    fn test_since_skips_corrupt_row_without_losing_other_rows() {
+        let store = Store::open(":memory:").unwrap();
+        store.record(1, 1, 100, "local").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO punches (card_id, station, time_s, source) VALUES (?1, ?2, ?3, ?4)",
+                (2, 99_999_i64, 200, "local"),
+            )
+            .unwrap();
+        }
+        store.record(3, 3, 300, "local").unwrap();
+
+        let card_ids: Vec<u32> = store.since(0).unwrap().iter().map(|p| p.card_id).collect();
+        assert_eq!(card_ids, vec![1, 3]);
     }
 
     #[test]

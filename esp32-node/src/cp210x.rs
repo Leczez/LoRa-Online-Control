@@ -92,6 +92,10 @@ extern "C" fn data_callback(data: *const u8, data_len: usize, user_arg: *mut c_v
     // Safety: `data`/`data_len` describe a valid buffer for the duration of
     // this callback, per cdc_acm_data_callback_t's documented contract.
     let bytes = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+    // Fails only once the receiver is dropped, i.e. Cp210xTransport is being
+    // torn down — the disconnect is already tracked separately via
+    // `disconnected` (event_callback below), so there's nothing more to
+    // signal here; just drop these last in-flight bytes.
     let _ = state.tx.send(bytes);
     true // data consumed, driver may reuse its RX buffer
 }

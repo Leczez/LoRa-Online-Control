@@ -67,7 +67,9 @@ impl PunchBuffer {
                 source: row.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows
+            .filter_map(|r| r.inspect_err(|e| log::error!("corrupt punch row skipped: {e}")).ok())
+            .collect())
     }
 
     /// Unsent punches this node itself should transmit — its own local SI
@@ -97,7 +99,9 @@ impl PunchBuffer {
                 source: row.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows
+            .filter_map(|r| r.inspect_err(|e| log::error!("corrupt punch row skipped: {e}")).ok())
+            .collect())
     }
 
     pub fn mark_sent(&self, id: i64) -> Result<()> {
@@ -135,6 +139,30 @@ mod tests {
         let unsent = buf.unsent().unwrap();
         assert_eq!(unsent.len(), 1);
         assert_eq!(unsent[0].card_id, 2);
+    }
+
+    /// A row that can't deserialize (here: a station value that overflows
+    /// u8, inserted via raw SQL to bypass record()'s type-safe API) must be
+    /// skipped, not panic the whole unsent() call — surrounding valid rows
+    /// still come back. The skip itself is logged (see unsent()'s
+    /// inspect_err), which isn't asserted here, only that it doesn't take
+    /// the rest of the batch down with it.
+    #[test]
+    fn test_unsent_skips_corrupt_row_without_losing_other_rows() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        buf.record(1, 1, 100, "local").unwrap();
+        {
+            let conn = buf.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO punches (card_id, station, time_s, source) VALUES (?1, ?2, ?3, ?4)",
+                (2, 99_999_i64, 200, "local"),
+            )
+            .unwrap();
+        }
+        buf.record(3, 3, 300, "local").unwrap();
+
+        let card_ids: Vec<u32> = buf.unsent().unwrap().iter().map(|p| p.card_id).collect();
+        assert_eq!(card_ids, vec![1, 3]);
     }
 
     #[test]
