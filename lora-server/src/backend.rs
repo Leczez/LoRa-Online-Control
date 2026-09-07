@@ -198,6 +198,16 @@ fn run_spi(args: Args) -> Result<()> {
     use rppal::gpio::Gpio;
     use rppal::spi::{Bus, Mode, SimpleHalSpiDevice, SlaveSelect, Spi};
 
+    // Spawned before any radio hardware is touched, not after — a daemon
+    // stuck retrying "SPI module not responding" forever used to be
+    // indistinguishable from outside from the process not running at all,
+    // since /health wasn't even listening yet during that window.
+    let radio_ready: crate::health::RadioReady = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    crate::health::spawn_server(args.health_listen.clone(), Arc::clone(&radio_ready));
+    if let Some(roc_health_url) = args.roc_health_url.clone() {
+        crate::health::spawn_checker(roc_health_url, Duration::from_secs(args.health_check_interval_secs));
+    }
+
     let config = build_sx127x_config(&args)?;
     let si_rx = crate::sportident::spawn_si_worker();
 
@@ -226,6 +236,7 @@ fn run_spi(args: Args) -> Result<()> {
 
     if std::io::stdout().is_terminal() {
         let driver = build_driver()?;
+        radio_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         let port_info = format!(
             "SPI0 CE0  freq: {}Hz  sf: {}  bw: {}Hz{}",
             config.freq_hz, config.spreading_factor, config.bandwidth.hz(),
@@ -238,6 +249,7 @@ fn run_spi(args: Args) -> Result<()> {
     let radio: Box<dyn Radio> = loop {
         match build_driver() {
             Ok(driver) => {
+                radio_ready.store(true, std::sync::atomic::Ordering::SeqCst);
                 log::info!("SX1276 module ready on SPI0 CE0{}", if args.dio0_pin.is_some() { " (DIO0 wired)" } else { "" });
                 break driver;
             }
@@ -247,11 +259,6 @@ fn run_spi(args: Args) -> Result<()> {
             }
         }
     };
-
-    crate::health::spawn_server(args.health_listen.clone());
-    if let Some(roc_health_url) = args.roc_health_url.clone() {
-        crate::health::spawn_checker(roc_health_url, Duration::from_secs(args.health_check_interval_secs));
-    }
 
     let punch_buffer = setup_punch_pipeline(&args)?;
     run_daemon_loop(

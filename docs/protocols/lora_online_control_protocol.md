@@ -80,15 +80,25 @@ transmitted. Delivery over the radio link itself works as **stop-and-wait**:
 ## lora-server ↔ roc-server reachability
 
 Separate from the LoRa-radio heartbeat below: `lora-server` and `roc-server`
-each expose a plain `GET /health` (→ `200 ok`) over HTTP, and each can
-optionally run a background thread that polls the *other's* `/health` on an
-interval (`--roc-health-url` on lora-server, `--lora-health-url` on
-roc-server; both default-off, and logging only on state transitions so a
-healthy link doesn't spam the log). This checks the network path between
-the two servers, independent of whether punches are actually flowing — a
+each expose a plain `GET /health` over HTTP, and each can optionally run a
+background thread that polls the *other's* `/health` on an interval
+(`--roc-health-url` on lora-server, `--lora-health-url` on roc-server; both
+default-off, and logging only on state transitions so a healthy link
+doesn't spam the log). This checks the network path between the two
+servers, independent of whether punches are actually flowing — a
 `lora-server` with nothing to push would otherwise give no signal at all
 that its link to `roc-server` is down until a punch actually needed to go
-out. If both processes run on the same host (e.g. the planned Pi 5
+out.
+
+On lora-server, `/health` starts serving *before* the radio hardware is
+even opened, not after — and reports `200 ok` only once the SX1276/RFM95W
+module has actually responded, `503 lora module not found` while still
+retrying. Starting it later (after a successful radio connect, as this
+originally shipped) meant a daemon stuck retrying "SPI module not
+responding" forever looked identical from outside to the process not
+running at all — `/health` simply wasn't listening yet during that window.
+
+If both processes run on the same host (e.g. the planned Pi 5
 consolidation) and `roc-server` runs in Docker, see the `extra_hosts` note
 in `roc-server/docker-compose.yml` — a container's own `localhost` won't
 reach a native process on the same machine.

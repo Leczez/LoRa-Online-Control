@@ -9,13 +9,27 @@
 // liveness signal (the LoRa-side HB frame, see docs/protocols/
 // lora_online_control_protocol.md).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Spawns the local `GET /health` server. Always started in daemon mode,
-/// regardless of whether `--roc-health-url` is configured — cheap, and lets
-/// roc-server (or an operator) check this daemon is alive without needing
-/// this side to have initiated anything first.
-pub fn spawn_server(listen: String) {
+/// Shared with the radio-init retry loop in `backend.rs::run_spi` — starts
+/// `false` and flips to `true` once the SX1276/RFM95W module actually
+/// answers. Spawning the health server *before* that first succeeds (not
+/// after, as this originally shipped) is the whole point: a daemon stuck
+/// retrying "SPI module not responding" forever used to be indistinguishable
+/// from outside from the process not running at all, since /health wasn't
+/// even listening yet during that window. Now it's listening from the very
+/// start and says exactly which of those two states it's in.
+pub type RadioReady = Arc<AtomicBool>;
+
+/// Spawns the local `GET /health` server. Always started — regardless of
+/// whether `--roc-health-url` is configured — cheap, and lets roc-server (or
+/// an operator) check this daemon's actual state without needing this side
+/// to have initiated anything first. Call this before attempting to open
+/// the radio, not after, so a hardware problem is visible immediately
+/// rather than only once it's already been retrying silently for a while.
+pub fn spawn_server(listen: String, radio_ready: RadioReady) {
     std::thread::Builder::new()
         .name("health-server".into())
         .spawn(move || {
@@ -28,7 +42,12 @@ pub fn spawn_server(listen: String) {
             };
             log::info!("health check server listening on {}", listen);
             for request in server.incoming_requests() {
-                let response = tiny_http::Response::from_string("ok");
+                let (status, body) = if radio_ready.load(Ordering::SeqCst) {
+                    (200, "ok")
+                } else {
+                    (503, "lora module not found")
+                };
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
                 if let Err(e) = request.respond(response) {
                     log::warn!("failed to respond to health check request: {}", e);
                 }
@@ -72,31 +91,52 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    /// Real spawn_server(), not a stand-in — binds an actual port and
-    /// confirms GET /health answers over a real HTTP request.
-    #[test]
-    fn test_health_server_responds_ok() {
+    fn free_listen_addr() -> String {
         // Bound only to claim a free port number, then immediately dropped
         // (end of this statement) so spawn_server can bind it itself.
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let listen = format!("127.0.0.1:{port}");
-        spawn_server(listen.clone());
+        format!("127.0.0.1:{port}")
+    }
 
-        // Give the server thread a moment to bind.
+    fn wait_for_health(listen: &str) -> ureq::Response {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match ureq::get(&format!("http://{listen}/health")).call() {
-                Ok(resp) => {
-                    assert_eq!(resp.status(), 200);
-                    assert_eq!(resp.into_string().unwrap(), "ok");
-                    return;
-                }
+                Ok(resp) => return resp,
+                Err(ureq::Error::Status(code, resp)) if code == 503 => return resp,
                 Err(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => panic!("health server never came up: {e}"),
             }
         }
+    }
+
+    /// Real spawn_server(), not a stand-in — binds an actual port and
+    /// confirms GET /health reports 200 once radio_ready is set.
+    #[test]
+    fn test_health_server_reports_ok_once_radio_ready() {
+        let listen = free_listen_addr();
+        let radio_ready = std::sync::Arc::new(AtomicBool::new(true));
+        spawn_server(listen.clone(), radio_ready);
+
+        let resp = wait_for_health(&listen);
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.into_string().unwrap(), "ok");
+    }
+
+    /// The specific gap this design fixes: the health server must report
+    /// the radio-not-found state, not just be silent/unreachable during it
+    /// (which is indistinguishable from the whole process being down).
+    #[test]
+    fn test_health_server_reports_503_when_radio_not_ready() {
+        let listen = free_listen_addr();
+        let radio_ready = std::sync::Arc::new(AtomicBool::new(false));
+        spawn_server(listen.clone(), radio_ready);
+
+        let resp = wait_for_health(&listen);
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.into_string().unwrap(), "lora module not found");
     }
 
     /// Real spawn_checker() against a real (short-lived) listener — proves
