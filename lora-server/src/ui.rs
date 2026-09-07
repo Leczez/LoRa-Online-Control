@@ -27,9 +27,61 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(chunks[1]);
+
     render_config(frame, app, chunks[0]);
-    render_log(frame, app, chunks[1]);
+    render_log(frame, app, middle[0]);
+    render_nodes(frame, app, middle[1]);
     render_input(frame, app, chunks[2]);
+}
+
+fn render_nodes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Nodes ");
+
+    let mut addrs: Vec<u16> = app.nodes.keys().copied().collect();
+    addrs.sort();
+
+    let items: Vec<ListItem> = if addrs.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "no heartbeats yet",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        addrs
+            .iter()
+            .map(|addr| {
+                let status = &app.nodes[addr];
+                let ago = status.last_heartbeat.map(|t| t.elapsed().as_secs());
+                let ago_color = match ago {
+                    Some(s) if s < 120 => Color::Green,
+                    Some(_) => Color::Yellow, // heard from before, but a while ago
+                    None => Color::DarkGray,
+                };
+                let battery = match (status.battery_pct, status.battery_mv) {
+                    (Some(pct), Some(mv)) => format!("{pct}% ({mv}mV)"),
+                    _ => "-".to_string(),
+                };
+                Line::from(vec![
+                    Span::styled(format!("{:#06x}  ", addr), Style::default().fg(Color::White)),
+                    Span::styled(
+                        ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
+                        Style::default().fg(ago_color),
+                    ),
+                    Span::styled(format!("  {battery}"), Style::default().fg(Color::Cyan)),
+                ])
+                .into()
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(block);
+    frame.render_widget(list, area);
 }
 
 fn render_config(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -171,6 +223,19 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 Style::default().fg(if *ok { Color::Green } else { Color::Red }),
             ),
         ]),
+        LogEntry::TestPunchResult { timestamp, card_id, station, time_s } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!(
+                    "TEST card {:>7}  {}@{:02}:{:02}:{:02}",
+                    card_id, station, time_s / 3600, (time_s % 3600) / 60, time_s % 60
+                ),
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
+            ),
+        ]),
     }
 }
 
@@ -258,6 +323,29 @@ pub fn run_app(
                                         None => app.push_log(LogEntry::Error {
                                             timestamp: ts,
                                             message: "usage: /cmd <target-addr> <heartbeat-secs>".to_string(),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/testpunch ") {
+                                    let mut parts = val.trim().splitn(3, ' ');
+                                    let parsed = (parts.next(), parts.next(), parts.next());
+                                    match parsed {
+                                        (Some(c), Some(s), Some(t)) => {
+                                            match (c.parse::<u32>(), s.parse::<u8>(), t.parse::<u32>()) {
+                                                (Ok(card_id), Ok(station), Ok(time_s)) => {
+                                                    match radio.send_test_punch(card_id, station, time_s) {
+                                                        Ok(()) => {} // confirmed later via TESTPUNCHOK, not here
+                                                        Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                                    }
+                                                }
+                                                _ => app.push_log(LogEntry::Error {
+                                                    timestamp: ts,
+                                                    message: "usage: /testpunch <card_id> <station> <time_s>".to_string(),
+                                                }),
+                                            }
+                                        }
+                                        _ => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /testpunch <card_id> <station> <time_s>".to_string(),
                                         }),
                                     }
                                 } else {
@@ -357,6 +445,14 @@ pub fn run_app(
                             target,
                             message: format!("no ack: {}", setting.encode()),
                             ok: false,
+                        });
+                    }
+                    crate::backend::StatusEvent::HeartbeatRx { node, battery } => {
+                        app.record_heartbeat(node, battery);
+                    }
+                    crate::backend::StatusEvent::TestPunchOk { card_id, station, time_s } => {
+                        app.push_log(LogEntry::TestPunchResult {
+                            timestamp: timestamp(), card_id, station, time_s,
                         });
                     }
                 }

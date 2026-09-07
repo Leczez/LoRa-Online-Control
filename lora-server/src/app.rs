@@ -1,6 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 pub const MAX_LOG_ENTRIES: usize = 1000;
+
+/// Node health as seen from this attach session — reset each time lora-tui
+/// (re)connects, unlike the daemon's own daemon_state.rs (which the web
+/// dashboard reads and which persists for the daemon's whole lifetime).
+#[derive(Debug, Clone, Default)]
+pub struct NodeStatus {
+    pub last_heartbeat: Option<Instant>,
+    pub battery_pct: Option<u8>,
+    pub battery_mv: Option<u16>,
+}
 
 #[derive(Debug)]
 pub enum LogEntry {
@@ -34,6 +45,12 @@ pub enum LogEntry {
         message: String,
         ok: bool,
     },
+    TestPunchResult {
+        timestamp: String,
+        card_id: u32,
+        station: u8,
+        time_s: u32,
+    },
 }
 
 pub struct App {
@@ -43,6 +60,7 @@ pub struct App {
     pub addr: u16,
     pub dest: u16,
     pub scroll_offset: usize,
+    pub nodes: HashMap<u16, NodeStatus>,
     port_info: String,
 }
 
@@ -55,7 +73,17 @@ impl App {
             addr,
             dest,
             scroll_offset: 0,
+            nodes: HashMap::new(),
             port_info,
+        }
+    }
+
+    pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>) {
+        let entry = self.nodes.entry(node).or_default();
+        entry.last_heartbeat = Some(Instant::now());
+        if let Some((pct, mv)) = battery {
+            entry.battery_pct = Some(pct);
+            entry.battery_mv = Some(mv);
         }
     }
 

@@ -30,11 +30,27 @@ pub enum StatusEvent {
     CmdOk { target: u16, setting: Setting },
     /// A command this daemon originated got no ack after retrying.
     CmdErr { target: u16, setting: Setting },
+    /// A heartbeat was received from another node — the node-health source
+    /// for lora-tui's node table (see app.rs), same data daemon_state.rs
+    /// tracks for the web dashboard.
+    HeartbeatRx { node: u16, battery: Option<(u8, u16)> },
+    /// Confirms a TESTPUNCH this client (or another attached client) sent
+    /// was actually recorded.
+    TestPunchOk { card_id: u32, station: u8, time_s: u32 },
 }
 
 pub trait Radio: Send {
     fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()>;
     fn receive(&mut self) -> Result<Option<ReceivedPacket>>;
+
+    /// Sends a synthetic test punch through the real buffer/send/ack
+    /// pipeline (see the TESTPUNCH socket command in run_daemon_loop and
+    /// unsent_local's doc comment in punch_buffer.rs). Only meaningful when
+    /// attached to a running daemon (SocketRadio) — a direct-hardware
+    /// session has no punch buffer of its own to inject into.
+    fn send_test_punch(&mut self, _card_id: u32, _station: u8, _time_s: u32) -> Result<()> {
+        anyhow::bail!("test punch requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
+    }
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
     fn poll_status(&mut self) -> Vec<StatusEvent> { Vec::new() }
 
@@ -858,6 +874,27 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
         let setting = Setting::parse(parts.next()?)?;
         return Some(StatusEvent::CmdErr { target, setting });
     }
+    if let Some(rest) = line.strip_prefix("HBRX ") {
+        let mut parts = rest.splitn(2, ' ');
+        let node: u16 = parts.next()?.parse().ok()?;
+        let battery_field = parts.next()?;
+        let battery = if battery_field == "-" {
+            None
+        } else {
+            let mut bparts = battery_field.splitn(2, ' ');
+            let pct: u8 = bparts.next()?.parse().ok()?;
+            let mv: u16 = bparts.next()?.parse().ok()?;
+            Some((pct, mv))
+        };
+        return Some(StatusEvent::HeartbeatRx { node, battery });
+    }
+    if let Some(rest) = line.strip_prefix("TESTPUNCHOK ") {
+        let mut parts = rest.splitn(3, ' ');
+        let card_id: u32 = parts.next()?.parse().ok()?;
+        let station: u8 = parts.next()?.parse().ok()?;
+        let time_s: u32 = parts.next()?.parse().ok()?;
+        return Some(StatusEvent::TestPunchOk { card_id, station, time_s });
+    }
     None
 }
 
@@ -887,6 +924,12 @@ impl Radio for SocketRadio {
         // the actual radio frame — an attach client has no radio identity
         // of its own to offer here.
         writeln!(self.writer, "CMD {} {}", target, heartbeat_interval_secs)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn send_test_punch(&mut self, card_id: u32, station: u8, time_s: u32) -> Result<()> {
+        writeln!(self.writer, "TESTPUNCH {} {} {}", card_id, station, time_s)?;
         self.writer.flush()?;
         Ok(())
     }
