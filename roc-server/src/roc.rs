@@ -3,9 +3,17 @@
 // ROC (Radio Online Control) output: a simple polled, semicolon-delimited
 // text format — `id;control;card;timestamp` per line, oldest first.
 //
-// NOTE: mirrors the shape of the real roc.olresultat.se polling format as
-// best recalled during design; verify against a real client before relying
-// on this in a live event.
+// Verified directly against melinsoftware/meos's actual C++ source
+// (OnlineInput::processPunches(oe, list<vector<wstring>> &rocData) in
+// onlineinput.cpp), not documentation or recollection: MEOS's csvparser
+// splits on `;` (confirmed by a sibling comment in that file noting the
+// SportIdent-Center format "can't use csv.parse as it expects semi-colon as
+// separator"), requires exactly 4 fields per line, and reads them
+// positionally as punchId/code/card/timeS — `timeS = line[3].substr(11)`,
+// i.e. it expects the 4th field to be `"YYYY-MM-DD HH:MM:SS"` and strips
+// the leading 11-character date prefix itself. Field order and the
+// timestamp format below match this exactly. MEOS's own request query
+// param is `lastId` (confirmed in the same file) — matched in main.rs.
 
 use crate::store::StoredPunch;
 
