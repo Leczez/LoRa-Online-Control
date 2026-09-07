@@ -801,41 +801,6 @@ fn run_daemon_loop(
 
 // ── Attach mode ───────────────────────────────────────────────────────────────
 
-struct SocketRadio {
-    writer: BufWriter<std::os::unix::net::UnixStream>,
-    events: std::sync::mpsc::Receiver<ReceivedPacket>,
-    status_events: std::sync::mpsc::Receiver<StatusEvent>,
-}
-
-impl SocketRadio {
-    fn new(stream: std::os::unix::net::UnixStream) -> Result<Self> {
-        let read_stream = stream.try_clone()?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (status_tx, status_rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            let reader = BufReader::new(read_stream);
-            for line in reader.lines().flatten() {
-                if let Some(pkt) = parse_rx_line(&line) {
-                    if tx.send(pkt).is_err() {
-                        break;
-                    }
-                } else if let Some(evt) = parse_status_line(&line) {
-                    if status_tx.send(evt).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            writer: BufWriter::new(stream),
-            events: rx,
-            status_events: status_rx,
-        })
-    }
-}
-
 fn parse_rx_line(line: &str) -> Option<ReceivedPacket> {
     let rest = line.strip_prefix("RX ")?;
     let mut parts = rest.splitn(3, ' ');
@@ -898,10 +863,103 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
     None
 }
 
-impl Radio for SocketRadio {
+/// How often HttpRadio polls /status.json for new log lines. Short enough
+/// that lora-tui feels live; long enough not to hammer a Pi-hosted daemon
+/// from a terminal a human is just watching.
+const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(serde::Deserialize)]
+struct HttpLogLine {
+    seq: u64,
+    line: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HttpStatusResponse {
+    log: Vec<HttpLogLine>,
+}
+
+/// lora-tui's transport when attaching to a running daemon over HTTP instead
+/// of the daemon's Unix control socket — reads GET /status.json (see
+/// web.rs), reusing parse_rx_line/parse_status_line since /status.json's log
+/// lines are the exact same text log_and_broadcast() already produces for
+/// the (still-supported, but no longer used by any client in this repo)
+/// socket broadcast. Commands go out as POST /send, /setdest, /cmd,
+/// /testpunch, which web.rs forwards to the daemon's own command channel —
+/// the identical cmd_tx a socket client's SEND/SET_DEST/CMD/TESTPUNCH lines
+/// would reach.
+struct HttpRadio {
+    base_url: String,
+    events: std::sync::mpsc::Receiver<ReceivedPacket>,
+    status_events: std::sync::mpsc::Receiver<StatusEvent>,
+}
+
+impl HttpRadio {
+    fn new(base_url: String) -> Result<Self> {
+        let status_url = format!("{}/status.json", base_url);
+        let initial: HttpStatusResponse = ureq::get(&status_url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("cannot reach lora-server at {}: {}", base_url, e))?
+            .into_json()
+            .map_err(|e| anyhow::anyhow!("bad /status.json from {}: {}", base_url, e))?;
+
+        // log is newest-first (see web.rs::build_status) — start from the
+        // highest seq already present so a freshly attached client doesn't
+        // replay the whole history, matching the old socket protocol's
+        // "live traffic only" behavior (see app.rs's NodeStatus doc comment).
+        let mut last_seq = initial.log.first().map(|e| e.seq).unwrap_or(0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let poll_url = status_url.clone();
+
+        std::thread::spawn(move || loop {
+            std::thread::sleep(HTTP_POLL_INTERVAL);
+
+            let resp = match ureq::get(&poll_url).call() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("status poll of {} failed: {}", poll_url, e);
+                    continue;
+                }
+            };
+            let parsed: HttpStatusResponse = match resp.into_json() {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("bad /status.json from {}: {}", poll_url, e);
+                    continue;
+                }
+            };
+
+            let mut new_entries: Vec<&HttpLogLine> = parsed.log.iter().filter(|e| e.seq > last_seq).collect();
+            if new_entries.is_empty() {
+                continue;
+            }
+            new_entries.sort_by_key(|e| e.seq); // oldest-of-the-new-batch first, preserving event order
+
+            for entry in &new_entries {
+                if let Some(pkt) = parse_rx_line(&entry.line) {
+                    if tx.send(pkt).is_err() {
+                        return;
+                    }
+                } else if let Some(evt) = parse_status_line(&entry.line) {
+                    if status_tx.send(evt).is_err() {
+                        return;
+                    }
+                }
+            }
+            last_seq = new_entries.last().unwrap().seq;
+        });
+
+        Ok(Self { base_url, events: rx, status_events: status_rx })
+    }
+}
+
+impl Radio for HttpRadio {
     fn send(&mut self, _dest: u16, payload: &[u8]) -> Result<()> {
-        writeln!(self.writer, "SEND {}", String::from_utf8_lossy(payload))?;
-        self.writer.flush()?;
+        ureq::post(&format!("{}/send", self.base_url))
+            .send_string(&String::from_utf8_lossy(payload))
+            .map_err(|e| anyhow::anyhow!("POST /send failed: {}", e))?;
         Ok(())
     }
 
@@ -910,8 +968,9 @@ impl Radio for SocketRadio {
     }
 
     fn set_dest(&mut self, dest: u16) -> Result<()> {
-        writeln!(self.writer, "SET_DEST {}", dest)?;
-        self.writer.flush()?;
+        ureq::post(&format!("{}/setdest", self.base_url))
+            .send_string(&format!("dest={}", dest))
+            .map_err(|e| anyhow::anyhow!("POST /setdest failed: {}", e))?;
         Ok(())
     }
 
@@ -923,25 +982,25 @@ impl Radio for SocketRadio {
         // The daemon fills in its own address as commander when it builds
         // the actual radio frame — an attach client has no radio identity
         // of its own to offer here.
-        writeln!(self.writer, "CMD {} {}", target, heartbeat_interval_secs)?;
-        self.writer.flush()?;
+        ureq::post(&format!("{}/cmd", self.base_url))
+            .send_string(&format!("target={}&heartbeat_interval_secs={}", target, heartbeat_interval_secs))
+            .map_err(|e| anyhow::anyhow!("POST /cmd failed: {}", e))?;
         Ok(())
     }
 
     fn send_test_punch(&mut self, card_id: u32, station: u8, time_s: u32) -> Result<()> {
-        writeln!(self.writer, "TESTPUNCH {} {} {}", card_id, station, time_s)?;
-        self.writer.flush()?;
+        ureq::post(&format!("{}/testpunch", self.base_url))
+            .send_string(&format!("card_id={}&station={}&time_s={}", card_id, station, time_s))
+            .map_err(|e| anyhow::anyhow!("POST /testpunch failed: {}", e))?;
         Ok(())
     }
 }
 
-pub fn attach(socket_path: &str, addr: u16, dest: u16) -> Result<()> {
-    let stream = std::os::unix::net::UnixStream::connect(socket_path)
-        .map_err(|e| anyhow::anyhow!("cannot connect to daemon at {}: {}", socket_path, e))?;
-
-    let radio = SocketRadio::new(stream)?;
+pub fn attach(server_url: &str, addr: u16, dest: u16) -> Result<()> {
+    let server_url = server_url.trim_end_matches('/').to_string();
+    let radio = HttpRadio::new(server_url.clone())?;
     let (_, si_rx) = std::sync::mpsc::channel();
-    crate::ui::run_app("attached to daemon".to_string(), addr, dest, Box::new(radio), 0, si_rx)
+    crate::ui::run_app(format!("attached via {}", server_url), addr, dest, Box::new(radio), 0, si_rx)
 }
 
 #[cfg(test)]
@@ -1027,21 +1086,85 @@ mod tests {
         assert!(parse_status_line("garbage").is_none());
     }
 
-    /// Real end-to-end check of the client -> daemon wire protocol for
-    /// commands: a SocketRadio wrapping one end of a real Unix socket pair
-    /// should write exactly "CMD <target> <secs>" to the other end when
-    /// send_command is called, since that's the line the daemon's
-    /// handle_client / run_daemon_loop parse to originate a command.
+    fn free_test_listen_addr() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("127.0.0.1:{port}")
+    }
+
+    fn wait_for_server(base_url: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if ureq::get(&format!("{base_url}/status.json")).call().is_ok() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("server at {base_url} never came up");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Real end-to-end check of HttpRadio's command path against a real
+    /// web::spawn_server instance: send_command should reach the daemon's
+    /// command channel as exactly "CMD <target> <secs>" — the same line the
+    /// (still-supported) socket protocol's CMD command produces, since both
+    /// paths feed run_daemon_loop's identical cmd_rx dispatch.
     #[test]
-    fn test_socket_radio_send_command_writes_expected_line() {
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut radio = SocketRadio::new(a).unwrap();
+    fn test_http_radio_send_command_reaches_daemon_command_channel() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let listen = free_test_listen_addr();
+        crate::web::spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        let mut radio = HttpRadio::new(base_url).unwrap();
         radio.send_command(1, 5, 30).unwrap();
 
-        let mut reader = BufReader::new(b);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert_eq!(line.trim_end(), "CMD 5 30");
+        let cmd = cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(cmd, "CMD 5 30");
+    }
+
+    /// Confirms the other half of HttpRadio: log lines pushed into
+    /// daemon_state (as run_daemon_loop's log_and_broadcast would) actually
+    /// surface as a ReceivedPacket via receive() and a StatusEvent via
+    /// poll_status() after the background poller picks them up from
+    /// /status.json — not just that HttpRadio compiles against the trait.
+    #[test]
+    fn test_http_radio_polls_new_log_lines_into_events_and_status() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<String>();
+        let listen = free_test_listen_addr();
+        crate::web::spawn_server(listen.clone(), Arc::clone(&state), radio_ready, None, cmd_tx);
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        let mut radio = HttpRadio::new(base_url).unwrap();
+
+        state.lock().unwrap().push_log("RX 5 -80 PUNCH 5 123456 31:100".to_string());
+        state.lock().unwrap().push_log("HBRX 5 77 3900".to_string());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got_pkt = false;
+        let mut got_evt = false;
+        while Instant::now() < deadline && !(got_pkt && got_evt) {
+            if let Ok(Some(pkt)) = radio.receive() {
+                assert_eq!(pkt.src_addr, 5);
+                got_pkt = true;
+            }
+            for evt in radio.poll_status() {
+                if let StatusEvent::HeartbeatRx { node, battery } = evt {
+                    assert_eq!(node, 5);
+                    assert_eq!(battery, Some((77, 3900)));
+                    got_evt = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(got_pkt, "never received the RX-derived packet via HTTP polling");
+        assert!(got_evt, "never received the HBRX-derived status event via HTTP polling");
     }
 
     #[test]

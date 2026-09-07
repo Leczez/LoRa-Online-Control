@@ -1,10 +1,14 @@
 // lora-server/src/web.rs
 //
-// Browser-facing status dashboard: radio/roc-server reachability, a node
-// health table, the recent packet log, and a form to send a TESTPUNCH — the
-// web counterpart to lora-tui's terminal view, both ultimately reading the
-// same daemon_state::SharedState (see that module's own doc comment for why
-// this exists separately from the Unix-socket broadcast lora-tui uses).
+// Status dashboard AND lora-tui's actual data/command transport: GET
+// /status.json (radio/roc-server reachability, node health table, recent
+// packet log with monotonic seq numbers for polling clients) plus GET / for
+// a browser view of the same data. POST /send, /setdest, /cmd, /testpunch
+// all forward to the daemon's own command channel (cmd_tx) — the same
+// channel the Unix-socket control protocol's SEND/SET_DEST/CMD/TESTPUNCH
+// lines feed (see backend.rs::run_daemon_loop) — so lora-tui's HttpRadio
+// (backend.rs) and a human using the HTML form are just two more callers of
+// exactly the commands the daemon already understood.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -28,11 +32,21 @@ struct NodeView {
 }
 
 #[derive(Serialize)]
+struct LogLineView {
+    /// See daemon_state::LogEntry::seq — lora-tui's HttpRadio polls this
+    /// endpoint and uses seq to tell which lines are new since its last
+    /// poll, since `line` text alone repeats and secs_ago changes every call.
+    seq: u64,
+    secs_ago: u64,
+    line: String,
+}
+
+#[derive(Serialize)]
 struct StatusView {
     radio_ready: bool,
     roc_reachable: Option<bool>,
     nodes: Vec<NodeView>,
-    log: Vec<String>,
+    log: Vec<LogLineView>,
 }
 
 fn secs_ago(t: SystemTime) -> u64 {
@@ -59,7 +73,12 @@ fn build_status(state: &SharedState, radio_ready: &RadioReady, roc_health_url: &
         .collect();
     nodes.sort_by_key(|n| n.addr);
 
-    let log: Vec<String> = guard.log.iter().rev().map(|e| format!("[-{}s] {}", secs_ago(e.at), e.line)).collect();
+    let log: Vec<LogLineView> = guard
+        .log
+        .iter()
+        .rev()
+        .map(|e| LogLineView { seq: e.seq, secs_ago: secs_ago(e.at), line: e.line.clone() })
+        .collect();
     drop(guard);
 
     let roc_reachable = roc_health_url
@@ -105,9 +124,8 @@ fn render_html(v: &StatusView) -> String {
     }
 
     let mut log_lines = String::new();
-    for line in &v.log {
-        log_lines.push_str(&html_escape(line));
-        log_lines.push('\n');
+    for entry in &v.log {
+        log_lines.push_str(&format!("[-{}s] {}\n", entry.secs_ago, html_escape(&entry.line)));
     }
     if log_lines.is_empty() {
         log_lines = "(empty)".to_string();
@@ -197,6 +215,47 @@ pub fn spawn_server(
                             _ => Response::from_string("missing card_id/station/time_s").with_status_code(400),
                         }
                     }
+                    // Raw text body, not form-encoded — a radio payload can
+                    // contain '&'/'=' that the naive parse_form() splitter
+                    // (used everywhere else here) would mangle.
+                    (Method::Post, "/send") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let payload = body.trim_end_matches(['\r', '\n']);
+                        if payload.is_empty() {
+                            Response::from_string("empty payload").with_status_code(400)
+                        } else {
+                            let _ = cmd_tx.send(format!("SEND {}", payload));
+                            Response::from_string("ok")
+                        }
+                    }
+                    (Method::Post, "/setdest") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match form.get("dest").and_then(|s| s.parse::<u16>().ok()) {
+                            Some(dest) => {
+                                let _ = cmd_tx.send(format!("SET_DEST {}", dest));
+                                Response::from_string("ok")
+                            }
+                            None => Response::from_string("missing/invalid dest").with_status_code(400),
+                        }
+                    }
+                    (Method::Post, "/cmd") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match (
+                            form.get("target").and_then(|s| s.parse::<u16>().ok()),
+                            form.get("heartbeat_interval_secs").and_then(|s| s.parse::<u32>().ok()),
+                        ) {
+                            (Some(target), Some(secs)) => {
+                                let _ = cmd_tx.send(format!("CMD {} {}", target, secs));
+                                Response::from_string("ok")
+                            }
+                            _ => Response::from_string("missing/invalid target/heartbeat_interval_secs").with_status_code(400),
+                        }
+                    }
                     _ => Response::from_string("not found").with_status_code(404),
                 };
 
@@ -257,5 +316,41 @@ mod tests {
             .unwrap();
         let cmd = cmd_rx.recv_timeout(Duration::from_secs(2)).expect("testpunch never reached the command channel");
         assert_eq!(cmd, "TESTPUNCH 555 9 1234");
+    }
+
+    /// The three endpoints lora-tui's HttpRadio relies on for everything
+    /// besides status polling and test punches: confirms each forwards the
+    /// exact command-channel line the daemon's socket-based dispatch already
+    /// parses (see run_daemon_loop's cmd_rx match in backend.rs), and that
+    /// log entries carry a seq number a polling client can diff against.
+    #[test]
+    fn test_send_setdest_cmd_endpoints_drive_command_channel() {
+        let state = crate::daemon_state::new_shared();
+        state.lock().unwrap().push_log("first".to_string());
+        state.lock().unwrap().push_log("second".to_string());
+
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        let listen = free_listen_addr();
+        spawn_server(listen.clone(), Arc::clone(&state), radio_ready, None, cmd_tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let json = loop {
+            match ureq::get(&format!("http://{listen}/status.json")).call() {
+                Ok(resp) => break resp.into_string().unwrap(),
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("web dashboard never came up: {e}"),
+            }
+        };
+        assert!(json.contains("\"seq\": 1") && json.contains("\"seq\": 2"), "status.json was: {json}");
+
+        ureq::post(&format!("http://{listen}/send")).send_string("PUNCH 5 123456 31:100").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "SEND PUNCH 5 123456 31:100");
+
+        ureq::post(&format!("http://{listen}/setdest")).send_string("dest=7").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "SET_DEST 7");
+
+        ureq::post(&format!("http://{listen}/cmd")).send_string("target=5&heartbeat_interval_secs=60").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CMD 5 60");
     }
 }

@@ -17,6 +17,12 @@ const LOG_CAPACITY: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    /// Monotonically increasing, never reused even once the entry itself is
+    /// evicted from `log` — lets a polling HTTP client (lora-tui's HttpRadio,
+    /// see backend.rs) tell "new since last poll" apart from "same entry,
+    /// just formatted with a fresher secs_ago", which comparing the `line`
+    /// text alone can't do.
+    pub seq: u64,
     pub at: SystemTime,
     pub line: String,
 }
@@ -34,6 +40,7 @@ pub struct NodeStatus {
 pub struct DaemonState {
     pub log: VecDeque<LogEntry>,
     pub nodes: HashMap<u16, NodeStatus>,
+    next_seq: u64,
 }
 
 impl DaemonState {
@@ -41,7 +48,8 @@ impl DaemonState {
         if self.log.len() >= LOG_CAPACITY {
             self.log.pop_front();
         }
-        self.log.push_back(LogEntry { at: SystemTime::now(), line });
+        self.next_seq += 1;
+        self.log.push_back(LogEntry { seq: self.next_seq, at: SystemTime::now(), line });
     }
 
     pub fn record_heartbeat(&mut self, node: u16, battery: Option<(u8, u16)>) {
@@ -79,6 +87,18 @@ mod tests {
         assert_eq!(state.log.len(), LOG_CAPACITY);
         assert_eq!(state.log.front().unwrap().line, "line 5");
         assert_eq!(state.log.back().unwrap().line, format!("line {}", LOG_CAPACITY + 4));
+    }
+
+    #[test]
+    fn test_seq_keeps_increasing_past_eviction() {
+        let mut state = DaemonState::default();
+        for _ in 0..LOG_CAPACITY + 5 {
+            state.push_log("line".to_string());
+        }
+        // Oldest surviving entry is the 6th pushed (1-indexed seq == 6), not
+        // reset to 1 just because earlier entries were evicted.
+        assert_eq!(state.log.front().unwrap().seq, 6);
+        assert_eq!(state.log.back().unwrap().seq, (LOG_CAPACITY + 5) as u64);
     }
 
     #[test]

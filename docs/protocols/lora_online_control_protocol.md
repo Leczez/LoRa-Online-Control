@@ -103,6 +103,42 @@ consolidation) and `roc-server` runs in Docker, see the `extra_hosts` note
 in `roc-server/docker-compose.yml` — a container's own `localhost` won't
 reach a native process on the same machine.
 
+## lora-server web API (dashboard + lora-tui transport)
+
+`lora-server` embeds an HTTP server (`--web-listen`, default
+`0.0.0.0:8082`) that is both a browser-facing status dashboard and
+`lora-tui`'s only transport when attaching to a running daemon — `lora-tui`
+does not open the Unix control socket described elsewhere in this doc; it is
+a plain HTTP client, so it can attach to a `lora-server` on a different
+machine, not just one with a reachable local socket.
+
+- `GET /status.json` — radio/roc-server reachability, the per-node health
+  table, and the recent packet log. Each log line carries a monotonically
+  increasing `seq` (never reused, even once the line itself ages out of the
+  bounded history) so a polling client can tell "new since last poll" apart
+  from "same line, just formatted with a fresher age" — comparing the line
+  text alone can't do that. `lora-tui`'s `HttpRadio` (`backend.rs`) polls
+  this every 500ms, tracks the highest `seq` it's seen, and feeds any newer
+  lines through the same `parse_rx_line`/`parse_status_line` parsing the
+  (still-running, but no longer used by any client in this repo) Unix socket
+  broadcast used — reusing 100% of the existing packet/heartbeat/command-ack
+  display logic.
+- `GET /` — the same data as an HTML page.
+- `POST /testpunch` (form: `card_id`, `station`, `time_s`) — injects a
+  synthetic punch tagged `source="test"` through the real send/retry/ack
+  pipeline.
+- `POST /send` (raw text body, not form-encoded — a radio payload can
+  contain `&`/`=`) — sends to the daemon's currently configured `dest`.
+- `POST /setdest` (form: `dest`) — changes the daemon's `dest`.
+- `POST /cmd` (form: `target`, `heartbeat_interval_secs`) — originates a
+  Command Packet (see below) toward `target`, tracked with the same
+  retry/ack bookkeeping as a socket client's `CMD` would get.
+
+All four POST endpoints forward to the daemon's internal command channel —
+the identical channel the Unix socket's `SEND`/`SET_DEST`/`CMD`/`TESTPUNCH`
+lines already fed — so a browser form, `lora-tui`, and a raw socket client
+are three callers of the same underlying commands.
+
 ## Heartbeats
 
 Uplink, `HB` — plain and untracked, no ack, no retry, just a liveness
