@@ -92,10 +92,6 @@ pub struct Args {
     #[arg(long, env = "LORA_WEB_LISTEN", default_value = "0.0.0.0:8082")]
     pub web_listen: String,
 
-    /// Unix socket path this daemon binds, for lora-tui (or other clients) to attach to.
-    #[arg(long, default_value = "/run/lora-server/control.sock")]
-    pub socket: String,
-
     /// Path to the persistent punch buffer (SQLite). Every punch, local or
     /// remote, is recorded here before anything else happens to it.
     #[arg(long, env = "LORA_PUNCH_DB", default_value = "/var/lib/lora-server/punches.db")]

@@ -72,7 +72,8 @@ impl PunchBuffer {
 
     /// Unsent punches this node itself should transmit — its own local SI
     /// reader (source == "local") plus any operator-triggered test punches
-    /// (source == "test", see the TESTPUNCH socket command in backend.rs),
+    /// (source == "test", see the TESTPUNCH command in backend.rs, reachable
+    /// via POST /testpunch — web.rs),
     /// oldest first. Test punches deliberately flow through the exact same
     /// send/retry/ack path as a real one — that's the point, verifying the
     /// real pipeline — but keep a distinct `source` tag rather than being

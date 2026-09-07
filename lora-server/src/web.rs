@@ -1,14 +1,12 @@
 // lora-server/src/web.rs
 //
-// Status dashboard AND lora-tui's actual data/command transport: GET
+// This IS lora-tui's transport, not just a browser dashboard: GET
 // /status.json (radio/roc-server reachability, node health table, recent
 // packet log with monotonic seq numbers for polling clients) plus GET / for
 // a browser view of the same data. POST /send, /setdest, /cmd, /testpunch
-// all forward to the daemon's own command channel (cmd_tx) — the same
-// channel the Unix-socket control protocol's SEND/SET_DEST/CMD/TESTPUNCH
-// lines feed (see backend.rs::run_daemon_loop) — so lora-tui's HttpRadio
-// (backend.rs) and a human using the HTML form are just two more callers of
-// exactly the commands the daemon already understood.
+// all forward to the daemon's own command channel (cmd_tx, read by
+// run_daemon_loop in backend.rs) — lora-tui's HttpRadio (backend.rs) and a
+// human using the HTML form are just two more callers of the same commands.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -281,8 +279,8 @@ mod tests {
 
     /// Real spawn_server() against real HTTP requests: confirms node data
     /// recorded via daemon_state actually surfaces through /status.json,
-    /// and that /testpunch really drives the command channel a socket
-    /// client's TESTPUNCH would use — not just that this all compiles.
+    /// and that /testpunch really drives the command channel run_daemon_loop
+    /// reads TESTPUNCH from — not just that this all compiles.
     #[test]
     fn test_status_json_and_testpunch_against_real_server() {
         let state = crate::daemon_state::new_shared();
@@ -320,9 +318,9 @@ mod tests {
 
     /// The three endpoints lora-tui's HttpRadio relies on for everything
     /// besides status polling and test punches: confirms each forwards the
-    /// exact command-channel line the daemon's socket-based dispatch already
-    /// parses (see run_daemon_loop's cmd_rx match in backend.rs), and that
-    /// log entries carry a seq number a polling client can diff against.
+    /// exact command-channel line run_daemon_loop's cmd_rx match (backend.rs)
+    /// already parses, and that log entries carry a seq number a polling
+    /// client can diff against.
     #[test]
     fn test_send_setdest_cmd_endpoints_drive_command_channel() {
         let state = crate::daemon_state::new_shared();

@@ -107,10 +107,10 @@ reach a native process on the same machine.
 
 `lora-server` embeds an HTTP server (`--web-listen`, default
 `0.0.0.0:8082`) that is both a browser-facing status dashboard and
-`lora-tui`'s only transport when attaching to a running daemon — `lora-tui`
-does not open the Unix control socket described elsewhere in this doc; it is
-a plain HTTP client, so it can attach to a `lora-server` on a different
-machine, not just one with a reachable local socket.
+`lora-tui`'s *only* transport when attaching to a running daemon — there is
+no other control channel; `lora-tui` is a plain HTTP client, so it can
+attach to a `lora-server` on a different machine, not just one on the same
+host.
 
 - `GET /status.json` — radio/roc-server reachability, the per-node health
   table, and the recent packet log. Each log line carries a monotonically
@@ -119,10 +119,8 @@ machine, not just one with a reachable local socket.
   from "same line, just formatted with a fresher age" — comparing the line
   text alone can't do that. `lora-tui`'s `HttpRadio` (`backend.rs`) polls
   this every 500ms, tracks the highest `seq` it's seen, and feeds any newer
-  lines through the same `parse_rx_line`/`parse_status_line` parsing the
-  (still-running, but no longer used by any client in this repo) Unix socket
-  broadcast used — reusing 100% of the existing packet/heartbeat/command-ack
-  display logic.
+  lines through `parse_rx_line`/`parse_status_line` — reusing 100% of the
+  existing packet/heartbeat/command-ack display logic.
 - `GET /` — the same data as an HTML page.
 - `POST /testpunch` (form: `card_id`, `station`, `time_s`) — injects a
   synthetic punch tagged `source="test"` through the real send/retry/ack
@@ -132,12 +130,12 @@ machine, not just one with a reachable local socket.
 - `POST /setdest` (form: `dest`) — changes the daemon's `dest`.
 - `POST /cmd` (form: `target`, `heartbeat_interval_secs`) — originates a
   Command Packet (see below) toward `target`, tracked with the same
-  retry/ack bookkeeping as a socket client's `CMD` would get.
+  retry/ack bookkeeping any command gets.
 
-All four POST endpoints forward to the daemon's internal command channel —
-the identical channel the Unix socket's `SEND`/`SET_DEST`/`CMD`/`TESTPUNCH`
-lines already fed — so a browser form, `lora-tui`, and a raw socket client
-are three callers of the same underlying commands.
+All four POST endpoints forward to the daemon's internal command channel,
+read by the same `run_daemon_loop` dispatch regardless of which endpoint a
+command came in on — a browser form and `lora-tui` are two callers of the
+same underlying commands.
 
 ## Heartbeats
 
@@ -208,7 +206,7 @@ uplink turn.
   `SET_DEST` first.** Command frames route to `--dest` (this node's own
   next hop) rather than straight to the named target, exactly like uplink
   punch traffic already does — that's what makes relaying possible, and it
-  makes `CMD` consistent with the existing `SEND` socket command instead of
+  makes `CMD` consistent with the existing `POST /send` behavior instead of
   being the one exception that assumed direct reach.
 - **Hop-count/TTL is not implemented yet.** Still worth adding as cheap
   insurance against a future misconfigured relay loop, but the current

@@ -2,12 +2,10 @@
 //
 // In-process shared state for the daemon loop: a bounded packet log and a
 // per-node health table, both readable from lora-server's own web server
-// (web.rs) for the status dashboard. Deliberately separate from the
-// existing Unix-socket broadcast() mechanism lora-tui uses — that's a
-// live-only stream (a client attaching after the fact sees nothing until
-// new traffic arrives), whereas a web dashboard needs to show *current*
-// state to a browser that just loaded the page. log_and_broadcast() in
-// backend.rs feeds both from the same call sites.
+// (web.rs) via GET /status.json — the browser dashboard's data source and
+// lora-tui's only transport (see HttpRadio in backend.rs, which polls
+// /status.json and tracks each entry's seq to reconstruct a live-only
+// stream client-side). log_event() in backend.rs is the sole writer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
