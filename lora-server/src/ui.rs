@@ -17,6 +17,20 @@ use ratatui::{
 use crate::app::{App, LogEntry};
 use crate::backend::Radio;
 
+/// Printed by /help, one entry per line. Kept next to the command dispatch
+/// below so a new command and its help line don't drift apart.
+const HELP_TEXT: &[&str] = &[
+    "commands:",
+    "  /dest <addr>                        change the address sent traffic targets",
+    "  /addr <addr>                        change this session's own displayed address",
+    "  /cmd <target-addr> <heartbeat-secs>  ask a node to change its heartbeat interval",
+    "  /testpunch <card_id> <station> <time_s>  inject a synthetic test punch",
+    "  /clearpunch <id>                     abandon one stuck unsent local punch",
+    "  /clearpunches                        abandon every stuck unsent local punch",
+    "  /help                                show this text",
+    "  anything else is sent as a raw payload to the current /dest",
+];
+
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -236,6 +250,23 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
             ),
         ]),
+        LogEntry::ClearPunchResult { timestamp, message } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("CLEAR {}", message),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            ),
+        ]),
+        LogEntry::Info { timestamp, message } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(message.clone(), Style::default().fg(Color::White)),
+        ]),
     }
 }
 
@@ -348,6 +379,26 @@ pub fn run_app(
                                             message: "usage: /testpunch <card_id> <station> <time_s>".to_string(),
                                         }),
                                     }
+                                } else if let Some(val) = msg.strip_prefix("/clearpunch ") {
+                                    match val.trim().parse::<i64>() {
+                                        Ok(id) => match radio.clear_punch(id) {
+                                            Ok(()) => {} // confirmed later via CLEARPUNCHOK, not here
+                                            Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                        },
+                                        Err(_) => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /clearpunch <id>".to_string(),
+                                        }),
+                                    }
+                                } else if msg.trim() == "/clearpunches" {
+                                    match radio.clear_all_punches() {
+                                        Ok(()) => {} // confirmed later via CLEARPUNCHESOK, not here
+                                        Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                    }
+                                } else if msg.trim() == "/help" {
+                                    for line in HELP_TEXT {
+                                        app.push_log(LogEntry::Info { timestamp: ts.clone(), message: line.to_string() });
+                                    }
                                 } else {
                                     match radio.send(app.dest, msg.as_bytes()) {
                                         Ok(()) => app.push_log(LogEntry::Tx { timestamp: ts, dest_addr: app.dest, payload: msg }),
@@ -453,6 +504,16 @@ pub fn run_app(
                     crate::backend::StatusEvent::TestPunchOk { card_id, station, time_s } => {
                         app.push_log(LogEntry::TestPunchResult {
                             timestamp: timestamp(), card_id, station, time_s,
+                        });
+                    }
+                    crate::backend::StatusEvent::ClearPunchOk { id } => {
+                        app.push_log(LogEntry::ClearPunchResult {
+                            timestamp: timestamp(), message: format!("cleared punch {id}"),
+                        });
+                    }
+                    crate::backend::StatusEvent::ClearPunchesOk { count } => {
+                        app.push_log(LogEntry::ClearPunchResult {
+                            timestamp: timestamp(), message: format!("cleared {count} punch(es)"),
                         });
                     }
                 }

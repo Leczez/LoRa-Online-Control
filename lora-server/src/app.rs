@@ -51,6 +51,17 @@ pub enum LogEntry {
         station: u8,
         time_s: u32,
     },
+    ClearPunchResult {
+        timestamp: String,
+        message: String,
+    },
+    /// Purely informational, non-error text — currently just /help's output,
+    /// one entry per line so each renders on its own row like every other
+    /// log entry.
+    Info {
+        timestamp: String,
+        message: String,
+    },
 }
 
 pub struct App {

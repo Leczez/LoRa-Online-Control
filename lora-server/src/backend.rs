@@ -38,6 +38,12 @@ pub enum StatusEvent {
     /// Confirms a TESTPUNCH this client (or another attached client) sent
     /// was actually recorded.
     TestPunchOk { card_id: u32, station: u8, time_s: u32 },
+    /// Confirms a CLEARPUNCH this client (or another attached client) sent
+    /// actually removed an unsent local punch.
+    ClearPunchOk { id: i64 },
+    /// Confirms a CLEARPUNCHES this client (or another attached client) sent
+    /// removed `count` unsent local punches.
+    ClearPunchesOk { count: usize },
 }
 
 pub trait Radio: Send {
@@ -53,6 +59,19 @@ pub trait Radio: Send {
     fn send_test_punch(&mut self, _card_id: u32, _station: u8, _time_s: u32) -> Result<()> {
         anyhow::bail!("test punch requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
     }
+
+    /// Abandons one stuck unsent local punch (see PunchBuffer::clear_local_unsent).
+    /// Same "needs an attached daemon" restriction as send_test_punch — a
+    /// direct-hardware session has no punch buffer to clear from.
+    fn clear_punch(&mut self, _id: i64) -> Result<()> {
+        anyhow::bail!("clear punch requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
+    }
+
+    /// Abandons every stuck unsent local punch (see PunchBuffer::clear_all_local_unsent).
+    fn clear_all_punches(&mut self) -> Result<()> {
+        anyhow::bail!("clear punches requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
+    }
+
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
     fn poll_status(&mut self) -> Vec<StatusEvent> { Vec::new() }
 
@@ -515,6 +534,37 @@ fn run_daemon_loop(
                     }
                     _ => log_event(&state, "ERR TESTPUNCH: usage TESTPUNCH <card_id> <station> <time_s>".to_string()),
                 }
+            } else if let Some(rest) = cmd.strip_prefix("CLEARPUNCH ") {
+                match rest.trim().parse::<i64>() {
+                    Ok(id) => match punch_buffer.clear_local_unsent(id) {
+                        Ok(true) => {
+                            // The row is gone from the DB, but if it was the
+                            // batch currently being retried in memory, that
+                            // in-memory state doesn't know that — without
+                            // this, run_daemon_loop would keep retrying a
+                            // payload whose backing row(s) no longer exist,
+                            // forever, since nothing else ever clears it.
+                            if pending_punch.as_ref().is_some_and(|p| p.row_ids.contains(&id)) {
+                                pending_punch = None;
+                            }
+                            log::info!("cleared unsent local punch {id}");
+                            log_event(&state, format!("CLEARPUNCHOK {id}"));
+                        }
+                        Ok(false) => log_event(&state, format!("ERR CLEARPUNCH: no unsent local punch {id}")),
+                        Err(e) => log_event(&state, format!("ERR CLEARPUNCH: {}", e)),
+                    },
+                    Err(_) => log_event(&state, "ERR CLEARPUNCH: usage CLEARPUNCH <id>".to_string()),
+                }
+            } else if cmd.trim() == "CLEARPUNCHES" {
+                match punch_buffer.clear_all_local_unsent() {
+                    Ok(n) => {
+                        // Whatever was in flight is now definitely gone too.
+                        pending_punch = None;
+                        log::info!("cleared {n} unsent local punch(es)");
+                        log_event(&state, format!("CLEARPUNCHESOK {n}"));
+                    }
+                    Err(e) => log_event(&state, format!("ERR CLEARPUNCHES: {}", e)),
+                }
             }
         }
 
@@ -789,6 +839,14 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
         let time_s: u32 = parts.next()?.parse().ok()?;
         return Some(StatusEvent::TestPunchOk { card_id, station, time_s });
     }
+    if let Some(rest) = line.strip_prefix("CLEARPUNCHOK ") {
+        let id: i64 = rest.trim().parse().ok()?;
+        return Some(StatusEvent::ClearPunchOk { id });
+    }
+    if let Some(rest) = line.strip_prefix("CLEARPUNCHESOK ") {
+        let count: usize = rest.trim().parse().ok()?;
+        return Some(StatusEvent::ClearPunchesOk { count });
+    }
     None
 }
 
@@ -917,6 +975,20 @@ impl Radio for HttpRadio {
         ureq::post(&format!("{}/testpunch", self.base_url))
             .send_string(&format!("card_id={}&station={}&time_s={}", card_id, station, time_s))
             .map_err(|e| anyhow::anyhow!("POST /testpunch failed: {}", e))?;
+        Ok(())
+    }
+
+    fn clear_punch(&mut self, id: i64) -> Result<()> {
+        ureq::post(&format!("{}/clearpunch", self.base_url))
+            .send_string(&format!("id={}", id))
+            .map_err(|e| anyhow::anyhow!("POST /clearpunch failed: {}", e))?;
+        Ok(())
+    }
+
+    fn clear_all_punches(&mut self) -> Result<()> {
+        ureq::post(&format!("{}/clearpunches", self.base_url))
+            .send_string("")
+            .map_err(|e| anyhow::anyhow!("POST /clearpunches failed: {}", e))?;
         Ok(())
     }
 }
@@ -1168,5 +1240,79 @@ mod tests {
         let mut radio = NetworkFilteredRadio::new(inner, "LOC".to_string());
 
         assert!(radio.receive().unwrap().is_none());
+    }
+
+    /// Real run_daemon_loop, not just PunchBuffer::clear_local_unsent in
+    /// isolation: proves CLEARPUNCH also cancels an *in-flight* pending_punch,
+    /// not just the DB row. Without that cancellation the loop would keep
+    /// retrying the now-deleted payload forever (pending_punch is only
+    /// re-derived from the buffer once it's None), so the second buffered
+    /// punch would never go out — the assertion below is exactly the
+    /// regression that cancellation prevents.
+    #[test]
+    fn test_clearpunch_cancels_in_flight_pending_punch_so_next_punch_can_go_out() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let id1 = punch_buffer.record(111, 31, 100, "local").unwrap();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+
+        let pb = Arc::clone(&punch_buffer);
+        let state_for_loop = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 5, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, pb, state_for_loop,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.lock().unwrap().log.iter().any(|e| e.line.contains("111")) {
+            assert!(Instant::now() < deadline, "first punch (card 111) was never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Only after the first punch is truly in flight — buffer a second,
+        // different-card punch now, so it's not part of the first batch.
+        punch_buffer.record(222, 32, 200, "local").unwrap();
+        cmd_tx.send(format!("CLEARPUNCH {}", id1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.lock().unwrap().log.iter().any(|e| e.line.contains("222")) {
+            assert!(Instant::now() < deadline, "clearing the in-flight punch never let the next one go out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(punch_buffer.unsent().unwrap().iter().all(|p| p.id != id1));
+    }
+
+    #[test]
+    fn test_clearpunches_command_removes_all_unsent_punches() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        punch_buffer.record(111, 31, 100, "local").unwrap();
+        punch_buffer.record(222, 32, 200, "local").unwrap();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+
+        let pb = Arc::clone(&punch_buffer);
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 5, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, pb, state,
+            );
+        });
+
+        cmd_tx.send("CLEARPUNCHES".to_string()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !punch_buffer.unsent().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "CLEARPUNCHES never cleared the buffer");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

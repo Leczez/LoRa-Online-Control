@@ -269,6 +269,22 @@ pub fn spawn_server(
                             _ => Response::from_string("missing/invalid target/heartbeat_interval_secs").with_status_code(400),
                         }
                     }
+                    (Method::Post, "/clearpunch") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match form.get("id").and_then(|s| s.parse::<i64>().ok()) {
+                            Some(id) => match cmd_tx.send(format!("CLEARPUNCH {}", id)) {
+                                Ok(()) => Response::from_string("ok"),
+                                Err(_) => command_channel_down(),
+                            },
+                            None => Response::from_string("missing/invalid id").with_status_code(400),
+                        }
+                    }
+                    (Method::Post, "/clearpunches") => match cmd_tx.send("CLEARPUNCHES".to_string()) {
+                        Ok(()) => Response::from_string("ok"),
+                        Err(_) => command_channel_down(),
+                    },
                     _ => Response::from_string("not found").with_status_code(404),
                 };
 
@@ -365,6 +381,30 @@ mod tests {
 
         ureq::post(&format!("http://{listen}/cmd")).send_string("target=5&heartbeat_interval_secs=60").unwrap();
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CMD 5 60");
+    }
+
+    #[test]
+    fn test_clearpunch_and_clearpunches_endpoints_drive_command_channel() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        let listen = free_listen_addr();
+        spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ureq::get(&format!("http://{listen}/status.json")).call() {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("web dashboard never came up: {e}"),
+            }
+        }
+
+        ureq::post(&format!("http://{listen}/clearpunch")).send_string("id=42").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CLEARPUNCH 42");
+
+        ureq::post(&format!("http://{listen}/clearpunches")).send_string("").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CLEARPUNCHES");
     }
 
     /// If the daemon loop's receiver is gone (it panicked or exited), a

@@ -109,6 +109,32 @@ impl PunchBuffer {
         conn.execute("UPDATE punches SET sent = 1 WHERE id = ?1", [id])?;
         Ok(())
     }
+
+    /// Permanently abandons one unsent local/test punch — a genuine delete,
+    /// not mark_sent, since it was never actually delivered and recording it
+    /// as "sent" would misrepresent that. Scoped to source IN ('local',
+    /// 'test') and sent = 0, same as unsent_local(), so this can't touch a
+    /// remote-sourced row still queued for the roc-server push (see
+    /// unsent()) or a row that already went out. Returns whether a row was
+    /// actually deleted, so the caller (run_daemon_loop) can tell "cleared"
+    /// from "no such unsent local punch".
+    pub fn clear_local_unsent(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM punches WHERE id = ?1 AND sent = 0 AND source IN ('local', 'test')",
+            [id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Abandons every unsent local/test punch — the blunt "unstick
+    /// everything" version of clear_local_unsent. Returns the number of rows
+    /// deleted, so the caller can report exactly how many were dropped.
+    pub fn clear_all_local_unsent(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute("DELETE FROM punches WHERE sent = 0 AND source IN ('local', 'test')", [])?;
+        Ok(affected)
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +152,47 @@ mod tests {
         assert_eq!(unsent[0].card_id, 12345);
         assert_eq!(unsent[0].station, 33);
         assert_eq!(unsent[1].station, 50);
+    }
+
+    #[test]
+    fn test_clear_local_unsent_removes_only_the_named_row() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        let id1 = buf.record(1, 1, 100, "local").unwrap();
+        let id2 = buf.record(2, 2, 200, "test").unwrap();
+
+        assert!(buf.clear_local_unsent(id1).unwrap());
+        let remaining: Vec<i64> = buf.unsent().unwrap().iter().map(|p| p.id).collect();
+        assert_eq!(remaining, vec![id2]);
+    }
+
+    #[test]
+    fn test_clear_local_unsent_leaves_remote_and_already_sent_rows_alone() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        let remote_id = buf.record(1, 1, 100, "192.168.1.5").unwrap();
+        let sent_id = buf.record(2, 2, 200, "local").unwrap();
+        buf.mark_sent(sent_id).unwrap();
+
+        assert!(!buf.clear_local_unsent(remote_id).unwrap());
+        assert!(!buf.clear_local_unsent(sent_id).unwrap());
+        assert_eq!(buf.unsent().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![remote_id]);
+    }
+
+    #[test]
+    fn test_clear_local_unsent_reports_false_for_unknown_id() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        assert!(!buf.clear_local_unsent(999).unwrap());
+    }
+
+    #[test]
+    fn test_clear_all_local_unsent_only_touches_local_and_test() {
+        let buf = PunchBuffer::open(":memory:").unwrap();
+        buf.record(1, 1, 100, "local").unwrap();
+        buf.record(2, 2, 200, "test").unwrap();
+        let remote_id = buf.record(3, 3, 300, "192.168.1.5").unwrap();
+
+        let cleared = buf.clear_all_local_unsent().unwrap();
+        assert_eq!(cleared, 2);
+        assert_eq!(buf.unsent().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![remote_id]);
     }
 
     #[test]

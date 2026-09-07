@@ -131,8 +131,16 @@ host.
 - `POST /cmd` (form: `target`, `heartbeat_interval_secs`) — originates a
   Command Packet (see below) toward `target`, tracked with the same
   retry/ack bookkeeping any command gets.
+- `POST /clearpunch` (form: `id`) — permanently abandons one unsent local
+  punch (a genuine delete, not mark-sent, since it was never actually
+  delivered). If that punch happens to be the one currently in flight (mid
+  retry), the daemon also drops its in-memory retry state, not just the DB
+  row — otherwise it would keep retrying a payload whose backing row no
+  longer exists, forever, since nothing else would ever clear it.
+- `POST /clearpunches` (no body) — the same, but for every unsent local
+  punch at once.
 
-All four POST endpoints forward to the daemon's internal command channel,
+All six POST endpoints forward to the daemon's internal command channel,
 read by the same `run_daemon_loop` dispatch regardless of which endpoint a
 command came in on — a browser form and `lora-tui` are two callers of the
 same underlying commands.
