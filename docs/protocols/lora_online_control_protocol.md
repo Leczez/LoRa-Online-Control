@@ -60,6 +60,21 @@ transmitted. Delivery over the radio link itself works as **stop-and-wait**:
 
 - A node holds at most **one punch outstanding** at a time. It doesn't
   attempt the next buffered punch until the current one is acknowledged.
+- **LoRa is a broadcast medium — every node in radio range decodes every
+  packet, regardless of what `dest` its sender used.** Nothing at the radio
+  layer filters by destination (see `sx127x::Sx127xSpi::send`, whose own
+  `dest` argument is unused — purely the caller's bookkeeping). So `PUNCH`
+  carries its intended final destination explicitly in the payload itself —
+  `PUNCH <origin> <dest> <card_id> <station>:<time_s>,...` — and every node
+  that overhears it checks `dest == own_addr` before reacting: only the
+  addressed node buffers and acks it. A non-addressed, non-relay node still
+  logs it (full visibility into everything overheard — e.g. `lora-tui`'s
+  packet log or the web dashboard), it just doesn't buffer or ack. A relay
+  forwards the raw payload unchanged, so `dest` stays the true final
+  destination through every hop rather than needing to be rewritten
+  per-hop. (`Frame::Command`/`Frame::Ack`/`Frame::PunchAck` already carried
+  an explicit `target`/`node` field checked the same way — `PUNCH` was the
+  one payload type missing this until now.)
 - The receiver (whoever gets a `PUNCH` payload) buffers it on its own end,
   then sends back a `PACK` frame naming the sending node and the card
   involved — e.g. `PACK <node> <card_id>` — so that on a shared channel with
@@ -210,7 +225,7 @@ uplink turn.
   header — implemented for punches and commands.** The radio-layer address
   on each hop is only the *next hop*, so after one or more relay hops
   `pkt.src_addr` is the last relay, not the original node. `PUNCH <origin>
-  <card_id> ...` carries the punching node's address explicitly
+  <dest> <card_id> ...` carries the punching node's address explicitly
   (`CardReadout::to_payload`/`parse_payload` in `sportident.rs`), and
   `Command`/`Ack` carry a `commander` field the same way, so the same
   parsing path handles direct and relayed traffic identically, with no

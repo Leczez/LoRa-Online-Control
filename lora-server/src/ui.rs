@@ -465,7 +465,7 @@ pub fn run_app(
 
         while let Ok(readout) = si_rx.try_recv() {
             let ts = timestamp();
-            let payload = readout.to_payload(app.addr);
+            let payload = readout.to_payload(app.addr, app.dest);
             if let Err(e) = radio.send(app.dest, payload.as_bytes()) {
                 app.push_log(LogEntry::Error {
                     timestamp: ts.clone(),

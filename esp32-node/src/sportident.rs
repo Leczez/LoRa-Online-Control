@@ -107,15 +107,23 @@ pub struct CardReadout {
 }
 
 impl CardReadout {
-    /// Wire format sent over LoRa: `PUNCH <origin> <card_id> <station>:<time_s>,...`
-    /// — must match `lora-server`'s `CardReadout::to_payload`/`parse_payload`
-    /// exactly, since the RPi parses this same format on receive.
-    pub fn to_payload(&self, origin: u16) -> String {
+    /// Wire format sent over LoRa: `PUNCH <origin> <dest> <card_id>
+    /// <station>:<time_s>,...` — must match `lora-server`'s
+    /// `CardReadout::to_payload`/`parse_payload` exactly, since the RPi
+    /// parses this same format on receive. `dest` is the intended final
+    /// recipient (this node's own configured `--dest`/config-portal value):
+    /// LoRa is a broadcast medium, so every node in range decodes every
+    /// packet regardless of `dest` — lora-server relies on this field being
+    /// embedded in the payload itself to tell "consume this" apart from
+    /// "not addressed to me", since nothing at the radio layer filters by
+    /// destination (see lora-server's sportident.rs for the full doc
+    /// comment on this).
+    pub fn to_payload(&self, origin: u16, dest: u16) -> String {
         let punches: String = self.punches.iter()
             .map(|p| format!("{}:{}", p.station, p.time_s))
             .collect::<Vec<_>>()
             .join(",");
-        format!("PUNCH {} {} {}", origin, self.card_id, punches)
+        format!("PUNCH {} {} {} {}", origin, dest, self.card_id, punches)
     }
 }
 
@@ -572,6 +580,6 @@ mod tests {
             card_id: 0x0F4240,
             punches: vec![ControlPunch { station: 33, time_s: 36070 }],
         };
-        assert_eq!(readout.to_payload(10), "PUNCH 10 1000000 33:36070");
+        assert_eq!(readout.to_payload(10, 1), "PUNCH 10 1 1000000 33:36070");
     }
 }

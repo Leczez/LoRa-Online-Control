@@ -126,7 +126,8 @@ pub struct CardReadout {
 }
 
 impl CardReadout {
-    /// Wire format sent over LoRa: `PUNCH <origin> <card_id> <station>:<time_s>,...`
+    /// Wire format sent over LoRa: `PUNCH <origin> <dest> <card_id>
+    /// <station>:<time_s>,...`
     ///
     /// `origin` is the LoRa address of the node that actually read this
     /// card — carried explicitly in the payload, not inferred from the
@@ -134,21 +135,34 @@ impl CardReadout {
     /// a relay the base station still attributes it to the right control
     /// point rather than to the relay that last touched it (see the
     /// "Relay Nodes" section of docs/protocols/lora_online_control_protocol.md).
-    pub fn to_payload(&self, origin: u16) -> String {
+    ///
+    /// `dest` is the LoRa address this punch is ultimately meant for. LoRa
+    /// is a broadcast medium — nothing at the radio layer filters reception
+    /// by destination (see sx127x::Sx127xSpi::send, whose own `dest`
+    /// argument is unused, purely the caller's bookkeeping), so every node
+    /// that overhears this frame needs `dest` embedded in the payload
+    /// itself to tell "this is mine to consume" apart from "not mine, and
+    /// not mine to relay either." A relay's forward() re-transmits the raw
+    /// payload unchanged, so `dest` stays the original final destination
+    /// all the way through a multi-hop chain — no intermediate hop needs to
+    /// know the full path, just whether `dest == own_addr`.
+    pub fn to_payload(&self, origin: u16, dest: u16) -> String {
         let punches: String = self.punches.iter()
             .map(|p| format!("{}:{}", p.station, p.time_s))
             .collect::<Vec<_>>()
             .join(",");
-        format!("PUNCH {} {} {}", origin, self.card_id, punches)
+        format!("PUNCH {} {} {} {}", origin, dest, self.card_id, punches)
     }
 
-    /// Inverse of `to_payload` — decodes a `PUNCH <origin> <card_id>
-    /// <station>:<time_s>,...` wire payload back into the originating node's
-    /// address and the card data itself.
-    pub fn parse_payload(s: &str) -> Option<(u16, CardReadout)> {
+    /// Inverse of `to_payload` — decodes a `PUNCH <origin> <dest> <card_id>
+    /// <station>:<time_s>,...` wire payload back into the originating
+    /// node's address, the intended final destination, and the card data
+    /// itself.
+    pub fn parse_payload(s: &str) -> Option<(u16, u16, CardReadout)> {
         let rest = s.strip_prefix("PUNCH ")?;
-        let mut parts = rest.splitn(3, ' ');
+        let mut parts = rest.splitn(4, ' ');
         let origin: u16 = parts.next()?.parse().ok()?;
+        let dest: u16 = parts.next()?.parse().ok()?;
         let card_id: u32 = parts.next()?.parse().ok()?;
         let punches = parts.next().unwrap_or("");
 
@@ -162,7 +176,7 @@ impl CardReadout {
             }
         }
 
-        Some((origin, CardReadout { card_id, punches: result }))
+        Some((origin, dest, CardReadout { card_id, punches: result }))
     }
 }
 
@@ -1046,10 +1060,11 @@ mod tests {
                 ControlPunch { station: 50, time_s: 37300 },
             ],
         };
-        let payload = original.to_payload(12);
-        let (origin, decoded) = CardReadout::parse_payload(&payload).unwrap();
+        let payload = original.to_payload(12, 1);
+        let (origin, dest, decoded) = CardReadout::parse_payload(&payload).unwrap();
 
         assert_eq!(origin, 12);
+        assert_eq!(dest, 1);
         assert_eq!(decoded.card_id, original.card_id);
         assert_eq!(decoded.punches.len(), 2);
         assert_eq!(decoded.punches[0].station, 33);
@@ -1061,8 +1076,9 @@ mod tests {
     #[test]
     fn test_punch_payload_no_punches() {
         let original = CardReadout { card_id: 42, punches: vec![] };
-        let (origin, decoded) = CardReadout::parse_payload(&original.to_payload(7)).unwrap();
+        let (origin, dest, decoded) = CardReadout::parse_payload(&original.to_payload(7, 1)).unwrap();
         assert_eq!(origin, 7);
+        assert_eq!(dest, 1);
         assert_eq!(decoded.card_id, 42);
         assert!(decoded.punches.is_empty());
     }
@@ -1071,5 +1087,13 @@ mod tests {
     fn test_punch_payload_rejects_non_punch_text() {
         assert!(CardReadout::parse_payload("HB").is_none());
         assert!(CardReadout::parse_payload("hello?").is_none());
+    }
+
+    #[test]
+    fn test_punch_payload_rejects_legacy_format_missing_dest_field() {
+        // Pre-addressing-filter wire format: "PUNCH <origin> <card_id> ..."
+        // with no <dest> — must not be silently misparsed as if the
+        // card_id were a dest and vice versa.
+        assert!(CardReadout::parse_payload("PUNCH 12 123456 33:36070").is_none());
     }
 }

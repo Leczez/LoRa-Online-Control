@@ -437,8 +437,11 @@ fn parse_heartbeat(payload: &str) -> Option<Heartbeat> {
 /// since punches from one card tap are buffered as consecutive rows sharing
 /// one card_id). Returns the row ids covered (to mark sent once acked) and
 /// the exact payload to send, rebuilt via `CardReadout::to_payload()` so it
-/// matches the wire format precisely.
-fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16) -> Result<Option<(u32, Vec<i64>, String)>> {
+/// matches the wire format precisely. `dest` is embedded in the payload
+/// itself as the intended final recipient (see to_payload's doc comment) —
+/// this daemon's own currently-configured next hop, which for a leaf node
+/// with no relay hops in between is also the final consumer.
+fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16, dest: u16) -> Result<Option<(u32, Vec<i64>, String)>> {
     let unsent = buffer.unsent_local()?;
     let Some(first) = unsent.first() else { return Ok(None) };
     let card_id = first.card_id;
@@ -447,7 +450,7 @@ fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16) ->
     let punches = batch.iter()
         .map(|p| crate::sportident::ControlPunch { station: p.station, time_s: p.time_s })
         .collect();
-    let payload = crate::sportident::CardReadout { card_id, punches }.to_payload(own_addr);
+    let payload = crate::sportident::CardReadout { card_id, punches }.to_payload(own_addr, dest);
     Ok(Some((card_id, row_ids, payload)))
 }
 
@@ -657,7 +660,7 @@ fn run_daemon_loop(
         }
 
         if pending_punch.is_none() {
-            match next_local_batch(&punch_buffer, own_addr) {
+            match next_local_batch(&punch_buffer, own_addr, dest) {
                 Ok(Some((card_id, row_ids, payload))) => {
                     match radio.send(dest, payload.as_bytes()) {
                         Ok(()) => {
@@ -699,15 +702,15 @@ fn run_daemon_loop(
                     Some(dbm) => log::info!("RX from {}: {} (RSSI: {}dBm)", pkt.src_addr, payload, dbm),
                     None      => log::info!("RX from {}: {}", pkt.src_addr, payload),
                 }
-                if let Some((origin, readout)) = crate::sportident::CardReadout::parse_payload(&payload) {
-                    if relay && origin != own_addr {
-                        // Not ours to consume — pass it on toward our own
-                        // dest unchanged. The final consumer (whoever that
-                        // ends up being) does the buffering; a relay hop
-                        // doesn't duplicate that bookkeeping for traffic
-                        // that isn't its own.
-                        forward(radio.as_mut(), &state, dest, &payload);
-                    } else {
+                if let Some((origin, punch_dest, readout)) = crate::sportident::CardReadout::parse_payload(&payload) {
+                    // LoRa is a broadcast medium — every node in radio range
+                    // decodes every packet regardless of what `dest` its
+                    // sender used (see CardReadout::to_payload's doc
+                    // comment), so this check is the only thing that stops
+                    // an uninvolved node from also consuming/acking traffic
+                    // meant for someone else. The RX log line above already
+                    // gives full visibility into everything overheard.
+                    if punch_dest == own_addr {
                         state.lock().unwrap().record_punch(origin, pkt.rssi);
                         for p in &readout.punches {
                             if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &origin.to_string()) {
@@ -726,6 +729,13 @@ fn run_daemon_loop(
                         if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
                             log::error!("failed to ack punch: {}", e);
                         }
+                    } else if relay {
+                        // Not ours to consume — pass it on toward our own
+                        // next hop unchanged. `punch_dest` (the ORIGINAL
+                        // final destination, not us) travels along with it
+                        // untouched, so whoever ends up consuming it still
+                        // checks against the right address.
+                        forward(radio.as_mut(), &state, dest, &payload);
                     }
                 } else if let Some(frame) = Frame::parse(&payload) {
                     match frame {
@@ -1081,7 +1091,7 @@ mod tests {
     #[test]
     fn test_next_local_batch_empty_buffer_is_none() {
         let buffer = crate::punch_buffer::PunchBuffer::open(":memory:").unwrap();
-        assert!(next_local_batch(&buffer, 5).unwrap().is_none());
+        assert!(next_local_batch(&buffer, 5, 1).unwrap().is_none());
     }
 
     #[test]
@@ -1090,7 +1100,7 @@ mod tests {
         let id1 = buffer.record(123456, 31, 36070, "local").unwrap();
         let id2 = buffer.record(123456, 32, 36200, "local").unwrap();
 
-        let (card_id, row_ids, payload) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        let (card_id, row_ids, payload) = next_local_batch(&buffer, 5, 1).unwrap().unwrap();
         assert_eq!(card_id, 123456);
         assert_eq!(row_ids, vec![id1, id2]);
 
@@ -1100,7 +1110,7 @@ mod tests {
                 crate::sportident::ControlPunch { station: 31, time_s: 36070 },
                 crate::sportident::ControlPunch { station: 32, time_s: 36200 },
             ],
-        }.to_payload(5);
+        }.to_payload(5, 1);
         assert_eq!(payload, expected);
     }
 
@@ -1110,7 +1120,7 @@ mod tests {
         buffer.record(1, 1, 100, "local").unwrap();
         buffer.record(2, 2, 200, "local").unwrap();
 
-        let (card_id, row_ids, _) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        let (card_id, row_ids, _) = next_local_batch(&buffer, 5, 1).unwrap().unwrap();
         assert_eq!(card_id, 1);
         assert_eq!(row_ids.len(), 1);
     }
@@ -1121,7 +1131,7 @@ mod tests {
         buffer.record(1, 1, 100, "192.168.1.5").unwrap();
         let id = buffer.record(2, 2, 200, "local").unwrap();
 
-        let (card_id, row_ids, _) = next_local_batch(&buffer, 5).unwrap().unwrap();
+        let (card_id, row_ids, _) = next_local_batch(&buffer, 5, 1).unwrap().unwrap();
         assert_eq!(card_id, 2);
         assert_eq!(row_ids, vec![id]);
     }
@@ -1445,5 +1455,57 @@ mod tests {
             assert!(Instant::now() < deadline, "CLEARPUNCHES never cleared the buffer");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Real run_daemon_loop, not just CardReadout::parse_payload in
+    /// isolation: LoRa is a broadcast medium (see to_payload's doc comment
+    /// in sportident.rs) — every node in range decodes every packet
+    /// regardless of what `dest` its sender used, so the embedded `dest`
+    /// field is the only thing that stops a non-relay node from also
+    /// consuming/acking traffic addressed to someone else. Feeds two
+    /// overheard punches through a real (non-relay) daemon loop — one
+    /// addressed to it, one not — and confirms only the addressed one ends
+    /// up buffered.
+    #[test]
+    fn test_run_daemon_loop_only_consumes_punches_addressed_to_own_addr() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+
+        let ours = crate::sportident::CardReadout {
+            card_id: 111,
+            punches: vec![crate::sportident::ControlPunch { station: 1, time_s: 100 }],
+        }.to_payload(10, 2); // origin 10, dest 2 — matches own_addr below
+        let not_ours = crate::sportident::CardReadout {
+            card_id: 222,
+            punches: vec![crate::sportident::ControlPunch { station: 1, time_s: 200 }],
+        }.to_payload(10, 99); // dest 99 — a different node entirely
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio {
+            sent: Vec::new(),
+            to_receive: std::collections::VecDeque::from(vec![packet(10, &ours), packet(10, &not_ours)]),
+        });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+
+        let pb = Arc::clone(&punch_buffer);
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, pb, state,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let unsent = punch_buffer.unsent().unwrap();
+            if unsent.iter().any(|p| p.card_id == 111) {
+                assert!(unsent.iter().all(|p| p.card_id != 222), "punch not addressed to us was consumed anyway");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the punch addressed to us was never buffered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(cmd_tx);
     }
 }

@@ -283,7 +283,7 @@ fn main() -> anyhow::Result<()> {
         // queued punch isn't even attempted until this one is acked.
         if pending_punch.is_none() {
             if let Some(readout) = punch_queue.pop_front() {
-                let payload = readout.to_payload(current.addr);
+                let payload = readout.to_payload(current.addr, current.dest);
                 match protocol::send_framed(&mut radio, current.dest, payload.as_bytes(), &current.network_id) {
                     Ok(()) => {
                         log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
