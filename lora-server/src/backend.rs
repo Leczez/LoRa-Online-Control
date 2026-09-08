@@ -46,6 +46,15 @@ pub enum StatusEvent {
     /// Confirms a CLEARPUNCHES this client (or another attached client) sent
     /// removed `count` unsent local punches.
     ClearPunchesOk { count: usize },
+    /// A punch this daemon originated (locally, or as an attached client's
+    /// TESTPUNCH) was acked by `acked_by` — the node that actually received
+    /// and buffered it, not necessarily its final consumer if there's
+    /// further relaying upstream of that.
+    PunchAckOk { card_id: u32, acked_by: u16 },
+    /// This daemon received and applied a Command from `commander` — the
+    /// receiving side of a command exchange, distinct from CmdOk (the
+    /// originating side, once its own command gets acked back).
+    CmdApplied { commander: u16, setting: Setting },
 }
 
 pub trait Radio: Send {
@@ -735,7 +744,7 @@ fn run_daemon_loop(
                             if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
                                 log::error!("failed to ack command: {}", e);
                             }
-                            log_event(&state, format!("CMDAPPLIED {:?}", setting));
+                            log_event(&state, format!("CMDAPPLIED {} {}", commander, setting.encode()));
                         }
                         Frame::Command { target, .. } if relay => {
                             // Not addressed to us — pass it on toward the
@@ -771,7 +780,7 @@ fn run_daemon_loop(
                                     }
                                 }
                                 log::info!("PUNCH card {} acked by {}", card_id, pkt.src_addr);
-                                log_event(&state, format!("PACKOK {}", card_id));
+                                log_event(&state, format!("PACKOK {} {}", card_id, pkt.src_addr));
                             }
                         }
                         Frame::PunchAck { node, .. } if relay => {
@@ -899,6 +908,18 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
     if let Some(rest) = line.strip_prefix("CLEARPUNCHESOK ") {
         let count: usize = rest.trim().parse().ok()?;
         return Some(StatusEvent::ClearPunchesOk { count });
+    }
+    if let Some(rest) = line.strip_prefix("PACKOK ") {
+        let mut parts = rest.splitn(2, ' ');
+        let card_id: u32 = parts.next()?.parse().ok()?;
+        let acked_by: u16 = parts.next()?.parse().ok()?;
+        return Some(StatusEvent::PunchAckOk { card_id, acked_by });
+    }
+    if let Some(rest) = line.strip_prefix("CMDAPPLIED ") {
+        let mut parts = rest.splitn(2, ' ');
+        let commander: u16 = parts.next()?.parse().ok()?;
+        let setting = Setting::parse(parts.next()?)?;
+        return Some(StatusEvent::CmdApplied { commander, setting });
     }
     None
 }
@@ -1154,6 +1175,18 @@ mod tests {
         // "not reported", distinct from an explicit "0" (SI master absent).
         let evt = parse_status_line("HBRX 5 - -").unwrap();
         assert_eq!(evt, StatusEvent::HeartbeatRx { node: 5, battery: None, si_present: None });
+    }
+
+    #[test]
+    fn test_parse_status_line_packok() {
+        let evt = parse_status_line("PACKOK 123456 5").unwrap();
+        assert_eq!(evt, StatusEvent::PunchAckOk { card_id: 123456, acked_by: 5 });
+    }
+
+    #[test]
+    fn test_parse_status_line_cmdapplied() {
+        let evt = parse_status_line("CMDAPPLIED 1 hb_interval=30").unwrap();
+        assert_eq!(evt, StatusEvent::CmdApplied { commander: 1, setting: Setting::HeartbeatIntervalSecs(30) });
     }
 
     fn free_test_listen_addr() -> String {

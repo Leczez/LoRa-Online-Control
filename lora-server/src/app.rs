@@ -65,6 +65,20 @@ pub enum LogEntry {
         timestamp: String,
         message: String,
     },
+    /// A punch this session originated was acked — see
+    /// StatusEvent::PunchAckOk's doc comment in backend.rs.
+    PunchAcked {
+        timestamp: String,
+        card_id: u32,
+        acked_by: u16,
+    },
+    /// This session received and applied a Command — see
+    /// StatusEvent::CmdApplied's doc comment in backend.rs.
+    CmdApplied {
+        timestamp: String,
+        commander: u16,
+        message: String,
+    },
 }
 
 pub struct App {

@@ -273,6 +273,26 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
             ),
             Span::styled(message.clone(), Style::default().fg(Color::White)),
         ]),
+        LogEntry::PunchAcked { timestamp, card_id, acked_by } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("ACK  card {:>7}  acked by {:#06x}", card_id, acked_by),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        LogEntry::CmdApplied { timestamp, commander, message } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("ACK  cmd from {:#06x}  applied: {}", commander, message),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
     }
 }
 
@@ -520,6 +540,14 @@ pub fn run_app(
                     crate::backend::StatusEvent::ClearPunchesOk { count } => {
                         app.push_log(LogEntry::ClearPunchResult {
                             timestamp: timestamp(), message: format!("cleared {count} punch(es)"),
+                        });
+                    }
+                    crate::backend::StatusEvent::PunchAckOk { card_id, acked_by } => {
+                        app.push_log(LogEntry::PunchAcked { timestamp: timestamp(), card_id, acked_by });
+                    }
+                    crate::backend::StatusEvent::CmdApplied { commander, setting } => {
+                        app.push_log(LogEntry::CmdApplied {
+                            timestamp: timestamp(), commander, message: setting.encode(),
                         });
                     }
                 }
