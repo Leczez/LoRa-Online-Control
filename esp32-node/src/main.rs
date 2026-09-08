@@ -118,13 +118,15 @@ const CODING_RATE: CodingRate = CodingRate::Cr4_5;
 const SYNC_WORD: u8 = 0x12;
 const TX_POWER_DBM: i8 = 20;
 
-/// First-boot defaults, matching lora-3b-2's actual deployment. addr=10 is
-/// this node's own address; dest=2 targets lora-3b-2 directly (it's itself
-/// addr=2, a relay hop toward addr=1, not address 1 itself). A function, not
-/// a const, since NodeConfig::network_id is a heap String — String::from
-/// isn't callable in a const context.
+/// First-boot defaults. addr=10 is this node's own address; dest=1 targets
+/// lora-base-station directly (its LoRa address, not an IP — see
+/// docs/protocols/lora_online_control_protocol.md). lora-3b-2 (addr=2) is
+/// not in this path at all; it was the original relay-hop target before
+/// lora-base-station existed, kept only as a separate deployment, not part
+/// of this node's route. A function, not a const, since NodeConfig::network_id
+/// is a heap String — String::from isn't callable in a const context.
 fn default_config() -> NodeConfig {
-    NodeConfig { addr: 10, dest: 2, freq_hz: 433_000_000, network_id: "LOC".to_string() }
+    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, network_id: "LOC".to_string() }
 }
 
 fn main() -> anyhow::Result<()> {
