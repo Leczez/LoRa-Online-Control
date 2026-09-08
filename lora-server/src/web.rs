@@ -30,6 +30,7 @@ struct NodeView {
     si_present: Option<bool>,
     last_punch_secs_ago: Option<u64>,
     last_rssi: Option<i16>,
+    punch_count: u64,
 }
 
 #[derive(Serialize)]
@@ -71,6 +72,7 @@ fn build_status(state: &SharedState, radio_ready: &RadioReady, roc_health_url: &
             si_present: s.si_present,
             last_punch_secs_ago: s.last_punch.map(secs_ago),
             last_rssi: s.last_rssi,
+            punch_count: s.punch_count,
         })
         .collect();
     nodes.sort_by_key(|n| n.addr);
@@ -189,17 +191,18 @@ fn render_html(v: &StatusView) -> String {
             None => "-".to_string(),
         };
         node_rows.push_str(&format!(
-            "<tr><td class=\"mono\">{:#06x}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{}</td><td class=\"mono\">{}</td></tr>\n",
+            "<tr><td class=\"mono\">{:#06x}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>\n",
             n.addr,
             n.last_heartbeat_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             battery,
             si_cell,
             n.last_punch_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             n.last_rssi.map(|r| format!("{r}dBm")).unwrap_or_else(|| "-".to_string()),
+            n.punch_count,
         ));
     }
     if node_rows.is_empty() {
-        node_rows = "<tr><td colspan=\"6\">no nodes heard from yet</td></tr>\n".to_string();
+        node_rows = "<tr><td colspan=\"7\">no nodes heard from yet</td></tr>\n".to_string();
     }
 
     let mut log_lines = String::new();
@@ -236,7 +239,7 @@ fn render_html(v: &StatusView) -> String {
 <h2>Nodes</h2>
 <div class="card">
 <table>
-<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th></tr>
+<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th><th>Punches</th></tr>
 {node_rows}
 </table>
 </div>

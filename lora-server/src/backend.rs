@@ -55,6 +55,11 @@ pub enum StatusEvent {
     /// receiving side of a command exchange, distinct from CmdOk (the
     /// originating side, once its own command gets acked back).
     CmdApplied { commander: u16, setting: Setting },
+    /// This daemon consumed a punch addressed to it, from `origin` — the
+    /// node-health source for lora-tui's/the web dashboard's per-node punch
+    /// count (see daemon_state::NodeStatus::punch_count's doc comment on
+    /// why this counts packets, not individual station taps).
+    PunchRx { origin: u16, card_id: u32 },
 }
 
 pub trait Radio: Send {
@@ -712,6 +717,7 @@ fn run_daemon_loop(
                     // gives full visibility into everything overheard.
                     if punch_dest == own_addr {
                         state.lock().unwrap().record_punch(origin, pkt.rssi);
+                        log_event(&state, format!("PUNCHRX {} {}", origin, readout.card_id));
                         for p in &readout.punches {
                             if let Err(e) = punch_buffer.record(readout.card_id, p.station, p.time_s, &origin.to_string()) {
                                 log::error!("failed to buffer remote punch: {}", e);
@@ -930,6 +936,12 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
         let commander: u16 = parts.next()?.parse().ok()?;
         let setting = Setting::parse(parts.next()?)?;
         return Some(StatusEvent::CmdApplied { commander, setting });
+    }
+    if let Some(rest) = line.strip_prefix("PUNCHRX ") {
+        let mut parts = rest.splitn(2, ' ');
+        let origin: u16 = parts.next()?.parse().ok()?;
+        let card_id: u32 = parts.next()?.parse().ok()?;
+        return Some(StatusEvent::PunchRx { origin, card_id });
     }
     None
 }
@@ -1197,6 +1209,12 @@ mod tests {
     fn test_parse_status_line_cmdapplied() {
         let evt = parse_status_line("CMDAPPLIED 1 hb_interval=30").unwrap();
         assert_eq!(evt, StatusEvent::CmdApplied { commander: 1, setting: Setting::HeartbeatIntervalSecs(30) });
+    }
+
+    #[test]
+    fn test_parse_status_line_punchrx() {
+        let evt = parse_status_line("PUNCHRX 10 123456").unwrap();
+        assert_eq!(evt, StatusEvent::PunchRx { origin: 10, card_id: 123456 });
     }
 
     fn free_test_listen_addr() -> String {
@@ -1486,6 +1504,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         let (_si_tx, si_rx) = std::sync::mpsc::channel();
         let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
 
         let pb = Arc::clone(&punch_buffer);
         std::thread::spawn(move || {
@@ -1505,6 +1524,11 @@ mod tests {
             assert!(Instant::now() < deadline, "the punch addressed to us was never buffered");
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        // The consumed punch (only the one addressed to us) should also
+        // have bumped node 10's punch_count via the real record_punch call
+        // in run_daemon_loop, not just via calling it in isolation.
+        assert_eq!(state_for_check.lock().unwrap().nodes[&10].punch_count, 1);
 
         drop(cmd_tx);
     }

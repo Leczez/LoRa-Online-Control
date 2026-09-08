@@ -94,6 +94,7 @@ fn render_nodes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     ),
                     Span::styled(format!("  {battery}"), Style::default().fg(Color::Cyan)),
                     Span::styled(format!("  {si_text}"), Style::default().fg(si_color)),
+                    Span::styled(format!("  {} punch(es)", status.punch_count), Style::default().fg(Color::Magenta)),
                 ])
                 .into()
             })
@@ -549,6 +550,12 @@ pub fn run_app(
                         app.push_log(LogEntry::CmdApplied {
                             timestamp: timestamp(), commander, message: setting.encode(),
                         });
+                    }
+                    crate::backend::StatusEvent::PunchRx { origin, .. } => {
+                        // No separate log entry — the punch itself already
+                        // shows up via the generic Rx entry above; this just
+                        // updates the node panel's running count.
+                        app.record_punch(origin);
                     }
                 }
             }

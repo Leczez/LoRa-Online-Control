@@ -38,6 +38,15 @@ pub struct NodeStatus {
     pub si_present: Option<bool>,
     pub last_punch: Option<SystemTime>,
     pub last_rssi: Option<i16>,
+    /// Total punch *packets* (CardReadouts) received from this node — by
+    /// `origin`, not radio-layer sender, so a relayed punch still counts
+    /// against the control point that actually read the card, not the
+    /// relay that last touched it. One packet can bundle several station
+    /// taps (see sportident::CardReadout::punches); this counts packets,
+    /// same granularity as last_punch/last_rssi above, not individual
+    /// station punches. Since this daemon process started — not persisted
+    /// across restarts, same as the rest of this struct.
+    pub punch_count: u64,
 }
 
 #[derive(Default)]
@@ -72,6 +81,7 @@ impl DaemonState {
         let entry = self.nodes.entry(node).or_default();
         entry.last_punch = Some(SystemTime::now());
         entry.last_rssi = rssi;
+        entry.punch_count += 1;
     }
 }
 
@@ -142,5 +152,19 @@ mod tests {
         assert!(node.last_punch.is_some());
         assert!(node.last_heartbeat.is_none());
         assert_eq!(node.last_rssi, Some(-80));
+        assert_eq!(node.punch_count, 1);
+    }
+
+    #[test]
+    fn test_record_punch_increments_count_per_node() {
+        let mut state = DaemonState::default();
+        state.record_punch(7, Some(-80));
+        state.record_punch(7, Some(-75));
+        state.record_punch(9, Some(-60));
+
+        assert_eq!(state.nodes[&7].punch_count, 2);
+        assert_eq!(state.nodes[&9].punch_count, 1);
+        // Most recent rssi wins, count doesn't reset it.
+        assert_eq!(state.nodes[&7].last_rssi, Some(-75));
     }
 }

@@ -14,6 +14,10 @@ pub struct NodeStatus {
     /// See daemon_state::NodeStatus::si_present's doc comment — same
     /// semantics, just reset on reconnect like the rest of this struct.
     pub si_present: Option<bool>,
+    /// Punches seen from this node since this session attached — not the
+    /// daemon-wide lifetime total (see daemon_state::NodeStatus::punch_count
+    /// for that; the web dashboard shows it, this is the TUI's own view).
+    pub punch_count: u64,
 }
 
 #[derive(Debug)]
@@ -116,6 +120,10 @@ impl App {
         if let Some(present) = si_present {
             entry.si_present = Some(present);
         }
+    }
+
+    pub fn record_punch(&mut self, node: u16) {
+        self.nodes.entry(node).or_default().punch_count += 1;
     }
 
     pub fn config_line(&self) -> String {
