@@ -1,7 +1,7 @@
 //! Field-editable node settings (address/dest/frequency), persisted to NVS so
-//! they survive reboots. Defaults match lora-3b-2's actual deployment (see
-//! esp32-node/src/main.rs) until a technician changes them via the Wi-Fi
-//! config page.
+//! they survive reboots. Defaults match lora-base-station's actual
+//! deployment (see esp32-node/src/main.rs) until a technician changes them
+//! via the Wi-Fi config page.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 

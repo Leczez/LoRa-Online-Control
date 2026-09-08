@@ -110,8 +110,8 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
 }
 
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
-// page (only addr/dest/freq are; see wifi_config.rs). Must match lora-3b-2's
-// deployed /etc/lora-server/env.
+// page (only addr/dest/freq are; see wifi_config.rs). Must match
+// lora-base-station's deployed /etc/lora-server/env.
 const SPREADING_FACTOR: u8 = 7;
 const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
 const CODING_RATE: CodingRate = CodingRate::Cr4_5;
@@ -120,11 +120,9 @@ const TX_POWER_DBM: i8 = 20;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
-/// docs/protocols/lora_online_control_protocol.md). lora-3b-2 (addr=2) is
-/// not in this path at all; it was the original relay-hop target before
-/// lora-base-station existed, kept only as a separate deployment, not part
-/// of this node's route. A function, not a const, since NodeConfig::network_id
-/// is a heap String — String::from isn't callable in a const context.
+/// docs/protocols/lora_online_control_protocol.md). A function, not a
+/// const, since NodeConfig::network_id is a heap String — String::from
+/// isn't callable in a const context.
 fn default_config() -> NodeConfig {
     NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, network_id: "LOC".to_string() }
 }
