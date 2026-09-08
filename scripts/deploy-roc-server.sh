@@ -35,7 +35,10 @@ WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 REMOTE_DIR="/opt/roc-server-src"
 
 echo "Syncing source to $TARGET_HOST:$REMOTE_DIR..."
-ssh "$TARGET_HOST" "mkdir -p $REMOTE_DIR"
+# /opt requires root to create things in; sudo the mkdir, then chown it to
+# the connecting user so the plain (non-sudo) rsync below can write into it
+# directly — rsync-over-ssh doesn't cleanly support a sudo remote shell.
+ssh "$TARGET_HOST" "sudo mkdir -p $REMOTE_DIR && sudo chown \"\$(whoami)\" $REMOTE_DIR"
 rsync -az --delete \
     --exclude target --exclude '.git' \
     "$WORKSPACE_ROOT/Cargo.toml" "$WORKSPACE_ROOT/Cargo.lock" \
