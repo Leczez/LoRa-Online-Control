@@ -94,16 +94,87 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Shared look for this dashboard and roc-server's (see roc-server/src/
+/// main.rs's identical copy — no shared crate between the two binaries to
+/// hang a single definition off of). Kept as its own constant rather than
+/// inline in the format! template below because format! parses `{`/`}` in
+/// its *template* string as placeholders — a raw CSS block full of literal
+/// braces would need every one doubled if it were part of that string
+/// directly. A substituted argument's own contents (this constant) aren't
+/// re-parsed, so no escaping is needed here.
+const DASHBOARD_STYLE: &str = r#"<style>
+:root {
+  --bg: #f5f6f8; --card: #ffffff; --border: #e3e6eb;
+  --text: #1a1d23; --dim: #6b7280;
+  --accent: #2563eb; --good: #16a34a; --bad: #dc2626; --warn: #b45309;
+  --good-bg: #dcfce7; --bad-bg: #fee2e2; --warn-bg: #fef3c7;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2.5rem 1.5rem 4rem; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+}
+.wrap { max-width: 880px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin: 0 0 .2rem; letter-spacing: -0.01em; }
+.subtitle { color: var(--dim); font-size: .875rem; margin: 0 0 2rem; }
+h2 {
+  font-size: .78rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--dim); margin: 2rem 0 .6rem; font-weight: 600;
+}
+h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1rem 1.25rem; box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+}
+table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--border); }
+th {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--dim); font-weight: 600; white-space: nowrap;
+}
+tr:last-child td { border-bottom: none; }
+td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.pill {
+  display: inline-block; padding: .15rem .55rem; border-radius: 999px;
+  font-size: .76rem; font-weight: 600; white-space: nowrap;
+}
+.pill-good { background: var(--good-bg); color: var(--good); }
+.pill-bad { background: var(--bad-bg); color: var(--bad); }
+.pill-warn { background: var(--warn-bg); color: var(--warn); }
+p.hint { color: var(--dim); font-size: .85rem; margin: 0 0 1rem; }
+form label { display: block; font-size: .85rem; margin-bottom: .65rem; }
+form input {
+  display: block; margin-top: .3rem; padding: .4rem .55rem; border: 1px solid var(--border);
+  border-radius: 6px; font-size: .9rem; width: 100%; max-width: 220px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+button {
+  background: var(--accent); color: #fff; border: none; padding: .5rem 1.1rem;
+  border-radius: 6px; font-size: .88rem; font-weight: 600; cursor: pointer; margin-top: .3rem;
+}
+button:hover { opacity: .9; }
+pre.log {
+  background: #0b1020; color: #d7dde8; padding: 1rem; border-radius: 10px;
+  font-size: .76rem; line-height: 1.6; overflow: auto; max-height: 440px; margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+</style>"#;
+
+fn pill(good: bool, text: &str) -> String {
+    format!("<span class=\"pill {}\">{}</span>", if good { "pill-good" } else { "pill-bad" }, text)
+}
+
 fn render_html(v: &StatusView) -> String {
     let radio_cell = if v.radio_ready {
-        "<td style=\"color:green\">ready</td>"
+        pill(true, "ready")
     } else {
-        "<td style=\"color:red\">lora module not found</td>"
+        pill(false, "lora module not found")
     };
     let roc_cell = match v.roc_reachable {
-        Some(true) => "<td style=\"color:green\">reachable</td>".to_string(),
-        Some(false) => "<td style=\"color:red\">unreachable</td>".to_string(),
-        None => "<td>not checked (--roc-health-url unset)</td>".to_string(),
+        Some(true) => pill(true, "reachable"),
+        Some(false) => pill(false, "unreachable"),
+        None => "<span class=\"pill pill-warn\">not checked (--roc-health-url unset)</span>".to_string(),
     };
 
     let mut node_rows = String::new();
@@ -113,12 +184,12 @@ fn render_html(v: &StatusView) -> String {
             _ => "-".to_string(),
         };
         let si_cell = match n.si_present {
-            Some(true) => "<td style=\"color:green\">connected</td>".to_string(),
-            Some(false) => "<td style=\"color:red\">not connected</td>".to_string(),
-            None => "<td>-</td>".to_string(),
+            Some(true) => pill(true, "connected"),
+            Some(false) => pill(false, "not connected"),
+            None => "-".to_string(),
         };
         node_rows.push_str(&format!(
-            "<tr><td>{:#06x}</td><td>{}</td><td>{}</td>{}<td>{}</td><td>{}</td></tr>\n",
+            "<tr><td class=\"mono\">{:#06x}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{}</td><td class=\"mono\">{}</td></tr>\n",
             n.addr,
             n.last_heartbeat_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             battery,
@@ -140,33 +211,54 @@ fn render_html(v: &StatusView) -> String {
     }
 
     format!(
-        r#"<html><head><title>lora-server status</title></head><body>
-<h1>lora-server status</h1>
-<table border="1" cellpadding="4">
-<tr><th>Radio</th>{radio_cell}</tr>
-<tr><th>roc-server</th>{roc_cell}</tr>
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>lora-server status</title>
+{DASHBOARD_STYLE}
+</head>
+<body>
+<div class="wrap">
+<h1>lora-server</h1>
+<p class="subtitle">LoRa daemon status &amp; node health</p>
+
+<h2>Status</h2>
+<div class="card">
+<table>
+<tr><th>Radio</th><td>{radio_cell}</td></tr>
+<tr><th>roc-server</th><td>{roc_cell}</td></tr>
 </table>
+</div>
 
 <h2>Nodes</h2>
-<table border="1" cellpadding="4">
+<div class="card">
+<table>
 <tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th></tr>
 {node_rows}
 </table>
+</div>
 
 <h2>Send test punch</h2>
-<p>Recorded with source="test" — flows through the real send/retry/ack
+<div class="card">
+<p class="hint">Recorded with source="test" — flows through the real send/retry/ack
 pipeline and on to roc-server/MEOS like a genuine punch, but stays tagged
 as synthetic. See docs/protocols/lora_online_control_protocol.md.</p>
 <form method="POST" action="/testpunch">
   <label>Card ID <input type="number" name="card_id" required></label>
   <label>Station <input type="number" name="station" required></label>
   <label>Time (s since midnight) <input type="number" name="time_s" required></label>
-  <button type="submit">Send</button>
+  <button type="submit">Send test punch</button>
 </form>
+</div>
 
-<h2>Packet log (newest first)</h2>
-<pre>{log_lines}</pre>
-</body></html>"#
+<h2>Packet log <span class="note">(newest first, auto-refreshes)</span></h2>
+<pre class="log">{log_lines}</pre>
+</div>
+</body>
+</html>"#
     )
 }
 
