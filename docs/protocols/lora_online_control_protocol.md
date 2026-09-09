@@ -127,15 +127,20 @@ no other control channel; `lora-tui` is a plain HTTP client, so it can
 attach to a `lora-server` on a different machine, not just one on the same
 host.
 
-- `GET /status.json` — radio/roc-server reachability, the per-node health
-  table, and the recent packet log. Each log line carries a monotonically
-  increasing `seq` (never reused, even once the line itself ages out of the
-  bounded history) so a polling client can tell "new since last poll" apart
-  from "same line, just formatted with a fresher age" — comparing the line
-  text alone can't do that. `lora-tui`'s `HttpRadio` (`backend.rs`) polls
-  this every 500ms, tracks the highest `seq` it's seen, and feeds any newer
-  lines through `parse_rx_line`/`parse_status_line` — reusing 100% of the
-  existing packet/heartbeat/command-ack display logic.
+- `GET /status.json` — this daemon's own `own_addr`, radio/roc-server
+  reachability, the per-node health table, and the recent packet log.
+  `own_addr` is what `lora-tui` displays as its own address on attach —
+  discovered from the daemon rather than taken from a `--addr` flag of its
+  own (which it doesn't have), since a hardcoded client-side default has no
+  way to stay correct across different daemons you might point it at. Each
+  log line carries a monotonically increasing `seq` (never reused, even
+  once the line itself ages out of the bounded history) so a polling client
+  can tell "new since last poll" apart from "same line, just formatted with
+  a fresher age" — comparing the line text alone can't do that. `lora-tui`'s
+  `HttpRadio` (`backend.rs`) polls this every 500ms, tracks the highest
+  `seq` it's seen, and feeds any newer lines through
+  `parse_rx_line`/`parse_status_line` — reusing 100% of the existing
+  packet/heartbeat/command-ack display logic.
 - `GET /` — the same data as an HTML page.
 - `POST /testpunch` (form: `card_id`, `station`, `time_s`) — injects a
   synthetic punch tagged `source="test"` through the real send/retry/ack

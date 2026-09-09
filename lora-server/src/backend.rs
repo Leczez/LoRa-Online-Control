@@ -301,7 +301,7 @@ fn run_spi(args: Args) -> Result<()> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
     let state = crate::daemon_state::new_shared();
     crate::web::spawn_server(
-        args.web_listen.clone(), Arc::clone(&state), Arc::clone(&radio_ready), args.roc_health_url.clone(), cmd_tx,
+        args.web_listen.clone(), args.addr, Arc::clone(&state), Arc::clone(&radio_ready), args.roc_health_url.clone(), cmd_tx,
     );
 
     let radio: Box<dyn Radio> = loop {
@@ -959,6 +959,7 @@ struct HttpLogLine {
 
 #[derive(serde::Deserialize)]
 struct HttpStatusResponse {
+    own_addr: u16,
     log: Vec<HttpLogLine>,
 }
 
@@ -969,6 +970,11 @@ struct HttpStatusResponse {
 /// which web.rs forwards to the daemon's own command channel (cmd_tx).
 struct HttpRadio {
     base_url: String,
+    /// The attached daemon's own LoRa address, discovered from its first
+    /// /status.json response rather than trusted from a CLI flag — see
+    /// attach()'s doc comment for why lora-tui no longer takes its own
+    /// --addr at all.
+    own_addr: u16,
     events: std::sync::mpsc::Receiver<ReceivedPacket>,
     status_events: std::sync::mpsc::Receiver<StatusEvent>,
 }
@@ -987,6 +993,7 @@ impl HttpRadio {
         // replay the whole history, only ever showing live traffic from the
         // point it attaches (see app.rs's NodeStatus doc comment).
         let mut last_seq = initial.log.first().map(|e| e.seq).unwrap_or(0);
+        let own_addr = initial.own_addr;
 
         let (tx, rx) = std::sync::mpsc::channel();
         let (status_tx, status_rx) = std::sync::mpsc::channel();
@@ -1030,7 +1037,7 @@ impl HttpRadio {
             last_seq = new_entries.last().unwrap().seq;
         });
 
-        Ok(Self { base_url, events: rx, status_events: status_rx })
+        Ok(Self { base_url, own_addr, events: rx, status_events: status_rx })
     }
 }
 
@@ -1089,9 +1096,18 @@ impl Radio for HttpRadio {
     }
 }
 
-pub fn attach(server_url: &str, addr: u16, dest: u16) -> Result<()> {
+/// `addr` is discovered from the attached daemon itself (its own
+/// /status.json response), not taken from the caller — lora-tui no longer
+/// has its own --addr flag at all. It used to, but that value was purely
+/// cosmetic in attach mode (the daemon always fills in its own real address
+/// server-side for anything that actually matters — see send_command's doc
+/// comment) and had no way to stay in sync with whatever daemon you
+/// actually pointed lora-tui at, so a stale/mismatched default was the only
+/// possible outcome for anyone not manually overriding it every time.
+pub fn attach(server_url: &str, dest: u16) -> Result<()> {
     let server_url = server_url.trim_end_matches('/').to_string();
     let radio = HttpRadio::new(server_url.clone())?;
+    let addr = radio.own_addr;
     let (_, si_rx) = std::sync::mpsc::channel();
     crate::ui::run_app(format!("attached via {}", server_url), addr, dest, Box::new(radio), 0, si_rx)
 }
@@ -1245,11 +1261,15 @@ mod tests {
         let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         let listen = free_test_listen_addr();
-        crate::web::spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+        crate::web::spawn_server(listen.clone(), 5, state, radio_ready, None, cmd_tx);
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 
         let mut radio = HttpRadio::new(base_url).unwrap();
+        // Discovered from /status.json's own_addr (this server was spawned
+        // with own_addr=5 above), not from any caller-supplied value — this
+        // is what attach() uses in place of a --addr flag now.
+        assert_eq!(radio.own_addr, 5);
         radio.send_command(1, 5, 30).unwrap();
 
         let cmd = cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1267,7 +1287,7 @@ mod tests {
         let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<String>();
         let listen = free_test_listen_addr();
-        crate::web::spawn_server(listen.clone(), Arc::clone(&state), radio_ready, None, cmd_tx);
+        crate::web::spawn_server(listen.clone(), 5, Arc::clone(&state), radio_ready, None, cmd_tx);
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 

@@ -45,6 +45,11 @@ struct LogLineView {
 
 #[derive(Serialize)]
 struct StatusView {
+    /// This daemon's own configured LoRa address — lets a polling client
+    /// (lora-tui's HttpRadio) discover it authoritatively instead of
+    /// relying on its own possibly-stale/mismatched CLI default (see
+    /// backend.rs::attach's doc comment).
+    own_addr: u16,
     radio_ready: bool,
     roc_reachable: Option<bool>,
     nodes: Vec<NodeView>,
@@ -59,7 +64,7 @@ fn secs_ago(t: SystemTime) -> u64 {
 /// background checker thread's state here too — avoids two different
 /// notions of "reachable" needing to agree, at the cost of a sub-second
 /// HTTP round trip per dashboard load.
-fn build_status(state: &SharedState, radio_ready: &RadioReady, roc_health_url: &Option<String>) -> StatusView {
+fn build_status(own_addr: u16, state: &SharedState, radio_ready: &RadioReady, roc_health_url: &Option<String>) -> StatusView {
     let guard = state.lock().unwrap();
     let mut nodes: Vec<NodeView> = guard
         .nodes
@@ -89,7 +94,7 @@ fn build_status(state: &SharedState, radio_ready: &RadioReady, roc_health_url: &
         .as_ref()
         .map(|url| ureq::get(url).timeout(Duration::from_secs(2)).call().is_ok());
 
-    StatusView { radio_ready: radio_ready.load(Ordering::SeqCst), roc_reachable, nodes, log }
+    StatusView { own_addr, radio_ready: radio_ready.load(Ordering::SeqCst), roc_reachable, nodes, log }
 }
 
 fn html_escape(s: &str) -> String {
@@ -168,6 +173,7 @@ fn pill(good: bool, text: &str) -> String {
 }
 
 fn render_html(v: &StatusView) -> String {
+    let own_addr = v.own_addr;
     let radio_cell = if v.radio_ready {
         pill(true, "ready")
     } else {
@@ -226,7 +232,7 @@ fn render_html(v: &StatusView) -> String {
 <body>
 <div class="wrap">
 <h1>lora-server</h1>
-<p class="subtitle">LoRa daemon status &amp; node health</p>
+<p class="subtitle">LoRa daemon status &amp; node health — this node: <span class="mono">{own_addr:#06x}</span></p>
 
 <h2>Status</h2>
 <div class="card">
@@ -283,7 +289,7 @@ fn command_channel_down() -> Response<std::io::Cursor<Vec<u8>>> {
 /// health::spawn_checker already uses) — `None` means "don't check,
 /// roc-server reachability just won't be shown."
 pub fn spawn_server(
-    listen: String, state: SharedState, radio_ready: RadioReady, roc_health_url: Option<String>, cmd_tx: Sender<String>,
+    listen: String, own_addr: u16, state: SharedState, radio_ready: RadioReady, roc_health_url: Option<String>, cmd_tx: Sender<String>,
 ) {
     std::thread::Builder::new()
         .name("web-server".into())
@@ -304,13 +310,13 @@ pub fn spawn_server(
 
                 let response = match (&method, path.as_str()) {
                     (Method::Get, "/status.json") => {
-                        let v = build_status(&state, &radio_ready, &roc_health_url);
+                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url);
                         let body = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string());
                         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
                         Response::from_string(body).with_header(header)
                     }
                     (Method::Get, "/") => {
-                        let v = build_status(&state, &radio_ready, &roc_health_url);
+                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url);
                         let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
                         Response::from_string(render_html(&v)).with_header(header)
                     }
@@ -427,7 +433,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
 
-        spawn_server(listen.clone(), Arc::clone(&state), radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let json = loop {
@@ -468,7 +474,7 @@ mod tests {
         let radio_ready = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), Arc::clone(&state), radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let json = loop {
@@ -496,7 +502,7 @@ mod tests {
         let radio_ready = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -525,7 +531,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         drop(cmd_rx); // simulates the daemon loop having died
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), state, radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
