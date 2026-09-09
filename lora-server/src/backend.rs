@@ -638,14 +638,28 @@ fn run_daemon_loop(
         if let Some(period) = heartbeat_period {
             if last_heartbeat.elapsed() >= period {
                 last_heartbeat = Instant::now();
-                match radio.send(dest, b"HB") {
-                    Ok(()) => {
-                        log::info!("HB sent to {}", dest);
-                        log_event(&state, format!("HB {}", dest));
-                    }
-                    Err(e) => {
-                        log::error!("HB send failed: {}", e);
-                        log_event(&state, format!("ERR HB: {}", e));
+                if dest == own_addr {
+                    // Sending a heartbeat to ourselves is meaningless —
+                    // dest never actually filters radio reception (LoRa is
+                    // a broadcast medium; see CardReadout::to_payload's doc
+                    // comment on why `dest` exists at all), so this isn't
+                    // about anyone failing to hear it. It's just burning
+                    // airtime and log noise announcing our own liveness to
+                    // ourselves — easy to end up here by accident once a
+                    // node's own address happens to match its configured
+                    // dest (e.g. a base station whose dest was set before
+                    // it existed, pointing at the address it'd eventually
+                    // be assigned).
+                } else {
+                    match radio.send(dest, b"HB") {
+                        Ok(()) => {
+                            log::info!("HB sent to {}", dest);
+                            log_event(&state, format!("HB {}", dest));
+                        }
+                        Err(e) => {
+                            log::error!("HB send failed: {}", e);
+                            log_event(&state, format!("ERR HB: {}", e));
+                        }
                     }
                 }
             }
@@ -1493,6 +1507,34 @@ mod tests {
             assert!(Instant::now() < deadline, "CLEARPUNCHES never cleared the buffer");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Real run_daemon_loop: a node whose own dest happens to equal its own
+    /// address (easy to end up with by accident — see the skip's own doc
+    /// comment at the call site) must not send itself a heartbeat. Uses a
+    /// short real interval and waits past it, then confirms no "HB " line
+    /// ever appears in the daemon log.
+    #[test]
+    fn test_heartbeat_skipped_when_dest_equals_own_addr() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 1, dest: 1, heartbeat_interval: 1, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(1200)); // past the 1s heartbeat interval
+        let has_hb_line = state_for_check.lock().unwrap().log.iter().any(|e| e.line.starts_with("HB "));
+        assert!(!has_hb_line, "sent a heartbeat to itself: dest == own_addr");
+
+        drop(cmd_tx);
     }
 
     /// Real run_daemon_loop, not just CardReadout::parse_payload in
