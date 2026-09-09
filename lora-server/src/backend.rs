@@ -678,7 +678,17 @@ fn run_daemon_loop(
             log::info!("buffered {} punch(es) for card {}", readout.punches.len(), readout.card_id);
         }
 
-        if pending_punch.is_none() {
+        if dest == own_addr {
+            // Radio-transmitting a punch toward ourselves is exactly as
+            // meaningless as the self-heartbeat skip above, and for the
+            // same reason — nothing to send toward if we're also the
+            // destination. Left buffered (sent=0) either way: still picked
+            // up by the HTTP pusher if --push-to is configured, or just
+            // waiting for `dest` to actually point somewhere. Without this,
+            // next_local_batch would keep re-attempting (and PUNCH_RETRY_INTERVAL
+            // would keep retrying any already-picked-up batch) forever,
+            // logging a stream of pointless send attempts.
+        } else if pending_punch.is_none() {
             match next_local_batch(&punch_buffer, own_addr, dest) {
                 Ok(Some((card_id, row_ids, payload))) => {
                     match radio.send(dest, payload.as_bytes()) {
@@ -1533,6 +1543,47 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200)); // past the 1s heartbeat interval
         let has_hb_line = state_for_check.lock().unwrap().log.iter().any(|e| e.line.starts_with("HB "));
         assert!(!has_hb_line, "sent a heartbeat to itself: dest == own_addr");
+
+        drop(cmd_tx);
+    }
+
+    /// Same bug, punch-sending side: reported live as "the web interface's
+    /// test-punch button is annoying" — a base station whose dest equals
+    /// its own address kept radio-retrying a self-addressed punch forever.
+    /// A buffered local/test punch should be left alone (still unsent, so
+    /// the HTTP pusher can still pick it up if --push-to is configured)
+    /// rather than radio-transmitted or retried toward itself.
+    #[test]
+    fn test_local_punch_send_skipped_when_dest_equals_own_addr() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        punch_buffer.record(111, 31, 100, "test").unwrap();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+        let pb = Arc::clone(&punch_buffer);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 1, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, pb, state,
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        let attempted_send = state_for_check
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|e| e.line.starts_with("TX ") || e.line.starts_with("ERR TX"));
+        assert!(!attempted_send, "attempted to radio-send a local punch to itself: dest == own_addr");
+        assert_eq!(
+            punch_buffer.unsent().unwrap().len(), 1,
+            "punch should remain buffered, not consumed by a self-send attempt"
+        );
 
         drop(cmd_tx);
     }
