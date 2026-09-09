@@ -65,18 +65,16 @@ impl Store {
             .collect())
     }
 
-    /// Timestamp string (`YYYY-MM-DD HH:MM:SS`) for the ROC format, computed
-    /// from the row's received_at rather than a re-derived value, so it's
-    /// stable across repeated queries for the same punch.
-    pub fn timestamp_of(&self, id: i64) -> Result<Option<String>> {
+    /// Today's date (`YYYY-MM-DD`, server-local per SQLite's own `date('now')`)
+    /// for prefixing the ROC format's timestamp column — see
+    /// roc.rs::render_roc_text for why only the date, not a per-punch
+    /// lookup: the actual time-of-day in that column has to come from each
+    /// punch's own `time_s` (the real SI punch time), not from anything
+    /// stored per-row here. One query per response, not per punch, since
+    /// the date is the same for the whole batch.
+    pub fn today(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT received_at FROM punches WHERE id = ?1")?;
-        let mut rows = stmt.query([id])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
+        conn.query_row("SELECT date('now')", [], |row| row.get(0)).map_err(Into::into)
     }
 }
 

@@ -274,19 +274,15 @@ fn handle_roc(
     let last_id: i64 = query_param(url, "lastId").and_then(|v| v.parse().ok()).unwrap_or(0);
     match store.since(last_id) {
         Ok(punches) => {
-            let mut timestamps = Vec::with_capacity(punches.len());
-            for p in &punches {
-                match store.timestamp_of(p.id) {
-                    Ok(Some(ts)) => timestamps.push(ts),
-                    Ok(None) => timestamps.push(String::new()),
-                    Err(e) => {
-                        log::error!("failed to look up timestamp for punch {}: {e}", p.id);
-                        return text_response(500, "internal error");
-                    }
+            let date = match store.today() {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("failed to get today's date for /roc: {e}");
+                    return text_response(500, "internal error");
                 }
-            }
+            };
             activity.lock().unwrap().push_log(format!("ROC poll lastId={last_id} -> {} punch(es)", punches.len()));
-            text_response(200, &roc::render_roc_text(&punches, &timestamps))
+            text_response(200, &roc::render_roc_text(&punches, &date))
         }
         Err(e) => {
             log::error!("failed to query store for /roc: {e}");
@@ -588,5 +584,30 @@ mod tests {
             ureq::get(&format!("{base_url}/roc?unitId=whatever&lastId=0")).call().unwrap().status(),
             200
         );
+    }
+
+    /// Real handle_roc against a real store: confirms /roc's timestamp
+    /// column reflects the punch's own time_s (10h01m10s for 36070s), not
+    /// whatever wall-clock time the row happened to be inserted at — the
+    /// actual bug this fix addresses, reported live as MIP and ROC
+    /// disagreeing on a punch's time in MEOS.
+    #[test]
+    fn test_roc_endpoint_reports_time_of_day_from_punch_time_s_not_receipt_time() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        store.record(123456, 31, 36070, "local").unwrap();
+        let activity = activity::new_shared();
+        let listen = free_listen_addr();
+        let listen_for_thread = listen.clone();
+        let store_for_thread = Arc::clone(&store);
+        let activity_for_thread = Arc::clone(&activity);
+
+        std::thread::spawn(move || {
+            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+        });
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        let body = ureq::get(&format!("{base_url}/roc?lastId=0")).call().unwrap().into_string().unwrap();
+        assert!(body.ends_with("10:01:10"), "expected time-of-day derived from time_s=36070, got: {body}");
     }
 }
