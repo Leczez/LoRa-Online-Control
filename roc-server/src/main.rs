@@ -32,6 +32,21 @@ struct Args {
     /// How often to check lora-server's health endpoint, in seconds.
     #[arg(long, env = "ROC_SERVER_HEALTH_CHECK_INTERVAL_SECS", default_value_t = 30)]
     health_check_interval_secs: u64,
+
+    /// Expected competition ID. MEOS sends one on every /mip (a "competition"
+    /// header) and /roc (a "unitId" query param) request — verified against
+    /// the real MEOS source (onlineinput.cpp's OnlineInput::process): both
+    /// protocols send it, this server just never checked it before. Unset
+    /// by default (`None`): every request is accepted regardless of what
+    /// competition ID it names, which is exactly today's behavior and the
+    /// only sane default for a single-event deployment — this server has no
+    /// concept of "competitions" to scope by, and it's what every existing
+    /// deployment already assumes. Set this only if MEOS is configured with
+    /// a matching ID and you want /mip and /roc to reject requests that
+    /// don't name it (e.g. a stray or misconfigured second MEOS instance
+    /// pointed at the same server).
+    #[arg(long, env = "ROC_SERVER_COMPETITION_ID")]
+    competition_id: Option<String>,
 }
 
 /// Mirrors lora-server's own health-check thread (lora-server/src/
@@ -92,8 +107,20 @@ fn main() -> Result<()> {
         spawn_health_checker(lora_health_url, std::time::Duration::from_secs(args.health_check_interval_secs));
     }
 
-    log::info!("roc-server listening on {} (db {})", args.listen, args.db);
-    let server = Server::http(&args.listen).map_err(|e| anyhow::anyhow!("{e}"))?;
+    run_server(&args.listen, store, activity, args.lora_health_url, args.competition_id)
+}
+
+/// The actual request-serving loop, pulled out of main() so real end-to-end
+/// tests can spawn it on a background thread and make genuine HTTP requests
+/// against it — same pattern as lora-server/src/web.rs::spawn_server, which
+/// this project leans on throughout rather than testing handlers against
+/// hand-built request/response values.
+fn run_server(
+    listen: &str, store: Arc<Store>, activity: SharedActivity,
+    lora_health_url: Option<String>, competition_id: Option<String>,
+) -> Result<()> {
+    log::info!("roc-server listening on {}", listen);
+    let server = Server::http(listen).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
@@ -102,11 +129,11 @@ fn main() -> Result<()> {
 
         let response = match (&method, path.as_str()) {
             (Method::Post, "/punches") => handle_punches(&mut request, &store, &activity),
-            (Method::Get, "/mip") => handle_mip(&request, &url, &store, &activity),
-            (Method::Get, "/roc") => handle_roc(&url, &store, &activity),
+            (Method::Get, "/mip") => handle_mip(&request, &url, &store, &activity, &competition_id),
+            (Method::Get, "/roc") => handle_roc(&url, &store, &activity, &competition_id),
             (Method::Get, "/health") => text_response(200, "ok"),
-            (Method::Get, "/") => handle_dashboard(&activity, &args.lora_health_url),
-            (Method::Get, "/status.json") => handle_status_json(&activity, &args.lora_health_url),
+            (Method::Get, "/") => handle_dashboard(&activity, &lora_health_url),
+            (Method::Get, "/status.json") => handle_status_json(&activity, &lora_health_url),
             _ => text_response(404, "not found"),
         };
 
@@ -181,7 +208,46 @@ fn last_id_from_request(request: &tiny_http::Request, url: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn handle_mip(request: &tiny_http::Request, url: &str, store: &Store, activity: &SharedActivity) -> Response<std::io::Cursor<Vec<u8>>> {
+/// MEOS sends this as a `competition` header on every /mip request
+/// (`key.emplace_back(L"competition", sanitizeId(cmpId));` in
+/// OnlineInput::process, onlineinput.cpp) — confirmed against the real
+/// source, not assumed.
+fn competition_id_from_mip_request(request: &tiny_http::Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("competition"))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// MEOS sends this as a `unitId` query param on every /roc request
+/// (`q = L"?unitId=" + ... ` in the same function) — same source, same
+/// verification.
+fn competition_id_from_roc_request(url: &str) -> Option<String> {
+    query_param(url, "unitId")
+}
+
+/// `expected` unset (`None`) means "don't check" — every request is
+/// accepted regardless of what competition ID it names, or whether it
+/// names one at all. That's the default and matches every existing
+/// deployment's actual behavior; see Args::competition_id's doc comment.
+fn competition_id_ok(expected: &Option<String>, actual: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(want) => actual == Some(want.as_str()),
+    }
+}
+
+fn handle_mip(
+    request: &tiny_http::Request, url: &str, store: &Store, activity: &SharedActivity,
+    expected_competition_id: &Option<String>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let actual_competition_id = competition_id_from_mip_request(request);
+    if !competition_id_ok(expected_competition_id, actual_competition_id.as_deref()) {
+        log::warn!("/mip request rejected: competition id {:?} doesn't match", actual_competition_id);
+        activity.lock().unwrap().push_log(format!("MIP poll rejected: competition id {:?}", actual_competition_id));
+        return text_response(403, "wrong competition id");
+    }
     let last_id = last_id_from_request(request, url);
     match store.since(last_id) {
         Ok(punches) => {
@@ -196,7 +262,15 @@ fn handle_mip(request: &tiny_http::Request, url: &str, store: &Store, activity: 
     }
 }
 
-fn handle_roc(url: &str, store: &Store, activity: &SharedActivity) -> Response<std::io::Cursor<Vec<u8>>> {
+fn handle_roc(
+    url: &str, store: &Store, activity: &SharedActivity, expected_competition_id: &Option<String>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let actual_competition_id = competition_id_from_roc_request(url);
+    if !competition_id_ok(expected_competition_id, actual_competition_id.as_deref()) {
+        log::warn!("/roc request rejected: competition id {:?} doesn't match", actual_competition_id);
+        activity.lock().unwrap().push_log(format!("ROC poll rejected: competition id {:?}", actual_competition_id));
+        return text_response(403, "wrong competition id");
+    }
     let last_id: i64 = query_param(url, "lastId").and_then(|v| v.parse().ok()).unwrap_or(0);
     match store.since(last_id) {
         Ok(punches) => {
@@ -401,4 +475,118 @@ numeric source is a remote node's LoRa address.</p>
 
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
     Response::from_string(body).with_header(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_competition_id_ok_when_unconfigured_accepts_anything() {
+        assert!(competition_id_ok(&None, None));
+        assert!(competition_id_ok(&None, Some("anything")));
+    }
+
+    #[test]
+    fn test_competition_id_ok_requires_exact_match_when_configured() {
+        let expected = Some("evt-42".to_string());
+        assert!(competition_id_ok(&expected, Some("evt-42")));
+        assert!(!competition_id_ok(&expected, Some("evt-43")));
+        assert!(!competition_id_ok(&expected, None));
+    }
+
+    #[test]
+    fn test_competition_id_from_roc_request_reads_unit_id_query_param() {
+        assert_eq!(competition_id_from_roc_request("/roc?unitId=evt-42&lastId=0"), Some("evt-42".to_string()));
+        assert_eq!(competition_id_from_roc_request("/roc?lastId=0"), None);
+    }
+
+    fn free_listen_addr() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("127.0.0.1:{port}")
+    }
+
+    fn wait_for_server(base_url: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if ureq::get(&format!("{base_url}/health")).call().is_ok() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("server at {base_url} never came up");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Real run_server, real HTTP requests — not just competition_id_ok in
+    /// isolation. Confirms a mismatched competition id gets 403'd on both
+    /// /mip (header-based) and /roc (query-param-based), and that the exact
+    /// same requests succeed once no competition id is configured at all
+    /// (today's behavior, and the default).
+    #[test]
+    fn test_endpoints_reject_wrong_competition_id_when_configured() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        store.record(123456, 31, 100, "local").unwrap();
+        let activity = activity::new_shared();
+        let listen = free_listen_addr();
+        let listen_for_thread = listen.clone();
+        let store_for_thread = Arc::clone(&store);
+        let activity_for_thread = Arc::clone(&activity);
+
+        std::thread::spawn(move || {
+            let _ = run_server(
+                &listen_for_thread, store_for_thread, activity_for_thread, None, Some("evt-42".to_string()),
+            );
+        });
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        let mip_wrong = ureq::get(&format!("{base_url}/mip"))
+            .set("competition", "evt-99")
+            .call();
+        assert_eq!(mip_wrong.unwrap_err().into_response().unwrap().status(), 403);
+
+        let mip_right = ureq::get(&format!("{base_url}/mip"))
+            .set("competition", "evt-42")
+            .call();
+        assert_eq!(mip_right.unwrap().status(), 200);
+
+        let roc_wrong = ureq::get(&format!("{base_url}/roc?unitId=evt-99&lastId=0")).call();
+        assert_eq!(roc_wrong.unwrap_err().into_response().unwrap().status(), 403);
+
+        let roc_right = ureq::get(&format!("{base_url}/roc?unitId=evt-42&lastId=0")).call();
+        assert_eq!(roc_right.unwrap().status(), 200);
+    }
+
+    /// Same real server, but with no competition_id configured at all —
+    /// every request must succeed regardless of what (if anything) it
+    /// sends, since this is the default for every existing single-event
+    /// deployment.
+    #[test]
+    fn test_endpoints_accept_any_competition_id_when_unconfigured() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let activity = activity::new_shared();
+        let listen = free_listen_addr();
+        let listen_for_thread = listen.clone();
+        let store_for_thread = Arc::clone(&store);
+        let activity_for_thread = Arc::clone(&activity);
+
+        std::thread::spawn(move || {
+            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+        });
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        assert_eq!(ureq::get(&format!("{base_url}/mip")).call().unwrap().status(), 200);
+        assert_eq!(
+            ureq::get(&format!("{base_url}/mip")).set("competition", "whatever").call().unwrap().status(),
+            200
+        );
+        assert_eq!(ureq::get(&format!("{base_url}/roc?lastId=0")).call().unwrap().status(), 200);
+        assert_eq!(
+            ureq::get(&format!("{base_url}/roc?unitId=whatever&lastId=0")).call().unwrap().status(),
+            200
+        );
+    }
 }

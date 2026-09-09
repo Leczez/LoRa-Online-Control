@@ -18,6 +18,13 @@ services:
     environment:
       ROC_SERVER_LORA_HEALTH_URL: "http://host.docker.internal:8081/health"
       ROC_SERVER_LISTEN: "0.0.0.0:8080"
+      # Uncomment to reject any /mip or /roc request whose competition id
+      # doesn't match — must equal whatever MEOS's own Online Input dialog
+      # is configured with. Left unset by default: every request is
+      # accepted regardless of competition id, which is correct for a
+      # single-event deployment (this server has no concept of separate
+      # competitions to scope by).
+      #ROC_SERVER_COMPETITION_ID: "your-competition-id"
     restart: unless-stopped
 
 volumes:
