@@ -31,6 +31,9 @@ struct NodeView {
     last_punch_secs_ago: Option<u64>,
     last_rssi: Option<i16>,
     punch_count: u64,
+    /// See daemon_state::NodeStatus::version — null until this node has
+    /// reported at least once (boot announcement or a /queryversion reply).
+    version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +84,7 @@ fn build_status(own_addr: u16, state: &SharedState, radio_ready: &RadioReady, ro
             si_present: s.si_present,
             last_punch_secs_ago: s.last_punch.map(secs_ago),
             last_rssi: s.last_rssi,
+            version: s.version.clone(),
             punch_count: s.punch_count,
         })
         .collect();
@@ -209,7 +213,7 @@ fn render_html(v: &StatusView) -> String {
             None => "-".to_string(),
         };
         node_rows.push_str(&format!(
-            "<tr><td class=\"mono\">{:#06x}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>\n",
+            "<tr><td class=\"mono\">{:#06x}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>\n",
             n.addr,
             n.last_heartbeat_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             battery,
@@ -217,10 +221,11 @@ fn render_html(v: &StatusView) -> String {
             n.last_punch_secs_ago.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".to_string()),
             n.last_rssi.map(|r| format!("{r}dBm")).unwrap_or_else(|| "-".to_string()),
             n.punch_count,
+            n.version.as_deref().map(html_escape).unwrap_or_else(|| "-".to_string()),
         ));
     }
     if node_rows.is_empty() {
-        node_rows = "<tr><td colspan=\"7\">no nodes heard from yet</td></tr>\n".to_string();
+        node_rows = "<tr><td colspan=\"8\">no nodes heard from yet</td></tr>\n".to_string();
     }
 
     let mut log_lines = String::new();
@@ -257,9 +262,20 @@ fn render_html(v: &StatusView) -> String {
 <h2>Nodes</h2>
 <div class="card">
 <table>
-<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th><th>Punches</th></tr>
+<tr><th>Addr</th><th>Last heartbeat</th><th>Battery</th><th>SI master</th><th>Last punch</th><th>RSSI</th><th>Punches</th><th>Version</th></tr>
 {node_rows}
 </table>
+</div>
+
+<h2>Query node version</h2>
+<div class="card">
+<p class="hint">Asks a node to report its firmware version right now, rather than
+waiting for its next boot (nodes also report once, unprompted, on every boot —
+see the Version column above). Reply lands asynchronously; refresh to see it.</p>
+<form method="POST" action="/queryversion">
+  <label>Target address <input type="number" name="target" required></label>
+  <button type="submit">Query version</button>
+</form>
 </div>
 
 <h2>Send test punch</h2>
@@ -392,6 +408,25 @@ pub fn spawn_server(
                             _ => Response::from_string("missing/invalid target/heartbeat_interval_secs").with_status_code(400),
                         }
                     }
+                    // Returns the same small "Sent. Back" HTML as /testpunch
+                    // (not a bare "ok" like /setdest, /cmd, etc.) since this
+                    // is driven by an actual browser form submission in the
+                    // dashboard, not just an API caller.
+                    (Method::Post, "/queryversion") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match form.get("target").and_then(|s| s.parse::<u16>().ok()) {
+                            Some(target) => match cmd_tx.send(format!("QUERYVERSION {}", target)) {
+                                Ok(()) => {
+                                    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+                                    Response::from_string("<html><body>Sent. <a href=\"/\">Back</a></body></html>").with_header(header)
+                                }
+                                Err(_) => command_channel_down(),
+                            },
+                            None => Response::from_string("missing/invalid target").with_status_code(400),
+                        }
+                    }
                     (Method::Post, "/clearpunch") => {
                         let mut body = String::new();
                         let _ = request.as_reader().read_to_string(&mut body);
@@ -439,6 +474,7 @@ mod tests {
     fn test_status_json_and_testpunch_against_real_server() {
         let state = crate::daemon_state::new_shared();
         state.lock().unwrap().record_heartbeat(10, Some((77, 3850)), Some(true));
+        state.lock().unwrap().record_version(10, "0.1.0+deadbeef".to_string());
         state.lock().unwrap().push_log("RX 10 -80 HB 77 3850".to_string());
 
         let radio_ready = Arc::new(AtomicBool::new(true));
@@ -463,11 +499,13 @@ mod tests {
             json.contains(&format!("\"version\": \"{}\"", crate::version::VERSION)),
             "status.json was: {json}"
         );
+        assert!(json.contains("\"version\": \"0.1.0+deadbeef\""), "status.json was: {json}");
 
         let html = ureq::get(&format!("http://{listen}/")).call().unwrap().into_string().unwrap();
         assert!(html.contains("0x000a") || html.contains("0xa"), "HTML was: {html}");
         assert!(html.contains("RX 10 -80 HB 77 3850"), "HTML was: {html}");
         assert!(html.contains("connected"), "HTML was: {html}");
+        assert!(html.contains("0.1.0+deadbeef"), "HTML was: {html}");
 
         ureq::post(&format!("http://{listen}/testpunch"))
             .send_string("card_id=555&station=9&time_s=1234")
@@ -510,6 +548,9 @@ mod tests {
 
         ureq::post(&format!("http://{listen}/cmd")).send_string("target=5&heartbeat_interval_secs=60").unwrap();
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "CMD 5 60");
+
+        ureq::post(&format!("http://{listen}/queryversion")).send_string("target=10").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "QUERYVERSION 10");
     }
 
     #[test]

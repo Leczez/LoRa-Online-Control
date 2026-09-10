@@ -18,6 +18,10 @@ pub struct NodeStatus {
     /// daemon-wide lifetime total (see daemon_state::NodeStatus::punch_count
     /// for that; the web dashboard shows it, this is the TUI's own view).
     pub punch_count: u64,
+    /// See daemon_state::NodeStatus::version — reset on reconnect like the
+    /// rest of this struct, so a freshly-attached session shows nothing
+    /// until this node reports again (boot or a fresh /queryversion).
+    pub version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -83,6 +87,14 @@ pub enum LogEntry {
         commander: u16,
         message: String,
     },
+    /// A node reported its version — see StatusEvent::VersionRx's doc
+    /// comment in backend.rs. Also updates the node panel (record_version),
+    /// this is just the log-visible confirmation of the same event.
+    VersionRx {
+        timestamp: String,
+        origin: u16,
+        version: String,
+    },
 }
 
 pub struct App {
@@ -120,6 +132,10 @@ impl App {
         if let Some(present) = si_present {
             entry.si_present = Some(present);
         }
+    }
+
+    pub fn record_version(&mut self, node: u16, version: String) {
+        self.nodes.entry(node).or_default().version = Some(version);
     }
 
     pub fn record_punch(&mut self, node: u16) {

@@ -29,7 +29,9 @@ impl Setting {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `Copy` — VersionReport's version field is a String, unlike every other
+// variant here, which were all plain integers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Downlink: `commander` -> node at `target`, asking it to change
     /// `setting`. `commander` travels in the payload (not just inferred from
@@ -47,6 +49,20 @@ pub enum Frame {
     /// unacknowledged at a time per node — `card_id` alone is enough to
     /// disambiguate since there's never more than one outstanding.
     PunchAck { node: u16, card_id: u32 },
+    /// Downlink: asks node `target` to report its firmware version.
+    /// Distinct from `Command`/`Ack` (which apply a `Setting` the commander
+    /// already knows the value of) since a version's value is exactly what
+    /// the commander doesn't have — nothing to echo back and confirm, just
+    /// something to report. No `commander`/relay-routing field, same
+    /// accepted limitation as `HB` (see its own doc comment): this is a
+    /// one-off diagnostic query, not safety-critical config, so relay
+    /// support isn't worth the complexity yet.
+    VersionQuery { target: u16 },
+    /// Uplink: node `origin`'s firmware version. Sent both in reply to a
+    /// `VersionQuery` and once, unprompted, right after booting (see
+    /// esp32-node/src/main.rs) — same wire shape either way, so parsing
+    /// doesn't need to care which prompted it.
+    VersionReport { origin: u16, version: String },
 }
 
 impl Frame {
@@ -55,6 +71,8 @@ impl Frame {
             Frame::Command { target, commander, setting } => format!("CMD {} {} {}", target, commander, setting.encode()),
             Frame::Ack { origin, commander, setting } => format!("ACK {} {} {}", origin, commander, setting.encode()),
             Frame::PunchAck { node, card_id } => format!("PACK {} {}", node, card_id),
+            Frame::VersionQuery { target } => format!("VQUERY {}", target),
+            Frame::VersionReport { origin, version } => format!("VERSION {} {}", origin, version),
         }
     }
 
@@ -78,6 +96,19 @@ impl Frame {
             let node: u16 = parts.next()?.parse().ok()?;
             let card_id: u32 = parts.next()?.parse().ok()?;
             return Some(Frame::PunchAck { node, card_id });
+        }
+        if let Some(rest) = s.strip_prefix("VQUERY ") {
+            let target: u16 = rest.trim().parse().ok()?;
+            return Some(Frame::VersionQuery { target });
+        }
+        if let Some(rest) = s.strip_prefix("VERSION ") {
+            let mut parts = rest.splitn(2, ' ');
+            let origin: u16 = parts.next()?.parse().ok()?;
+            let version = parts.next()?.to_string();
+            if version.is_empty() {
+                return None;
+            }
+            return Some(Frame::VersionReport { origin, version });
         }
         None
     }
@@ -133,5 +164,35 @@ mod tests {
         assert_eq!(Frame::parse("CMD 5 1 hb_interval=notanumber"), None);
         assert_eq!(Frame::parse("CMD 5"), None);
         assert_eq!(Frame::parse("CMD 5 1"), None);
+    }
+
+    #[test]
+    fn test_version_query_round_trips() {
+        let frame = Frame::VersionQuery { target: 10 };
+        let encoded = frame.encode();
+        assert_eq!(encoded, "VQUERY 10");
+        assert_eq!(Frame::parse(&encoded), Some(frame));
+    }
+
+    #[test]
+    fn test_version_report_round_trips() {
+        let frame = Frame::VersionReport { origin: 10, version: "0.1.0+a1b2c3d4.dirty".to_string() };
+        let encoded = frame.encode();
+        assert_eq!(encoded, "VERSION 10 0.1.0+a1b2c3d4.dirty");
+        assert_eq!(Frame::parse(&encoded), Some(frame));
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_version_query() {
+        assert_eq!(Frame::parse("VQUERY notanumber"), None);
+        assert_eq!(Frame::parse("VQUERY"), None);
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_version_report() {
+        assert_eq!(Frame::parse("VERSION notanumber 0.1.0"), None);
+        assert_eq!(Frame::parse("VERSION 10"), None);
+        assert_eq!(Frame::parse("VERSION 10 "), None);
+        assert_eq!(Frame::parse("VERSION"), None);
     }
 }

@@ -38,6 +38,12 @@ pub struct NodeStatus {
     pub si_present: Option<bool>,
     pub last_punch: Option<SystemTime>,
     pub last_rssi: Option<i16>,
+    /// `<semver>+<git-sha>[.dirty]` this node last reported — either its
+    /// unprompted boot announcement, or a reply to a version query (see
+    /// protocol.rs's `Frame::VersionReport`). `None` until it's reported at
+    /// least once this daemon run — not persisted, same as the rest of this
+    /// struct.
+    pub version: Option<String>,
     /// Total punch *packets* (CardReadouts) received from this node — by
     /// `origin`, not radio-layer sender, so a relayed punch still counts
     /// against the control point that actually read the card, not the
@@ -75,6 +81,10 @@ impl DaemonState {
         if let Some(present) = si_present {
             entry.si_present = Some(present);
         }
+    }
+
+    pub fn record_version(&mut self, node: u16, version: String) {
+        self.nodes.entry(node).or_default().version = Some(version);
     }
 
     pub fn record_punch(&mut self, node: u16, rssi: Option<i16>) {
@@ -142,6 +152,24 @@ mod tests {
         state.record_heartbeat(5, None, Some(true));
         state.record_heartbeat(5, None, Some(false));
         assert_eq!(state.nodes[&5].si_present, Some(false));
+    }
+
+    #[test]
+    fn test_record_version_tracks_separately_from_heartbeat() {
+        let mut state = DaemonState::default();
+        state.record_heartbeat(5, Some((80, 3900)), None);
+        state.record_version(5, "0.1.0+a1b2c3d4".to_string());
+        let node = &state.nodes[&5];
+        assert_eq!(node.version.as_deref(), Some("0.1.0+a1b2c3d4"));
+        assert_eq!(node.battery_pct, Some(80));
+    }
+
+    #[test]
+    fn test_record_version_overwrites_previous_value() {
+        let mut state = DaemonState::default();
+        state.record_version(5, "0.1.0+a1b2c3d4".to_string());
+        state.record_version(5, "0.1.0+deadbeef.dirty".to_string());
+        assert_eq!(state.nodes[&5].version.as_deref(), Some("0.1.0+deadbeef.dirty"));
     }
 
     #[test]

@@ -213,6 +213,19 @@ fn main() -> anyhow::Result<()> {
         current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.network_id
     );
 
+    // Announced once, unprompted, right after the radio is up — lets
+    // lora-base-station learn a node's firmware version passively (see
+    // daemon_state::NodeStatus::version) without an operator having to
+    // remember to query every node after a redeploy. Best-effort like every
+    // other uplink send here: if this one send is lost, the node's version
+    // just won't show up until the next boot or an explicit /queryversion —
+    // not worth retrying for a value that never changes mid-session.
+    let boot_report = protocol::encode_version_report(current.addr, VERSION);
+    match protocol::send_framed(&mut radio, current.dest, boot_report.as_bytes(), &current.network_id) {
+        Ok(()) => log::info!("VERSION to {:#06x}: {}", current.dest, boot_report),
+        Err(e) => log::warn!("boot version announcement failed: {:?}", e),
+    }
+
     // GPIO4: placeholder battery-sense pin, see battery.rs and the wiring
     // doc — the actual voltage-divider circuit isn't built yet.
     let mut battery = battery::BatteryMonitor::new(peripherals.adc1, pins.gpio4)?;
@@ -252,6 +265,14 @@ fn main() -> anyhow::Result<()> {
                     {
                         log::info!("PUNCH card {} acked by {:#06x}", card_id, src_addr);
                         pending_punch = None;
+                    }
+                } else if let Some(target) = protocol::parse_version_query(&text) {
+                    if target == current.addr {
+                        let report = protocol::encode_version_report(current.addr, VERSION);
+                        match protocol::send_framed(&mut radio, src_addr, report.as_bytes(), &current.network_id) {
+                            Ok(()) => log::info!("VERSION to {:#06x}: {}", src_addr, report),
+                            Err(e) => log::warn!("version query reply failed: {:?}", e),
+                        }
                     }
                 } else {
                     log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);

@@ -60,6 +60,12 @@ pub enum StatusEvent {
     /// count (see daemon_state::NodeStatus::punch_count's doc comment on
     /// why this counts packets, not individual station taps).
     PunchRx { origin: u16, card_id: u32 },
+    /// A node reported its firmware version — either its unprompted boot
+    /// announcement, or a reply to a QUERYVERSION this session (or another
+    /// attached client) issued. Same event either way; lora-tui doesn't
+    /// need to know which prompted it, just the current value to show in
+    /// the node table.
+    VersionRx { origin: u16, version: String },
 }
 
 pub trait Radio: Send {
@@ -99,6 +105,17 @@ pub trait Radio: Send {
     /// retry-with-ack tracking (see run_daemon_loop).
     fn send_command(&mut self, commander: u16, target: u16, heartbeat_interval_secs: u32) -> Result<()> {
         let frame = Frame::Command { target, commander, setting: Setting::HeartbeatIntervalSecs(heartbeat_interval_secs) };
+        self.send(target, frame.encode().as_bytes())
+    }
+
+    /// Ask the node at `target` to report its firmware version. Same
+    /// direct-hardware-vs-daemon split as send_command: this default impl
+    /// (fire-and-forget, no retry tracking — see the QUERYVERSION handling
+    /// in run_daemon_loop for why) is what a direct-hardware session uses;
+    /// the daemon's HttpRadio hands it off to the daemon itself instead
+    /// (POST /queryversion — web.rs).
+    fn query_version(&mut self, target: u16) -> Result<()> {
+        let frame = Frame::VersionQuery { target };
         self.send(target, frame.encode().as_bytes())
     }
 }
@@ -559,6 +576,26 @@ fn run_daemon_loop(
                         pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
                     }
                 }
+            } else if let Some(rest) = cmd.strip_prefix("QUERYVERSION ") {
+                if let Ok(target) = rest.trim().parse::<u16>() {
+                    // Fire-and-forget, unlike CMD's retry-tracked
+                    // pending_commands — this is a one-off diagnostic
+                    // action, not safety/data-critical config, so an
+                    // operator just re-issuing it if nothing comes back is
+                    // an acceptable substitute for automatic retry.
+                    let frame = Frame::VersionQuery { target };
+                    let payload = frame.encode();
+                    match radio.send(dest, payload.as_bytes()) {
+                        Ok(()) => {
+                            log::info!("VQUERY to {} (via {})", target, dest);
+                            log_event(&state, format!("TX {} {}", dest, payload));
+                        }
+                        Err(e) => {
+                            log::error!("VQUERY send failed: {}", e);
+                            log_event(&state, format!("ERR VQUERY: {}", e));
+                        }
+                    }
+                }
             } else if let Some(rest) = cmd.strip_prefix("TESTPUNCH ") {
                 // Recorded as "test", not "local" — deliberately flows
                 // through the exact same buffer/send/retry/ack pipeline as
@@ -832,6 +869,32 @@ fn run_daemon_loop(
                         Frame::PunchAck { .. } => {
                             // Not relaying and not ours — ignore.
                         }
+                        Frame::VersionQuery { target } if target == own_addr => {
+                            let report = Frame::VersionReport { origin: own_addr, version: crate::version::VERSION.to_string() };
+                            let report_payload = report.encode();
+                            match radio.send(pkt.src_addr, report_payload.as_bytes()) {
+                                Ok(()) => log_event(&state, format!("TX {} {}", pkt.src_addr, report_payload)),
+                                Err(e) => log::error!("failed to reply to version query: {}", e),
+                            }
+                            log_event(&state, format!("VQUERYRX {}", pkt.src_addr));
+                        }
+                        Frame::VersionQuery { target } if relay => {
+                            // Not addressed to us — pass it on toward the
+                            // named target directly, same pattern as Command.
+                            forward(radio.as_mut(), &state, target, &payload);
+                        }
+                        Frame::VersionQuery { .. } => {
+                            // Not addressed to us and not relaying — ignore.
+                        }
+                        Frame::VersionReport { origin, version } => {
+                            // No addressing/relay to check — same accepted
+                            // limitation as HB (see Frame::VersionReport's
+                            // doc comment): recorded from whoever overheard
+                            // it, exactly like battery/SI-master state
+                            // already is from any overheard HB.
+                            state.lock().unwrap().record_version(origin, version.clone());
+                            log_event(&state, format!("VERSIONRX {} {}", origin, version));
+                        }
                     }
                 } else if let Some(hb) = parse_heartbeat(&payload) {
                     match (hb.battery, hb.si_present) {
@@ -966,6 +1029,12 @@ fn parse_status_line(line: &str) -> Option<StatusEvent> {
         let origin: u16 = parts.next()?.parse().ok()?;
         let card_id: u32 = parts.next()?.parse().ok()?;
         return Some(StatusEvent::PunchRx { origin, card_id });
+    }
+    if let Some(rest) = line.strip_prefix("VERSIONRX ") {
+        let mut parts = rest.splitn(2, ' ');
+        let origin: u16 = parts.next()?.parse().ok()?;
+        let version = parts.next()?.to_string();
+        return Some(StatusEvent::VersionRx { origin, version });
     }
     None
 }
@@ -1118,6 +1187,13 @@ impl Radio for HttpRadio {
             .map_err(|e| anyhow::anyhow!("POST /clearpunches failed: {}", e))?;
         Ok(())
     }
+
+    fn query_version(&mut self, target: u16) -> Result<()> {
+        ureq::post(&format!("{}/queryversion", self.base_url))
+            .send_string(&format!("target={}", target))
+            .map_err(|e| anyhow::anyhow!("POST /queryversion failed: {}", e))?;
+        Ok(())
+    }
 }
 
 /// `addr` is discovered from the attached daemon itself (its own
@@ -1255,6 +1331,12 @@ mod tests {
     fn test_parse_status_line_punchrx() {
         let evt = parse_status_line("PUNCHRX 10 123456").unwrap();
         assert_eq!(evt, StatusEvent::PunchRx { origin: 10, card_id: 123456 });
+    }
+
+    #[test]
+    fn test_parse_status_line_versionrx() {
+        let evt = parse_status_line("VERSIONRX 10 0.1.0+a1b2c3d4.dirty").unwrap();
+        assert_eq!(evt, StatusEvent::VersionRx { origin: 10, version: "0.1.0+a1b2c3d4.dirty".to_string() });
     }
 
     fn free_test_listen_addr() -> String {
@@ -1642,6 +1724,122 @@ mod tests {
         // have bumped node 10's punch_count via the real record_punch call
         // in run_daemon_loop, not just via calling it in isolation.
         assert_eq!(state_for_check.lock().unwrap().nodes[&10].punch_count, 1);
+
+        drop(cmd_tx);
+    }
+
+    /// Real run_daemon_loop, not the pure protocol::Frame round-trip already
+    /// covered in protocol.rs: confirms a VersionQuery addressed to us
+    /// actually gets a VersionReport carrying this daemon's own real
+    /// VERSION sent back, over a real (fake) radio.
+    #[test]
+    fn test_run_daemon_loop_replies_to_version_query_addressed_to_own_addr() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let query = Frame::VersionQuery { target: 2 }.encode();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio {
+            sent: Vec::new(),
+            to_receive: std::collections::VecDeque::from(vec![packet(10, &query)]),
+        });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        let expected_reply = Frame::VersionReport { origin: 2, version: crate::version::VERSION.to_string() }.encode();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let saw_reply = state_for_check
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|e| e.line == format!("TX 10 {}", expected_reply));
+            if saw_reply {
+                break;
+            }
+            assert!(Instant::now() < deadline, "never replied to the version query addressed to us");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(cmd_tx);
+    }
+
+    /// A VersionReport is recorded from whoever sent it, unconditionally —
+    /// same accepted no-addressing limitation as HB — so this daemon learns
+    /// a node's version passively even when it never asked for it.
+    #[test]
+    fn test_run_daemon_loop_records_version_report_from_any_node() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let report = Frame::VersionReport { origin: 10, version: "0.1.0+a1b2c3d4".to_string() }.encode();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio {
+            sent: Vec::new(),
+            to_receive: std::collections::VecDeque::from(vec![packet(10, &report)]),
+        });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if state_for_check.lock().unwrap().nodes.get(&10).and_then(|n| n.version.clone()).is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "version report from node 10 was never recorded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(state_for_check.lock().unwrap().nodes[&10].version.as_deref(), Some("0.1.0+a1b2c3d4"));
+
+        drop(cmd_tx);
+    }
+
+    /// A QUERYVERSION command (as originated by POST /queryversion — see
+    /// web.rs, or lora-tui's /queryversion) sends a real VersionQuery frame
+    /// out over the radio toward the daemon's configured `dest`.
+    #[test]
+    fn test_run_daemon_loop_sends_version_query_on_command() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        cmd_tx.send("QUERYVERSION 10".to_string()).unwrap();
+
+        let expected_tx = format!("TX 1 {}", Frame::VersionQuery { target: 10 }.encode());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sent = state_for_check.lock().unwrap().log.iter().any(|e| e.line == expected_tx);
+            if sent {
+                break;
+            }
+            assert!(Instant::now() < deadline, "QUERYVERSION command never produced a VQUERY send");
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         drop(cmd_tx);
     }

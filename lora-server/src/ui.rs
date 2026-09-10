@@ -24,6 +24,7 @@ const HELP_TEXT: &[&str] = &[
     "  /dest <addr>                        change the address sent traffic targets",
     "  /addr <addr>                        change this session's own displayed address",
     "  /cmd <target-addr> <heartbeat-secs>  ask a node to change its heartbeat interval",
+    "  /queryversion <target-addr>          ask a node to report its firmware version",
     "  /testpunch <card_id> <station> <time_s>  inject a synthetic test punch",
     "  /clearpunch <id>                     abandon one stuck unsent local punch",
     "  /clearpunches                        abandon every stuck unsent local punch",
@@ -95,6 +96,10 @@ fn render_nodes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     Span::styled(format!("  {battery}"), Style::default().fg(Color::Cyan)),
                     Span::styled(format!("  {si_text}"), Style::default().fg(si_color)),
                     Span::styled(format!("  {} punch(es)", status.punch_count), Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        format!("  {}", status.version.as_deref().unwrap_or("-")),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ])
                 .into()
             })
@@ -294,6 +299,16 @@ fn format_entry(entry: &LogEntry) -> Line<'static> {
                 Style::default().fg(Color::Green),
             ),
         ]),
+        LogEntry::VersionRx { timestamp, origin, version } => Line::from(vec![
+            Span::styled(
+                format!("[{}] ", timestamp),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("VER  node {:#06x}  running {}", origin, version),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
     }
 }
 
@@ -381,6 +396,21 @@ pub fn run_app(
                                         None => app.push_log(LogEntry::Error {
                                             timestamp: ts,
                                             message: "usage: /cmd <target-addr> <heartbeat-secs>".to_string(),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/queryversion ") {
+                                    match val.trim().parse::<u16>() {
+                                        Ok(target) => match radio.query_version(target) {
+                                            Ok(()) => app.push_log(LogEntry::Tx {
+                                                timestamp: ts,
+                                                dest_addr: target,
+                                                payload: "VQUERY".to_string(),
+                                            }),
+                                            Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                        },
+                                        Err(_) => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /queryversion <target-addr>".to_string(),
                                         }),
                                     }
                                 } else if let Some(val) = msg.strip_prefix("/testpunch ") {
@@ -556,6 +586,10 @@ pub fn run_app(
                         // shows up via the generic Rx entry above; this just
                         // updates the node panel's running count.
                         app.record_punch(origin);
+                    }
+                    crate::backend::StatusEvent::VersionRx { origin, version } => {
+                        app.record_version(origin, version.clone());
+                        app.push_log(LogEntry::VersionRx { timestamp: timestamp(), origin, version });
                     }
                 }
             }

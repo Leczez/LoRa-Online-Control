@@ -213,6 +213,38 @@ time, matching the addressing scheme above.
   to ever hear the "undo" instruction, and it can only be fixed by physical
   access again. Those settings stay commissioning-time only.
 
+## Version Reporting
+
+Every node and lora-server instance embeds its own build version
+(`<semver>+<git-sha>[.dirty]` — see each crate's `version.rs`/`VERSION`
+const, and the repo-root `VERSION` file for the semver half). Two ways it
+reaches the base station:
+
+- **Boot announcement** — `VERSION <origin> <version>`, sent once,
+  unprompted, right after the radio comes up. Passive discovery: an
+  operator doesn't have to remember to query every node after a redeploy,
+  it just shows up in the node table the next time each node reboots.
+- **On-demand query** — `VQUERY <target>` (downlink), answered with the
+  same `VERSION <origin> <version>` uplink frame. Reachable via
+  `lora-tui`'s `/queryversion <target-addr>`, the web dashboard's "Query
+  node version" form, or `POST /queryversion` (form field `target`)
+  directly.
+
+Both are deliberately simple compared to `Command`/`Ack`:
+
+- **No `commander`/relay-routing field, no ack, no retry.** Same accepted
+  limitation as `HB` (see above) — a `VersionReport` is recorded from
+  whoever overheard it, unconditionally, the same way battery/SI-master
+  state already is from any overheard `HB`. This is a one-off diagnostic
+  value, not safety-critical config, so the complexity of `Command`'s
+  retry-tracked, relay-aware exchange isn't worth it here. A lost `VQUERY`
+  or `VERSION` reply just means re-issuing the query, or waiting for the
+  node's next boot.
+- **`VersionQuery` still relays like `Command`** (`--relay`, forwarding
+  toward `target` if not addressed to this node) so a query can still reach
+  a node behind a relay — only the *reply* skips relay/commander routing,
+  same as `HB`.
+
 ## Relay Nodes
 
 A control point out of direct range of the base station can reach it via a
