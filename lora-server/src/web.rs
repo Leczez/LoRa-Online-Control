@@ -50,6 +50,10 @@ struct StatusView {
     /// relying on its own possibly-stale/mismatched CLI default (see
     /// backend.rs::attach's doc comment).
     own_addr: u16,
+    /// `<semver>+<git-sha>[.dirty]` — see version.rs. Lets an operator (or a
+    /// deploy script) confirm a redeploy actually took by comparing this
+    /// against the commit they just pushed, without SSHing in.
+    version: &'static str,
     radio_ready: bool,
     roc_reachable: Option<bool>,
     nodes: Vec<NodeView>,
@@ -94,7 +98,14 @@ fn build_status(own_addr: u16, state: &SharedState, radio_ready: &RadioReady, ro
         .as_ref()
         .map(|url| ureq::get(url).timeout(Duration::from_secs(2)).call().is_ok());
 
-    StatusView { own_addr, radio_ready: radio_ready.load(Ordering::SeqCst), roc_reachable, nodes, log }
+    StatusView {
+        own_addr,
+        version: crate::version::VERSION,
+        radio_ready: radio_ready.load(Ordering::SeqCst),
+        roc_reachable,
+        nodes,
+        log,
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -174,6 +185,7 @@ fn pill(good: bool, text: &str) -> String {
 
 fn render_html(v: &StatusView) -> String {
     let own_addr = v.own_addr;
+    let version = html_escape(v.version);
     let radio_cell = if v.radio_ready {
         pill(true, "ready")
     } else {
@@ -232,7 +244,7 @@ fn render_html(v: &StatusView) -> String {
 <body>
 <div class="wrap">
 <h1>lora-server</h1>
-<p class="subtitle">LoRa daemon status &amp; node health — this node: <span class="mono">{own_addr:#06x}</span></p>
+<p class="subtitle">LoRa daemon status &amp; node health — this node: <span class="mono">{own_addr:#06x}</span> · <span class="mono">{version}</span></p>
 
 <h2>Status</h2>
 <div class="card">
@@ -447,6 +459,10 @@ mod tests {
         assert!(json.contains("\"battery_pct\": 77"), "status.json was: {json}");
         assert!(json.contains("\"si_present\": true"), "status.json was: {json}");
         assert!(json.contains("\"radio_ready\": true"), "status.json was: {json}");
+        assert!(
+            json.contains(&format!("\"version\": \"{}\"", crate::version::VERSION)),
+            "status.json was: {json}"
+        );
 
         let html = ureq::get(&format!("http://{listen}/")).call().unwrap().into_string().unwrap();
         assert!(html.contains("0x000a") || html.contains("0xa"), "HTML was: {html}");

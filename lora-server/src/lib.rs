@@ -8,6 +8,7 @@ pub mod punch_buffer;
 pub mod pusher;
 pub mod sportident;
 pub mod ui;
+pub mod version;
 pub mod web;
 
 pub use args::Args;

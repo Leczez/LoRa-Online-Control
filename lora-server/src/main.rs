@@ -30,8 +30,8 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     log::info!(
-        "starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
-        args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
+        "lora-server {} starting on SPI (reset pin {}) addr {} dest {} freq {}MHz sf {} bw {}Hz heartbeat {}s",
+        lora_server::version::VERSION, args.reset_pin, args.addr, args.dest, args.freq, args.sf, args.bw_hz, args.heartbeat_interval
     );
     lora_server::backend::run(args)
 }

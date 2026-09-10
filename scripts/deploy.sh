@@ -39,6 +39,12 @@ esac
 
 echo "Cross-compiling lora-server (daemon) and lora-tui (attach client)..."
 cd "$WORKSPACE_ROOT"
+# Computed here, not inside build.rs, because `cross build` runs in a Docker
+# container that can't see this worktree's real .git (a worktree's .git is
+# a file pointing at an absolute host path the container doesn't have) —
+# forwarded into the container via Cross.toml's `[build.env] passthrough`.
+# See lora-server/build.rs for the consuming side.
+export GIT_SHA="$(git describe --always --dirty=.dirty --abbrev=8 2>/dev/null || echo unknown)"
 cross build --release -p lora-server --target "$RUST_TARGET"
 
 SERVER_BINARY="$TARGET_DIR/$RUST_TARGET/release/lora-server"
@@ -158,6 +164,7 @@ REMOTE
 
 echo ""
 echo "Deploy complete!"
+echo "  Version:  $GIT_SHA (curl the deployed /status.json's \"version\" field to confirm it took)"
 echo "  Binaries: /usr/local/bin/lora-server, /usr/local/bin/lora-tui"
 echo "  Config:   /etc/lora-server/env  (edit on device, then: sudo systemctl restart lora-server)"
 echo "  Service:  sudo systemctl {start,stop,status} lora-server"

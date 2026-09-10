@@ -1,3 +1,12 @@
+# scripts/deploy.sh computes GIT_SHA on the host (where the real .git is)
+# and exports it before calling `cross build` — the container cross builds
+# in can't see the worktree's real gitdir, so build.rs can't just run `git`
+# itself in there. This passthrough is what lets the container-side build.rs
+# see that host-computed value at all; without it cross drops all host env
+# vars it doesn't explicitly recognize.
+[build.env]
+passthrough = ["GIT_SHA"]
+
 [target.aarch64-unknown-linux-gnu]
 pre-build = ["dpkg --add-architecture arm64 && apt-get update && apt-get install -y libudev-dev:arm64"]
 

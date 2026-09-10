@@ -2,6 +2,7 @@ mod activity;
 mod mip;
 mod roc;
 mod store;
+mod version;
 
 use anyhow::Result;
 use clap::Parser;
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    log::info!("roc-server {} starting", version::VERSION);
 
     if let Some(parent) = std::path::Path::new(&args.db).parent() {
         std::fs::create_dir_all(parent).ok();
@@ -300,6 +302,10 @@ struct SourceView {
 
 #[derive(Serialize)]
 struct DashboardView {
+    /// `<semver>+<git-sha>[.dirty]` — see version.rs. Lets an operator (or a
+    /// deploy script) confirm a redeploy actually took by comparing this
+    /// against the commit they just pushed, without SSHing in.
+    version: &'static str,
     lora_reachable: Option<bool>,
     sources: Vec<SourceView>,
     log: Vec<String>,
@@ -329,7 +335,7 @@ fn build_dashboard(activity: &SharedActivity, lora_health_url: &Option<String>) 
         .as_ref()
         .map(|url| ureq::get(url).timeout(std::time::Duration::from_secs(2)).call().is_ok());
 
-    DashboardView { lora_reachable, sources, log }
+    DashboardView { version: version::VERSION, lora_reachable, sources, log }
 }
 
 fn html_escape(s: &str) -> String {
@@ -401,6 +407,7 @@ fn pill(good: bool, text: &str) -> String {
 
 fn handle_dashboard(activity: &SharedActivity, lora_health_url: &Option<String>) -> Response<std::io::Cursor<Vec<u8>>> {
     let v = build_dashboard(activity, lora_health_url);
+    let version = html_escape(v.version);
 
     let lora_cell = match v.lora_reachable {
         Some(true) => pill(true, "reachable"),
@@ -443,7 +450,7 @@ fn handle_dashboard(activity: &SharedActivity, lora_health_url: &Option<String>)
 <body>
 <div class="wrap">
 <h1>roc-server</h1>
-<p class="subtitle">MIP/ROC output server status</p>
+<p class="subtitle">MIP/ROC output server status — <span class="mono">{version}</span></p>
 
 <h2>Status</h2>
 <div class="card">
@@ -609,5 +616,31 @@ mod tests {
 
         let body = ureq::get(&format!("{base_url}/roc?lastId=0")).call().unwrap().into_string().unwrap();
         assert!(body.ends_with("10:01:10"), "expected time-of-day derived from time_s=36070, got: {body}");
+    }
+
+    /// Real handle_status_json against a real spawned server: confirms the
+    /// running binary's build version is actually discoverable over HTTP,
+    /// not just present as a Rust constant — this is what an operator (or
+    /// deploy script) checks to confirm a redeploy took.
+    #[test]
+    fn test_status_json_reports_own_version() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let activity = activity::new_shared();
+        let listen = free_listen_addr();
+        let listen_for_thread = listen.clone();
+        let store_for_thread = Arc::clone(&store);
+        let activity_for_thread = Arc::clone(&activity);
+
+        std::thread::spawn(move || {
+            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+        });
+        let base_url = format!("http://{listen}");
+        wait_for_server(&base_url);
+
+        let body = ureq::get(&format!("{base_url}/status.json")).call().unwrap().into_string().unwrap();
+        assert!(
+            body.contains(&format!("\"version\": \"{}\"", version::VERSION)),
+            "status.json was: {body}"
+        );
     }
 }

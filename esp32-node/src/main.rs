@@ -109,6 +109,14 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
         .expect("failed to spawn SI reader thread");
 }
 
+/// `<semver>+<git-sha>[.dirty]`, e.g. "0.1.0+a1b2c3d4" or
+/// "0.1.0+a1b2c3d4.dirty" — same scheme as lora-server's and roc-server's
+/// own version.rs (no shared crate to hang one definition off of). GIT_SHA
+/// is embedded by build.rs. Logged on every boot below — the only way to
+/// tell what firmware an unattended field node is actually running without
+/// physically re-flashing it to find out.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_SHA"));
+
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
 // page (only addr/dest/freq are; see wifi_config.rs). Must match
 // lora-base-station's deployed /etc/lora-server/env.
@@ -138,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     // watchdog, panic) is otherwise invisible; this is the only way to tell
     // "power-cycled on purpose" apart from "crashed" after the fact from a
     // serial log.
-    log::info!("esp32-node booting (reset reason: {:?})", esp_idf_hal::reset::ResetReason::get());
+    log::info!("esp32-node {} booting (reset reason: {:?})", VERSION, esp_idf_hal::reset::ResetReason::get());
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;

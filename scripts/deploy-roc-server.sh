@@ -34,6 +34,14 @@ WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 # than introduce a second, different packaging path.
 REMOTE_DIR="/opt/roc-server-src"
 
+# Computed here, not inside build.rs, because the build context excludes
+# .git (see ../.dockerignore) and the rsync below excludes it too — the
+# remote build has no working .git to run `git describe` against at all.
+# Forwarded to the remote below as a real env var (docker-compose.yml reads
+# it from there for the build.args passed into the Dockerfile's ARG
+# GIT_SHA) — see roc-server/build.rs for the consuming side.
+GIT_SHA="$(git describe --always --dirty=.dirty --abbrev=8 2>/dev/null || echo unknown)"
+
 echo "Syncing source to $TARGET_HOST:$REMOTE_DIR..."
 # /opt requires root to create things in; sudo the mkdir, then chown it to
 # the connecting user so the plain (non-sudo) rsync below can write into it
@@ -49,15 +57,18 @@ echo "Building and (re)starting roc-server on $TARGET_HOST..."
 ssh "$TARGET_HOST" bash <<REMOTE
 set -euo pipefail
 cd "$REMOTE_DIR/roc-server"
+# 'sudo VAR=val cmd' does NOT set VAR for cmd (sudo resets the environment
+# by default) — 'sudo env VAR=val cmd' does, regardless of sudoers config.
 if sudo docker compose version &>/dev/null; then
-    sudo docker compose up -d --build
+    sudo env GIT_SHA="$GIT_SHA" docker compose up -d --build
 else
-    sudo docker-compose up -d --build
+    sudo env GIT_SHA="$GIT_SHA" docker-compose up -d --build
 fi
 REMOTE
 
 echo ""
 echo "Deploy complete!"
+echo "  Version:  $GIT_SHA (curl the deployed /status.json's \"version\" field to confirm it took)"
 echo "  roc-server listening on port 8080 (see roc-server/docker-compose.yml for the mapping)"
 echo "  Punch data persists in the 'roc-server-data' Docker volume across redeploys."
 echo "  Logs:   ssh $TARGET_HOST 'cd $REMOTE_DIR/roc-server && sudo docker compose logs -f'"

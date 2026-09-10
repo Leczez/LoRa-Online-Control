@@ -10,6 +10,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY sx127x sx127x
 COPY lora-server lora-server
 COPY roc-server roc-server
+# The build context excludes .git (see ../.dockerignore) and
+# deploy-roc-server.sh's rsync excludes it too, so roc-server/build.rs has
+# no working .git to run `git describe` against in here — the caller
+# (docker build --build-arg / docker-compose's build.args) computes it on
+# the host instead and passes it through. Defaults to "unknown" for a plain
+# `docker build` with no --build-arg, rather than failing the build.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release -p roc-server
 
 FROM debian:bookworm-slim

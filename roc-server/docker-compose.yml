@@ -3,6 +3,13 @@ services:
     build:
       context: ..
       dockerfile: roc-server/Dockerfile
+      # deploy-roc-server.sh computes and exports GIT_SHA on the host
+      # (where git works) before running `docker compose ... --build`;
+      # compose substitutes it from that shell env here and forwards it
+      # into the Dockerfile's ARG GIT_SHA. Empty/unset falls through to the
+      # Dockerfile's own "unknown" default.
+      args:
+        GIT_SHA: "${GIT_SHA:-unknown}"
     ports:
       - "8080:8080"
     volumes:
