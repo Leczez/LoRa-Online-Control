@@ -18,6 +18,7 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, BlockingWifi, Configuration, EspWifi};
 
 use crate::config::NodeConfig;
+use crate::persistent_log;
 
 const CONFIG_WINDOW: Duration = Duration::from_secs(120);
 
@@ -54,6 +55,22 @@ pub fn run(
     let render_current = current.clone();
     server.fn_handler::<anyhow::Error, _>("/", Method::Get, move |req| {
         let html = render_page(&render_current);
+        let mut resp = req.into_ok_response()?;
+        resp.write_all(html.as_bytes())?;
+        Ok(())
+    })?;
+
+    // Surfaces the persistent checkpoint log (persistent_log.rs) — the one
+    // way to see how far a *previous* boot got before a crash (brownout,
+    // panic, watchdog) without a live serial connection, since this portal
+    // runs fresh at the start of every boot, before cp210x::install() ever
+    // touches USB. See persistent_log.rs's doc comment for the full
+    // rationale and why it's only a handful of short checkpoint lines, not
+    // a full serial-log mirror.
+    let log_nvs = Arc::clone(&nvs);
+    server.fn_handler::<anyhow::Error, _>("/log", Method::Get, move |req| {
+        let lines = { persistent_log::read_lines(&log_nvs.lock().unwrap()) };
+        let html = render_log_page(&lines);
         let mut resp = req.into_ok_response()?;
         resp.write_all(html.as_bytes())?;
         Ok(())
@@ -114,10 +131,34 @@ fn render_page(cfg: &NodeConfig) -> String {
   <label>Network ID <input type="text" name="network_id" value="{network_id}"></label><br>
   <button type="submit">Save &amp; restart</button>
 </form>
+<p><a href="/log">View boot/checkpoint log</a></p>
 </body></html>"#,
         addr = cfg.addr,
         dest = cfg.dest,
         freq = cfg.freq_hz,
         network_id = cfg.network_id,
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Oldest-first, one per line — matches the order persistent_log::read_lines
+/// returns them in, which matches the order they were checkpointed in.
+fn render_log_page(lines: &[String]) -> String {
+    let body = if lines.is_empty() {
+        "(empty — nothing checkpointed yet)".to_string()
+    } else {
+        lines.iter().map(|l| html_escape(l)).collect::<Vec<_>>().join("\n")
+    };
+    format!(
+        r#"<html><body>
+<h1>Checkpoint log</h1>
+<p>Persisted across reboots (see persistent_log.rs) — oldest first. Only a
+handful of meaningful checkpoints, not a full serial-log mirror.</p>
+<pre>{body}</pre>
+<p><a href="/">Back to config</a></p>
+</body></html>"#
     )
 }

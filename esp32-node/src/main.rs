@@ -33,6 +33,7 @@ use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi}
 mod battery;
 mod config;
 mod cp210x;
+mod persistent_log;
 mod protocol;
 mod psram;
 mod sportident;
@@ -147,7 +148,8 @@ fn main() -> anyhow::Result<()> {
     // watchdog, panic) is otherwise invisible; this is the only way to tell
     // "power-cycled on purpose" apart from "crashed" after the fact from a
     // serial log.
-    log::info!("esp32-node {} booting (reset reason: {:?})", VERSION, esp_idf_hal::reset::ResetReason::get());
+    let reset_reason = esp_idf_hal::reset::ResetReason::get();
+    log::info!("esp32-node {} booting (reset reason: {:?})", VERSION, reset_reason);
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
@@ -157,6 +159,14 @@ fn main() -> anyhow::Result<()> {
         let guard = nvs.lock().unwrap();
         NodeConfig::load(&guard, default_config())
     };
+
+    // First persistent-log checkpoint of this boot — see persistent_log.rs's
+    // doc comment for why this exists at all: a crash later in this same
+    // boot (brownout, panic, watchdog) means the live serial console is
+    // long gone by the time it happens (cp210x::install(), below, steals
+    // it), but this survives in NVS for the *next* boot's Wi-Fi portal
+    // (/log) to show — telling you how far this boot actually got.
+    persistent_log::append(&mut nvs.lock().unwrap(), &format!("boot: {:?}", reset_reason));
 
     // Either returns after the window closes with `current` still accurate
     // (nothing saved), or a save inside the portal calls esp_restart()
@@ -212,6 +222,7 @@ fn main() -> anyhow::Result<()> {
         "esp32-node up: addr={} dest={} freq={}Hz sf={} network_id={}",
         current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.network_id
     );
+    persistent_log::append(&mut nvs.lock().unwrap(), "radio up");
 
     // Announced once, unprompted, right after the radio is up — lets
     // lora-base-station learn a node's firmware version passively (see
@@ -222,14 +233,24 @@ fn main() -> anyhow::Result<()> {
     // not worth retrying for a value that never changes mid-session.
     let boot_report = protocol::encode_version_report(current.addr, VERSION);
     match protocol::send_framed(&mut radio, current.dest, boot_report.as_bytes(), &current.network_id) {
-        Ok(()) => log::info!("VERSION to {:#06x}: {}", current.dest, boot_report),
-        Err(e) => log::warn!("boot version announcement failed: {:?}", e),
+        Ok(()) => {
+            log::info!("VERSION to {:#06x}: {}", current.dest, boot_report);
+            persistent_log::append(&mut nvs.lock().unwrap(), "boot announce: ok");
+        }
+        Err(e) => {
+            log::warn!("boot version announcement failed: {:?}", e);
+            persistent_log::append(&mut nvs.lock().unwrap(), &format!("boot announce: err {:?}", e));
+        }
     }
 
     // GPIO4: placeholder battery-sense pin, see battery.rs and the wiring
     // doc — the actual voltage-divider circuit isn't built yet.
     let mut battery = battery::BatteryMonitor::new(peripherals.adc1, pins.gpio4)?;
     let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL; // send one immediately on boot
+    // Included in each persisted heartbeat checkpoint below — lets the next
+    // boot's /log page distinguish "died on the very first attempt" from
+    // "ran fine for a while, then died", not just "died somewhere".
+    let mut hb_attempt: u32 = 0;
 
     cp210x::install()?;
 
@@ -296,9 +317,16 @@ fn main() -> anyhow::Result<()> {
             };
             let si_flag = if si_present.load(Ordering::SeqCst) { '1' } else { '0' };
             let hb_payload = std::format!("HB {} {}", battery_field, si_flag);
+            hb_attempt += 1;
             match protocol::send_framed(&mut radio, current.dest, hb_payload.as_bytes(), &current.network_id) {
-                Ok(()) => log::info!("HB to {:#06x}: {}", current.dest, hb_payload),
-                Err(e) => log::warn!("HB send failed: {:?}", e),
+                Ok(()) => {
+                    log::info!("HB to {:#06x}: {}", current.dest, hb_payload);
+                    persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("hb #{}: ok", hb_attempt));
+                }
+                Err(e) => {
+                    log::warn!("HB send failed: {:?}", e);
+                    persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("hb #{}: err {:?}", hb_attempt, e));
+                }
             }
         }
 
