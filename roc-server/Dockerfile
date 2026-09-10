@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock VERSION ./
 COPY sx127x sx127x
 COPY lora-server lora-server
 COPY roc-server roc-server

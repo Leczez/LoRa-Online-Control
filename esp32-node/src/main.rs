@@ -111,11 +111,12 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
 
 /// `<semver>+<git-sha>[.dirty]`, e.g. "0.1.0+a1b2c3d4" or
 /// "0.1.0+a1b2c3d4.dirty" — same scheme as lora-server's and roc-server's
-/// own version.rs (no shared crate to hang one definition off of). GIT_SHA
-/// is embedded by build.rs. Logged on every boot below — the only way to
-/// tell what firmware an unattended field node is actually running without
+/// own version.rs (no shared crate to hang one definition off of). SEMVER
+/// comes from the repo-root VERSION file, GIT_SHA from `git describe`; both
+/// embedded by build.rs. Logged on every boot below — the only way to tell
+/// what firmware an unattended field node is actually running without
 /// physically re-flashing it to find out.
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_SHA"));
+const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
 // page (only addr/dest/freq are; see wifi_config.rs). Must match

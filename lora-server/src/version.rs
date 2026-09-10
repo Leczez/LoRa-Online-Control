@@ -2,10 +2,13 @@
 //
 // `<semver>+<git-sha>[.dirty]`, e.g. "0.1.0+a1b2c3d4" or
 // "0.1.0+a1b2c3d4.dirty" — valid semver 2.0 build-metadata syntax (a single
-// leading `+`, dot-separated identifiers after it). GIT_SHA is embedded by
-// build.rs; see that file for why it isn't just `git describe` run here
-// directly (cross-compilation doesn't have a working .git to ask).
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_SHA"));
+// leading `+`, dot-separated identifiers after it). SEMVER comes from the
+// repo-root VERSION file, GIT_SHA from `git describe`; both are embedded by
+// build.rs — see that file for why neither is just read/run here directly
+// (cross-compilation doesn't have a working .git to ask, and reading
+// ../VERSION at runtime would look at whatever's on disk on the *deployed*
+// machine, not what the binary was actually built from).
+pub const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 
 #[cfg(test)]
 mod tests {

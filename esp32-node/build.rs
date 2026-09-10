@@ -1,15 +1,25 @@
 fn main() {
     embuild::espidf::sysenv::output();
-    emit_git_sha();
+    emit_version();
 }
 
-/// Embeds a git-describe string via GIT_SHA (read at runtime through
-/// env!("GIT_SHA") in src/version.rs), same purpose as lora-server's and
-/// roc-server's own build.rs — see either for the full rationale. This
-/// crate is simpler: it's flashed by building directly on a dev machine
-/// (no cross/Docker container in the way), so .git is always right there
-/// and this can just run `git describe` unconditionally.
-fn emit_git_sha() {
+/// Embeds SEMVER (from the repo-root VERSION file) and GIT_SHA (from `git
+/// describe`), read at runtime via the VERSION const in main.rs — same
+/// purpose as lora-server's and roc-server's own build.rs, see either for
+/// the full rationale on why VERSION is the source of truth over
+/// CARGO_PKG_VERSION. This crate is simpler on the GIT_SHA half: it's
+/// flashed by building directly on a dev machine (no cross/Docker container
+/// in the way), so .git is always right there and this can just run `git
+/// describe` unconditionally.
+fn emit_version() {
+    let semver = std::fs::read_to_string("../VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=SEMVER={semver}");
+    println!("cargo:rerun-if-changed=../VERSION");
+
     let sha = std::process::Command::new("git")
         .args(["describe", "--always", "--dirty=.dirty", "--abbrev=8"])
         .output()

@@ -1,5 +1,8 @@
 [package]
 name = "roc-server"
+# Cargo requires a value here, but it isn't what's embedded in the binary or
+# shown on /status.json — that comes from the repo-root VERSION file
+# (read by build.rs) so it can't drift from what `cat VERSION` reports.
 version = "0.1.0"
 edition = "2021"
 

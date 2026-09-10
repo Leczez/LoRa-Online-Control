@@ -49,7 +49,7 @@ echo "Syncing source to $TARGET_HOST:$REMOTE_DIR..."
 ssh "$TARGET_HOST" "sudo mkdir -p $REMOTE_DIR && sudo chown \"\$(whoami)\" $REMOTE_DIR"
 rsync -az --delete \
     --exclude target --exclude '.git' \
-    "$WORKSPACE_ROOT/Cargo.toml" "$WORKSPACE_ROOT/Cargo.lock" \
+    "$WORKSPACE_ROOT/Cargo.toml" "$WORKSPACE_ROOT/Cargo.lock" "$WORKSPACE_ROOT/VERSION" \
     "$WORKSPACE_ROOT/sx127x" "$WORKSPACE_ROOT/lora-server" "$WORKSPACE_ROOT/roc-server" \
     "$TARGET_HOST:$REMOTE_DIR/"
 
