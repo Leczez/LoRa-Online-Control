@@ -55,7 +55,14 @@ pub fn append(nvs: &mut EspNvs<NvsDefault>, line: &str) {
 /// `/log` page renders. Empty if nothing has been checkpointed yet (first
 /// boot ever, or NVS was erased).
 pub fn read_lines(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
-    let mut buf = [0u8; READ_BUF_LEN];
+    // Heap-allocated, not a stack array — this is called from main() before
+    // wifi_config::run() ever starts Wi-Fi (see append's call sites), and
+    // the main task's stack doesn't necessarily have READ_BUF_LEN bytes of
+    // headroom to spare at that point in the boot sequence. A stack
+    // overflow here would crash/reset the board silently, before Wi-Fi ever
+    // gets a chance to come up — exactly the kind of failure this whole
+    // module exists to make visible, so it can't itself be the cause of one.
+    let mut buf = vec![0u8; READ_BUF_LEN];
     nvs.get_str(KEY_LOG, &mut buf)
         .ok()
         .flatten()
