@@ -614,14 +614,12 @@ pub fn run_app(
     result
 }
 
+/// This machine's local wall-clock time — chrono::Local reads the system's
+/// actual configured timezone, unlike a hand-rolled `SystemTime`/`UNIX_EPOCH`
+/// calculation (which is always UTC, since std has no timezone support of
+/// its own). Matters for lora-tui specifically since it's usually run
+/// interactively by a person watching the clock on the wall, not just
+/// logged/compared programmatically.
 fn timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }

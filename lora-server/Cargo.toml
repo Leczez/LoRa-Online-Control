@@ -10,6 +10,11 @@ edition = "2021"
 sx127x = { path = "../sx127x" }
 anyhow = "1"
 heapless = "0.8"
+# lora-tui's displayed log timestamps (ui.rs::timestamp) — std deliberately
+# has no timezone support of its own, and chrono's Local::now() is the
+# standard, thread-safe way to get the system's actual local time instead
+# of hand-rolling UTC-only arithmetic.
+chrono = "0.4"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
