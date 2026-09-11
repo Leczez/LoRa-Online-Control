@@ -6,7 +6,7 @@ use embedded_hal::{
     spi::SpiDevice,
 };
 
-use crate::{Config, LoraRadio, NoInputPin, ReceivedPacket, Sx127xError};
+use crate::{Config, LoraRadio, NoInputPin, ReceivedPacket, Sx127xError, TimeoutKind};
 
 const REG_FIFO: u8 = 0x00;
 const REG_OP_MODE: u8 = 0x01;
@@ -80,6 +80,12 @@ impl WaitFor {
             WaitFor::CadDone => DIO0_MAPPING_CADDONE,
         }
     }
+    fn timeout_kind(&self) -> TimeoutKind {
+        match self {
+            WaitFor::TxDone => TimeoutKind::TxDone,
+            WaitFor::CadDone => TimeoutKind::ChannelActivityDetection,
+        }
+    }
 }
 
 pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin> {
@@ -132,7 +138,7 @@ where
                     return self.read_register(REG_IRQ_FLAGS);
                 }
             }
-            return Err(Sx127xError::Timeout);
+            return Err(Sx127xError::Timeout(event.timeout_kind()));
         }
 
         for _ in 0..poll_iterations {
@@ -141,7 +147,7 @@ where
                 return Ok(irq);
             }
         }
-        Err(Sx127xError::Timeout)
+        Err(Sx127xError::Timeout(event.timeout_kind()))
     }
 
     fn read_register(&mut self, addr: u8) -> Result<u8, Sx127xError<SPI::Error>> {
@@ -655,5 +661,57 @@ mod tests {
 
         radio.spi.done();
         radio.reset.done();
+    }
+
+    /// Regression guard for the CAD/TxDone timeout distinction: without it,
+    /// a CAD that never completes (nothing was even keyed up for
+    /// transmission yet) was indistinguishable from a TxDone that never
+    /// arrives (the transmission started but its completion was never
+    /// signaled) — both surfaced as the exact same generic error. Uses a
+    /// small custom poll_iterations (2), not the real TX_POLL_ITERATIONS/
+    /// CAD_POLL_ITERATIONS (100_000) send()/channel_activity_detected() use
+    /// internally — wait_for already takes this as a parameter, so a small
+    /// value here still exercises the real timeout path, just quickly.
+    #[test]
+    fn test_wait_for_cad_timeout_reports_channel_activity_detection_kind() {
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, 0x00]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, 0x00]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
+
+        let result = radio.wait_for(WaitFor::CadDone, 2);
+        assert!(matches!(result, Err(Sx127xError::Timeout(TimeoutKind::ChannelActivityDetection))));
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    /// Same distinction, exercised via the DIO0-polling branch (not just the
+    /// SPI-register-polling one above) since both construct the error from
+    /// the same `event.timeout_kind()` call but are otherwise separate code
+    /// paths.
+    #[test]
+    fn test_wait_for_via_dio0_txdone_timeout_reports_txdone_kind() {
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_TXDONE]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let dio0 = PinMock::new(&[PinTx::get(State::Low), PinTx::get(State::Low)]);
+        let mut radio = Sx127xSpi::new_with_dio0(spi, reset, NoopDelay, dio0);
+
+        let result = radio.wait_for(WaitFor::TxDone, 2);
+        assert!(matches!(result, Err(Sx127xError::Timeout(TimeoutKind::TxDone))));
+
+        radio.spi.done();
+        radio.reset.done();
+        radio.dio0.unwrap().done();
     }
 }
