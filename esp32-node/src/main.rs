@@ -152,6 +152,26 @@ fn default_config() -> NodeConfig {
     NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, network_id: "LOC".to_string() }
 }
 
+/// Recovers from a send failure by forcing a real hardware reset and full
+/// register re-init (`configure()` calls `hardware_reset()` first thing) —
+/// cheap insurance against a specific, observed failure mode: a timed-out
+/// send can leave the chip in a state that plain per-attempt register
+/// rewrites (which every send already does) don't clear, so every following
+/// attempt — even `channel_activity_detected()`'s own CAD check, before any
+/// transmission is even attempted — keeps failing too, forever, until the
+/// node is physically power-cycled. Nothing else here ever re-initializes
+/// the chip once boot's own `radio.configure()` call succeeds, so without
+/// this a single bad transmission was permanent for the rest of that boot.
+/// Best-effort: if the reconfigure itself fails, just log it and let the
+/// next scheduled send attempt (which will likely also fail) try again —
+/// there's nothing more targeted to fall back to here.
+fn recover_radio<R: LoraRadio>(radio: &mut R, radio_config: &RadioConfig) {
+    log::warn!("attempting radio recovery: forcing hardware reset + reconfigure");
+    if let Err(e) = radio.configure(radio_config) {
+        log::error!("radio recovery reconfigure failed: {:?}", e);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Required on every esp-idf-svc std binary before touching any ESP-IDF
     // API — links libc/newlib patches the IDF needs.
@@ -255,6 +275,7 @@ fn main() -> anyhow::Result<()> {
         Err(e) => {
             log::warn!("boot version announcement failed: {:?}", e);
             persistent_log::append(&mut nvs.lock().unwrap(), &format!("boot announce: err {:?}", e));
+            recover_radio(&mut radio, &radio_config);
         }
     }
 
@@ -326,7 +347,10 @@ fn main() -> anyhow::Result<()> {
                         let report = protocol::encode_version_report(current.addr, VERSION);
                         match protocol::send_framed(&mut radio, src_addr, report.as_bytes(), &current.network_id) {
                             Ok(()) => log::info!("VERSION to {:#06x}: {}", src_addr, report),
-                            Err(e) => log::warn!("version query reply failed: {:?}", e),
+                            Err(e) => {
+                                log::warn!("version query reply failed: {:?}", e);
+                                recover_radio(&mut radio, &radio_config);
+                            }
                         }
                     }
                 } else {
@@ -360,6 +384,7 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     log::warn!("HB send failed: {:?}", e);
                     persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("hb #{}: err {:?}", hb_attempt, e));
+                    recover_radio(&mut radio, &radio_config);
                 }
             }
         }
@@ -384,6 +409,7 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         log::warn!("PUNCH send failed ({:?}), will retry", e);
                         punch_queue.push_front(readout);
+                        recover_radio(&mut radio, &radio_config);
                     }
                 }
             }
@@ -393,7 +419,10 @@ fn main() -> anyhow::Result<()> {
                 p.sent_at = Instant::now();
                 match protocol::send_framed(&mut radio, current.dest, p.payload.as_bytes(), &current.network_id) {
                     Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
-                    Err(e) => log::warn!("PUNCH retry failed: {:?}", e),
+                    Err(e) => {
+                        log::warn!("PUNCH retry failed: {:?}", e);
+                        recover_radio(&mut radio, &radio_config);
+                    }
                 }
             }
         }
