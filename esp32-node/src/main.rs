@@ -165,7 +165,10 @@ fn default_config() -> NodeConfig {
 /// Best-effort: if the reconfigure itself fails, just log it and let the
 /// next scheduled send attempt (which will likely also fail) try again —
 /// there's nothing more targeted to fall back to here.
-fn recover_radio<R: LoraRadio>(radio: &mut R, radio_config: &RadioConfig) {
+fn recover_radio<R: LoraRadio>(radio: &mut R, radio_config: &RadioConfig)
+where
+    R::Error: std::fmt::Debug,
+{
     log::warn!("attempting radio recovery: forcing hardware reset + reconfigure");
     if let Err(e) = radio.configure(radio_config) {
         log::error!("radio recovery reconfigure failed: {:?}", e);
