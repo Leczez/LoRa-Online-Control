@@ -8,6 +8,13 @@
 //! (cp210x.rs + sportident.rs) and relays them to the base station over
 //! LoRa, using the same wire format lora-server already parses. The pending-
 //! punch queue is allocated in PSRAM (psram.rs), not the main heap.
+//!
+//! Build with `--features debug-console` for a bench/debug variant that
+//! skips SI-master reading entirely so the USB serial console stays live
+//! for the whole session (normally lost partway through boot once
+//! cp210x::install() switches the native USB port into host mode) — see
+//! Cargo.toml's debug-console feature. Never flash that build to a real
+//! field node.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for
@@ -32,6 +39,10 @@ use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi}
 
 mod battery;
 mod config;
+// Unreachable under the debug-console feature (main() skips
+// cp210x::install() entirely there) — see Cargo.toml's debug-console
+// feature and main()'s own comment at that call site.
+#[cfg_attr(feature = "debug-console", allow(dead_code))]
 mod cp210x;
 mod persistent_log;
 mod protocol;
@@ -74,6 +85,10 @@ struct PendingPunch {
 /// instant a connection is lost or not yet established, true only once the
 /// SI master actually answers — main() reports this as-is in every
 /// heartbeat rather than only while actively reading punches.
+///
+/// Unreachable under the debug-console feature (main() never calls this
+/// there) — see Cargo.toml's debug-console feature.
+#[cfg_attr(feature = "debug-console", allow(dead_code))]
 fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("si-reader".into())
@@ -252,15 +267,34 @@ fn main() -> anyhow::Result<()> {
     // "ran fine for a while, then died", not just "died somewhere".
     let mut hb_attempt: u32 = 0;
 
-    cp210x::install()?;
-
     // SI master connection lives entirely on its own thread now (see
     // spawn_si_reader_thread's doc comment) — this thread never blocks on
     // it, so radio RX/ack handling and heartbeats keep running even with no
     // reader plugged in at all.
     let (punch_tx, punch_rx) = mpsc::channel::<CardReadout>();
     let si_present = Arc::new(AtomicBool::new(false));
-    spawn_si_reader_thread(punch_tx, Arc::clone(&si_present));
+
+    #[cfg(not(feature = "debug-console"))]
+    {
+        // cp210x::install() switches the native USB port into host mode —
+        // see cp210x.rs and this project's chat history for why that steals
+        // the serial console for the rest of the boot. The debug-console
+        // feature (Cargo.toml) skips this (and SI reading) entirely so the
+        // console survives instead, for exactly the debugging situation
+        // this comment is attached to.
+        cp210x::install()?;
+        spawn_si_reader_thread(punch_tx, Arc::clone(&si_present));
+    }
+    #[cfg(feature = "debug-console")]
+    {
+        // No producer for punch_tx in this build — drop it explicitly
+        // rather than leave it an unused binding; punch_rx.try_recv() in
+        // the main loop below simply never yields anything, and
+        // si_present stays false forever, same as a node with no reader
+        // plugged in at all.
+        drop(punch_tx);
+        log::warn!("debug-console build: SI master reading is disabled so the USB console stays available — never flash this to a field node");
+    }
 
     // Punches read from the SI master land here first — actual transmission
     // (and its stop-and-wait retry) is driven by this queue below, mirroring

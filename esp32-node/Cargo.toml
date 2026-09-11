@@ -30,6 +30,16 @@ opt-level = "z"
 [features]
 default = ["std", "esp-idf-svc/native"]
 std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
+# Bench/debug build: skips cp210x::install() and the SI-reader thread
+# entirely (main.rs), so the native USB port stays in device/console mode
+# for the whole session instead of cp210x::install() switching it into host
+# mode partway through boot. Trades away SI-master reading for a live
+# serial console across the whole boot sequence — including every
+# heartbeat send, not just the boot-time Wi-Fi portal window. Build with:
+#   cargo build --release --features debug-console
+# Never enable this for a real field deployment — a node built this way
+# can't read punches at all.
+debug-console = []
 
 [dependencies]
 log = { version = "0.4", default-features = false }
