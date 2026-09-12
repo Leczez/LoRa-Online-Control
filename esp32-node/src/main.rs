@@ -98,9 +98,40 @@ const CONFIG_VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 struct PendingPunch {
     card_id: u32,
-    payload: String,
+    payload: Vec<u8>,
     sent_at: Instant,
     attempts: u32,
+}
+
+// Wire tag byte + fixed length for the binary HB frame — must match
+// lora-server's own backend.rs::TAG_HB/HB_LEN exactly. See sportident.rs's
+// TAG_PUNCH doc comment for the full tag registry.
+const TAG_HB: u8 = 0x03;
+const HB_FLAG_BATTERY_VALID: u8 = 0b001;
+const HB_FLAG_SI_KNOWN: u8 = 0b010;
+const HB_FLAG_SI_CONNECTED: u8 = 0b100;
+
+/// Binary wire format: `[tag:1][flags:1][battery_pct:1][battery_mv:2]`,
+/// big-endian, always 5 bytes — must match lora-server's own
+/// `encode_heartbeat`/`parse_heartbeat` exactly. See
+/// docs/protocols/lora_online_control_protocol.md, "Wire Format".
+fn encode_heartbeat(battery: Option<(u8, u16)>, si_present: Option<bool>) -> [u8; 5] {
+    let mut flags = 0u8;
+    let (pct, mv) = match battery {
+        Some((pct, mv)) => {
+            flags |= HB_FLAG_BATTERY_VALID;
+            (pct, mv)
+        }
+        None => (0, 0),
+    };
+    if let Some(si) = si_present {
+        flags |= HB_FLAG_SI_KNOWN;
+        if si {
+            flags |= HB_FLAG_SI_CONNECTED;
+        }
+    }
+    let mv_bytes = mv.to_be_bytes();
+    [TAG_HB, flags, pct, mv_bytes[0], mv_bytes[1]]
 }
 
 /// Owns the SI master connection end-to-end: (re)connecting, reading
@@ -398,34 +429,45 @@ fn main() -> anyhow::Result<()> {
     let mut pending_punch: Option<PendingPunch> = None;
 
     loop {
-        match protocol::receive_text(&mut radio) {
-            Ok(Some((src_addr, rssi, text))) => {
-                if let Some((node, card_id)) = protocol::parse_punch_ack(&text) {
+        match protocol::receive_raw(&mut radio) {
+            Ok(Some((src_addr, rssi, bytes))) => {
+                // PACK is binary (see protocol::parse_punch_ack) — checked
+                // directly against the raw bytes before any UTF-8
+                // conversion, since it's arbitrary binary and a lossy
+                // decode would corrupt it. Only once that doesn't match do
+                // we assume text, for the remaining (rare) control frames
+                // this node understands (VQUERY/CACK).
+                if let Some((node, card_id)) = protocol::parse_punch_ack(&bytes) {
+                    log::info!("RX from {:#06x} rssi={:?}: PACK node={} card={}", src_addr, rssi, node, card_id);
                     if node == current.addr
                         && pending_punch.as_ref().is_some_and(|p| p.card_id == card_id)
                     {
                         log::info!("PUNCH card {} acked by {:#06x}", card_id, src_addr);
                         pending_punch = None;
                     }
-                } else if let Some(target) = protocol::parse_version_query(&text) {
-                    if target == current.addr {
-                        let report = protocol::encode_version_report(current.addr, VERSION);
-                        match radio.send(src_addr, report.as_bytes()) {
-                            Ok(()) => log::info!("VERSION to {:#06x}: {}", src_addr, report),
-                            Err(e) => {
-                                log::warn!("version query reply failed: {:?}", e);
-                                recover_radio(&mut radio, &radio_config);
+                } else if let Ok(text) = core::str::from_utf8(&bytes) {
+                    if let Some(target) = protocol::parse_version_query(text) {
+                        if target == current.addr {
+                            let report = protocol::encode_version_report(current.addr, VERSION);
+                            match radio.send(src_addr, report.as_bytes()) {
+                                Ok(()) => log::info!("VERSION to {:#06x}: {}", src_addr, report),
+                                Err(e) => {
+                                    log::warn!("version query reply failed: {:?}", e);
+                                    recover_radio(&mut radio, &radio_config);
+                                }
                             }
                         }
-                    }
-                } else if let Some(target) = protocol::parse_config_ack(&text) {
-                    if target == current.addr && config_pending {
-                        log::info!("current LoRa mode acked by {:#06x} — keeping it", src_addr);
-                        persistent_log::append(&mut nvs.lock().unwrap(), "config verified");
-                        config_pending = false;
+                    } else if let Some(target) = protocol::parse_config_ack(text) {
+                        if target == current.addr && config_pending {
+                            log::info!("current LoRa mode acked by {:#06x} — keeping it", src_addr);
+                            persistent_log::append(&mut nvs.lock().unwrap(), "config verified");
+                            config_pending = false;
+                        }
+                    } else {
+                        log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
                     }
                 } else {
-                    log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
+                    log::info!("RX from {:#06x} rssi={:?}: <{} bytes, undecodable>", src_addr, rssi, bytes.len());
                 }
             }
             Ok(None) => {}
@@ -485,22 +527,24 @@ fn main() -> anyhow::Result<()> {
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
-            // "- -" (not bare tokens) keeps the field count fixed at three
-            // whether or not the read succeeded, so lora-server's parser
-            // doesn't need to guess which two of three fields are missing.
-            let battery_field = match battery.read() {
-                Ok((pct, mv)) => std::format!("{} {}", pct, mv),
+            let battery_reading = match battery.read() {
+                Ok((pct, mv)) => Some((pct, mv)),
                 Err(e) => {
                     log::warn!("battery read failed ({:?}), reporting no battery data", e);
-                    "- -".to_string()
+                    None
                 }
             };
-            let si_flag = if si_present.load(Ordering::SeqCst) { '1' } else { '0' };
-            let hb_payload = std::format!("HB {} {}", battery_field, si_flag);
+            let si = si_present.load(Ordering::SeqCst);
+            let hb_payload = encode_heartbeat(battery_reading, Some(si));
             hb_attempt += 1;
-            match radio.send(current.dest, hb_payload.as_bytes()) {
+            match radio.send(current.dest, &hb_payload) {
                 Ok(()) => {
-                    log::info!("HB to {:#06x}: {}", current.dest, hb_payload);
+                    log::info!(
+                        "HB to {:#06x}: battery={} si={}",
+                        current.dest,
+                        battery_reading.map(|(pct, mv)| std::format!("{}% {}mV", pct, mv)).unwrap_or_else(|| "none".to_string()),
+                        si
+                    );
                     persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("hb #{}: ok", hb_attempt));
                 }
                 Err(e) => {
@@ -521,9 +565,12 @@ fn main() -> anyhow::Result<()> {
         if pending_punch.is_none() {
             if let Some(readout) = punch_queue.pop_front() {
                 let payload = readout.to_payload(current.addr, current.dest);
-                match radio.send(current.dest, payload.as_bytes()) {
+                match radio.send(current.dest, &payload) {
                     Ok(()) => {
-                        log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
+                        log::info!(
+                            "PUNCH to {:#06x}: card={} punches={}",
+                            current.dest, readout.card_id, readout.punches.len()
+                        );
                         pending_punch = Some(PendingPunch {
                             card_id: readout.card_id, payload, sent_at: Instant::now(), attempts: 1,
                         });
@@ -539,8 +586,8 @@ fn main() -> anyhow::Result<()> {
             if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
                 p.attempts += 1;
                 p.sent_at = Instant::now();
-                match radio.send(current.dest, p.payload.as_bytes()) {
-                    Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
+                match radio.send(current.dest, &p.payload) {
+                    Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: card={}", p.attempts, current.dest, p.card_id),
                     Err(e) => {
                         log::warn!("PUNCH retry failed: {:?}", e);
                         recover_radio(&mut radio, &radio_config);

@@ -100,6 +100,13 @@ pub struct ControlPunch {
     pub time_s: u32,
 }
 
+// Wire tag byte for the binary PUNCH frame — must match lora-server's own
+// sportident.rs::TAG_PUNCH exactly. Safe against collision with the
+// remaining plain-text control frames (VQUERY/VERSION/CACK), which all
+// start with an ASCII uppercase letter (0x41+); PACK uses 0x02, HB uses
+// 0x03 (see protocol.rs and main.rs respectively).
+const TAG_PUNCH: u8 = 0x01;
+
 #[derive(Debug, Clone)]
 pub struct CardReadout {
     pub card_id: u32,
@@ -107,23 +114,36 @@ pub struct CardReadout {
 }
 
 impl CardReadout {
-    /// Wire format sent over LoRa: `PUNCH <origin> <dest> <card_id>
-    /// <station>:<time_s>,...` — must match `lora-server`'s
-    /// `CardReadout::to_payload`/`parse_payload` exactly, since the RPi
-    /// parses this same format on receive. `dest` is the intended final
-    /// recipient (this node's own configured `--dest`/config-portal value):
-    /// LoRa is a broadcast medium, so every node in range decodes every
-    /// packet regardless of `dest` — lora-server relies on this field being
-    /// embedded in the payload itself to tell "consume this" apart from
-    /// "not addressed to me", since nothing at the radio layer filters by
-    /// destination (see lora-server's sportident.rs for the full doc
-    /// comment on this).
-    pub fn to_payload(&self, origin: u16, dest: u16) -> String {
-        let punches: String = self.punches.iter()
-            .map(|p| format!("{}:{}", p.station, p.time_s))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("PUNCH {} {} {} {}", origin, dest, self.card_id, punches)
+    /// Binary wire format sent over LoRa — must match lora-server's own
+    /// `CardReadout::to_payload` exactly, since that's what parses it on
+    /// receive: `[tag:1][origin:u16][dest:u16][card_id:u32][count:u8]
+    /// {[station:u8][time_s:u32]}*count`, all multi-byte integers
+    /// big-endian. See docs/protocols/lora_online_control_protocol.md,
+    /// "Wire Format", for why this moved off plain text.
+    ///
+    /// `dest` is the intended final recipient (this node's own configured
+    /// `--dest`/config-portal value): LoRa is a broadcast medium, so every
+    /// node in range decodes every packet regardless of `dest` —
+    /// lora-server relies on this field being embedded in the payload
+    /// itself to tell "consume this" apart from "not addressed to me",
+    /// since nothing at the radio layer filters by destination (see
+    /// lora-server's sportident.rs for the full doc comment on this).
+    ///
+    /// `.take(255)` caps the punch count at what a single `count` byte can
+    /// hold — no real SI card carries anywhere near that many punches.
+    pub fn to_payload(&self, origin: u16, dest: u16) -> Vec<u8> {
+        let punches: Vec<_> = self.punches.iter().take(255).collect();
+        let mut buf = Vec::with_capacity(10 + punches.len() * 5);
+        buf.push(TAG_PUNCH);
+        buf.extend_from_slice(&origin.to_be_bytes());
+        buf.extend_from_slice(&dest.to_be_bytes());
+        buf.extend_from_slice(&self.card_id.to_be_bytes());
+        buf.push(punches.len() as u8);
+        for p in punches {
+            buf.push(p.station);
+            buf.extend_from_slice(&p.time_s.to_be_bytes());
+        }
+        buf
     }
 }
 
@@ -580,6 +600,12 @@ mod tests {
             card_id: 0x0F4240,
             punches: vec![ControlPunch { station: 33, time_s: 36070 }],
         };
-        assert_eq!(readout.to_payload(10, 1), "PUNCH 10 1 1000000 33:36070");
+        // tag=0x01, origin=10 (0x000A), dest=1 (0x0001), card_id=0x000F4240,
+        // count=1, station=33 (0x21), time_s=36070 (0x00008CE6) — must match
+        // lora-server's own CardReadout::to_payload exactly.
+        assert_eq!(
+            readout.to_payload(10, 1),
+            vec![0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x0F, 0x42, 0x40, 0x01, 0x21, 0x00, 0x00, 0x8C, 0xE6]
+        );
     }
 }

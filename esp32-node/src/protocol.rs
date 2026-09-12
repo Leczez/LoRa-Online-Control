@@ -6,15 +6,26 @@
 //! to reply to a version query addressed to us and to announce our own
 //! version once on boot. See docs/protocols/lora_online_control_protocol.md,
 //! "Punch Delivery" and "Version Reporting".
+//!
+//! PACK is binary (see `parse_punch_ack`); VQUERY/VERSION/CACK stay plain
+//! text — see docs/protocols/lora_online_control_protocol.md, "Wire
+//! Format", for why only the high-frequency frames (PUNCH/PACK/HB) moved
+//! off text.
 
-/// Parses a `PACK <node> <card_id>` wire payload — must match
-/// `lora-server`'s `Frame::PunchAck::encode()` format exactly, since that's
-/// what actually produces this on the wire.
-pub fn parse_punch_ack(s: &str) -> Option<(u16, u32)> {
-    let rest = s.strip_prefix("PACK ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let node: u16 = parts.next()?.parse().ok()?;
-    let card_id: u32 = parts.next()?.parse().ok()?;
+// Wire tag byte for the binary PunchAck frame — must match lora-server's
+// own protocol.rs::TAG_PUNCH_ACK exactly.
+const TAG_PUNCH_ACK: u8 = 0x02;
+const PUNCH_ACK_LEN: usize = 7;
+
+/// Parses a binary PunchAck payload — must match `lora-server`'s
+/// `encode_punch_ack` exactly, since that's what actually produces this on
+/// the wire. Wire format: `[tag:1][node:u16][card_id:u32]`, big-endian.
+pub fn parse_punch_ack(bytes: &[u8]) -> Option<(u16, u32)> {
+    if bytes.len() != PUNCH_ACK_LEN || bytes[0] != TAG_PUNCH_ACK {
+        return None;
+    }
+    let node = u16::from_be_bytes([bytes[1], bytes[2]]);
+    let card_id = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
     Some((node, card_id))
 }
 
@@ -45,22 +56,23 @@ pub fn parse_config_ack(s: &str) -> Option<u16> {
     rest.trim().parse().ok()
 }
 
-/// Wraps `radio.receive`, validating the payload as UTF-8 and packaging it
-/// with the sender/RSSI into the tuple `main.rs`'s loop consumes — a
-/// malformed (non-UTF-8) payload is treated as if nothing was received, not
-/// misparsed as one of our own malformed frames. No longer strips a shared
-/// deployment network ID (removed — the radio's own sync word already
-/// guards against cross-talk with another deployment nearby, for free, at
-/// the hardware level, checked during preamble detection before the chip
-/// even demodulates a mismatched packet — see
+/// Wraps `radio.receive`, packaging the raw payload bytes with the
+/// sender/RSSI into the tuple `main.rs`'s loop consumes. Returns raw bytes,
+/// not text — unlike before the wire-efficiency pass, a payload can now be
+/// genuinely binary (PACK), so validating/converting to UTF-8 has to wait
+/// until after the binary shapes have had a chance to match; see main.rs's
+/// receive-loop dispatch and `parse_punch_ack` above. No longer strips a
+/// shared deployment network ID (removed — the radio's own sync word
+/// already guards against cross-talk with another deployment nearby, for
+/// free, at the hardware level, checked during preamble detection before
+/// the chip even demodulates a mismatched packet — see
 /// docs/protocols/lora_online_control_protocol.md, "Network Identification"
 /// and NodeConfig::sync_word).
-pub fn receive_text<R: sx127x::LoraRadio>(
+pub fn receive_raw<R: sx127x::LoraRadio>(
     radio: &mut R,
-) -> Result<Option<(u16, Option<i16>, String)>, R::Error> {
+) -> Result<Option<(u16, Option<i16>, Vec<u8>)>, R::Error> {
     let Some(pkt) = radio.receive()? else { return Ok(None) };
-    let Ok(text) = core::str::from_utf8(&pkt.payload) else { return Ok(None) };
-    Ok(Some((pkt.src_addr, pkt.rssi, text.to_string())))
+    Ok(Some((pkt.src_addr, pkt.rssi, pkt.payload.to_vec())))
 }
 
 #[cfg(test)]
@@ -69,14 +81,19 @@ mod tests {
 
     #[test]
     fn test_parse_punch_ack() {
-        assert_eq!(parse_punch_ack("PACK 12 123456"), Some((12, 123456)));
+        // node=12 (0x000C), card_id=123456 (0x0001E240) — matches
+        // lora-server's own encode_punch_ack test vector exactly.
+        let bytes = [TAG_PUNCH_ACK, 0x00, 0x0C, 0x00, 0x01, 0xE2, 0x40];
+        assert_eq!(parse_punch_ack(&bytes), Some((12, 123456)));
     }
 
     #[test]
-    fn test_parse_punch_ack_rejects_garbage() {
-        assert_eq!(parse_punch_ack("PACK notanumber 123"), None);
-        assert_eq!(parse_punch_ack("HB"), None);
-        assert_eq!(parse_punch_ack("PACK 12"), None);
+    fn test_parse_punch_ack_rejects_wrong_tag_or_length() {
+        let mut wrong_tag = [TAG_PUNCH_ACK, 0x00, 0x0C, 0x00, 0x01, 0xE2, 0x40];
+        wrong_tag[0] = 0xFF;
+        assert_eq!(parse_punch_ack(&wrong_tag), None);
+        assert_eq!(parse_punch_ack(b"HB"), None);
+        assert_eq!(parse_punch_ack(&[TAG_PUNCH_ACK, 0x00, 0x0C]), None);
     }
 
     #[test]
