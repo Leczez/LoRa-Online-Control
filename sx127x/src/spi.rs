@@ -28,7 +28,6 @@ const REG_DETECTION_OPTIMIZE: u8 = 0x31;
 const REG_DETECTION_THRESHOLD: u8 = 0x37;
 const REG_SYNC_WORD: u8 = 0x39;
 const REG_PA_DAC: u8 = 0x4D;
-#[cfg(test)]
 const REG_VERSION: u8 = 0x42;
 const REG_DIO_MAPPING1: u8 = 0x40;
 
@@ -224,6 +223,16 @@ where
         let mut buf = [addr & 0x7F, 0x00];
         self.spi.transfer_in_place(&mut buf).map_err(Sx127xError::Transport)?;
         Ok(buf[1])
+    }
+
+    /// RegVersion (0x42) — a fixed silicon ID, 0x12 on every real SX1276/77/
+    /// 78/79. Not used by any radio logic; exists purely as a diagnostic
+    /// sanity check callers can log at boot to confirm SPI is actually
+    /// reaching a real chip (wrong wiring, a dead/unpowered module, or a
+    /// stuck MISO/MOSI line reads back as 0x00 or 0xFF instead) before
+    /// trusting anything else this driver reports.
+    pub fn chip_version(&mut self) -> Result<u8, Sx127xError<SPI::Error>> {
+        self.read_register(REG_VERSION)
     }
 
     fn write_register(&mut self, addr: u8, value: u8) -> Result<(), Sx127xError<SPI::Error>> {

@@ -415,6 +415,17 @@ fn main() -> anyhow::Result<()> {
         .configure(&radio_config)
         .map_err(|e| anyhow::anyhow!("radio configure failed: {:?}", e))?;
 
+    // Diagnostic sanity check, not used by any radio logic: RegVersion is a
+    // fixed silicon ID, 0x12 on every real SX1276/77/78/79. Anything else
+    // (0x00, 0xFF, or garbage) means SPI isn't actually reaching a live
+    // chip at all — wrong wiring, a dead/unpowered module, or a stuck
+    // MISO/MOSI line — which would make every other radio.* result
+    // meaningless regardless of DIO0 strategy or timeout tuning.
+    match radio.chip_version() {
+        Ok(v) => log::info!("sx127x chip version register: {:#04x} (expect 0x12)", v),
+        Err(e) => log::warn!("sx127x chip version read failed: {:?}", e),
+    }
+
     log::info!(
         "esp32-node up: addr={} dest={} freq={}Hz sf={} bw={}Hz cr=4/{} sync_word={:#04x}",
         current.addr, current.dest, current.freq_hz, current.sf, current.bw_hz, current.cr, current.sync_word
