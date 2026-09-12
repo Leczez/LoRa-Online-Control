@@ -4,25 +4,31 @@ The purpose of this protocol is to send the SPORTident punches from a SPORTident
 
 
 ## Protocol Structure
-- ~~Packets should have some form of crc or identifier to make sure that the data received is from one of our own nodes and the data is correct.~~ Identifier: done, see "Network Identification" below. CRC: LoRa's own hardware CRC (`crc_on` in `sx127x::Config`) already covers over-the-air corruption at the driver level — `receive()` drops a CRC-failed packet before the application ever sees it, so no separate payload-level CRC was added on top.
+- ~~Packets should have some form of crc or identifier to make sure that the data received is from one of our own nodes and the data is correct.~~ Identifier: done, see "Network Identification" below — now the radio's own sync word, not an application-layer prefix. CRC: LoRa's own hardware CRC (`crc_on` in `sx127x::Config`, on by default on both ends) already covers over-the-air corruption at the driver level — `receive()` drops a CRC-failed packet before the application ever sees it, so no separate payload-level CRC was needed on top.
 - ~~Heartbeat data should be sent to make sure that the receiver knows that the node is alive, together with the voltage of the battery of the node if it has one and other status data that could be necessary.~~ Done for battery voltage/percentage, see "Heartbeats" below. Other status data (e.g. SI-master-connected state) isn't carried yet — a natural extension of the same `HB` format if needed later.
 
 ## Network Identification
 
-Every frame, of every type, is wrapped with a shared deployment ID at the
-radio transport layer — transparent to `Frame::parse`/
-`CardReadout::parse_payload`, which never see it. `--network-id`
-(`LORA_NETWORK_ID`, default `LOC`) is prepended on send and checked on
-receive (`NetworkFilteredRadio` in `backend.rs`); anything with a missing or
-mismatched ID is treated as if nothing was received at all, not misparsed as
-a malformed frame of our own.
+Previously implemented as a plaintext deployment-ID prefix sent on *every*
+frame (`--network-id`/`NetworkFilteredRadio`) — removed as part of a wire
+protocol efficiency pass, since it cost airtime on every single packet for
+something the radio's own hardware can already do for free: the LoRa
+**sync word** (`--sync-word`/`LORA_SYNC_WORD` on lora-server,
+`NodeConfig::sync_word` — set via the Wi-Fi config portal — on esp32-node)
+is checked by the chip itself during preamble detection, rejecting a
+mismatched packet *before it's even demodulated*, rather than after
+receiving and parsing a whole extra prefix.
 
-This is a **plain-text guard against accidental cross-talk**, not a
-security mechanism — it protects against another event running this same
-open-source firmware nearby (or unrelated LoRa gear that happens to share
-our sync word), not a deliberate spoofer who has the source. Every node and
-base station in one deployment must be configured with the same value;
-different events/deployments should use different values.
+This is still a **plain-text-equivalent guard against accidental
+cross-talk**, not a security mechanism — it protects against another event
+running this same open-source firmware nearby, not a deliberate spoofer who
+has the source and could easily match it. Every node and base station in
+one deployment must use the same sync word value; **change it away from the
+default (18/0x12) for a real deployment** — that specific value is a very
+commonly used default across LoRa projects generally, not unique to this
+one, so leaving it unchanged gives little real protection against a nearby
+deployment of *this* firmware (which also defaults to it) let alone other
+LoRa gear.
 
 ## Addressing
 

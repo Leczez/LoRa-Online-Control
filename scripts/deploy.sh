@@ -101,13 +101,20 @@ LORA_RESET_PIN=25
 LORA_SF=7
 LORA_BW_HZ=125000
 LORA_CR=5
+# This is now the *only* guard against accidental cross-talk with another
+# event running this same open-source firmware nearby (a plaintext "network
+# ID" sent on every frame used to do this at the application layer; removed
+# since the sync word already does the same job for free at the radio's own
+# hardware level). 18 (0x12) is a very commonly used default across LoRa
+# projects generally, not unique to this one — change this for a real
+# deployment, and make sure every node's own sync word (set via its Wi-Fi
+# config portal) matches exactly.
 LORA_SYNC_WORD=18
 LORA_FREQ=433
 LORA_ADDR=0
 LORA_DEST=1
 LORA_POWER=22
 LORA_HEARTBEAT_INTERVAL=60
-LORA_NETWORK_ID=LOC
 LORA_HEALTH_LISTEN=0.0.0.0:8081
 LORA_HEALTH_CHECK_INTERVAL_SECS=30
 # Uncomment and point at roc-server's own /health to enable the mutual
@@ -154,7 +161,7 @@ ExecStart=/usr/local/bin/lora-server \
   --reset-pin ${LORA_RESET_PIN} \
   --sf ${LORA_SF} --bw-hz ${LORA_BW_HZ} --cr ${LORA_CR} --sync-word ${LORA_SYNC_WORD} \
   --freq ${LORA_FREQ} --addr ${LORA_ADDR} --dest ${LORA_DEST} --power ${LORA_POWER} \
-  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL} --network-id "${LORA_NETWORK_ID}"
+  --heartbeat-interval ${LORA_HEARTBEAT_INTERVAL}
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

@@ -28,7 +28,19 @@ pub struct Args {
     #[arg(long, env = "LORA_CR", default_value_t = 5)]
     pub cr: u8,
 
-    /// LoRa sync word for the SPI radio (decimal; default 18 = 0x12)
+    /// LoRa sync word for the SPI radio (decimal; default 18 = 0x12) — this
+    /// is now the *only* guard against accidental cross-talk with another
+    /// event running this same open-source firmware nearby (a plaintext
+    /// "network ID" prefix used to do this at the application layer, on
+    /// every single frame; removed since the sync word already does the
+    /// same job for free at the radio's own hardware level — a mismatched
+    /// sync word is rejected during preamble detection, before the chip
+    /// even demodulates the payload). Every node and base station in one
+    /// deployment must use the same value, and — since 0x12 is a very
+    /// commonly used default across LoRa projects generally, not unique to
+    /// this one — **change this to something else for a real deployment**,
+    /// not just when you happen to notice interference. Not a security
+    /// mechanism either way, just collision avoidance.
     #[arg(long, env = "LORA_SYNC_WORD", default_value_t = 18)]
     pub sync_word: u8,
 
@@ -61,14 +73,6 @@ pub struct Args {
     /// Heartbeat interval in seconds (0 to disable)
     #[arg(long, env = "LORA_HEARTBEAT_INTERVAL", default_value_t = 60)]
     pub heartbeat_interval: u64,
-
-    /// Shared deployment identifier, prepended to every outgoing frame and
-    /// checked on every received one — a plain-text guard against accidental
-    /// cross-talk with another event running this same firmware nearby, not
-    /// a security mechanism. Change this per event/deployment; every node
-    /// and base station in one deployment must use the same value.
-    #[arg(long, env = "LORA_NETWORK_ID", default_value = "LOC")]
-    pub network_id: String,
 
     /// Address:port this daemon's own GET /health check server binds, so
     /// roc-server (or an operator) can confirm it's alive over the network —
