@@ -98,7 +98,12 @@ if [[ ! -f /etc/lora-server/env ]]; then
 # lora-server configuration
 # Edit these values then: sudo systemctl restart lora-server
 LORA_RESET_PIN=25
-LORA_SF=7
+# SF11 trades bitrate for range (see docs/protocols/lora_online_control_protocol.md,
+# "RF Parameters") — must match every field node's own SPREADING_FACTOR const
+# exactly (esp32-node/src/main.rs), since this is commissioning-time only,
+# not remotely changeable: a mismatch means the node and base station simply
+# never hear each other.
+LORA_SF=11
 LORA_BW_HZ=125000
 LORA_CR=5
 # This is now the *only* guard against accidental cross-talk with another

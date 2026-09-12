@@ -137,7 +137,15 @@ const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
 // page (only addr/dest/freq/sync_word are; see wifi_config.rs). Must match
 // lora-base-station's deployed /etc/lora-server/env.
-const SPREADING_FACTOR: u8 = 7;
+//
+// SPREADING_FACTOR=11 (up from 7) trades bitrate for receiver sensitivity —
+// see docs/protocols/lora_online_control_protocol.md's "RF Parameters"
+// section for the reasoning. LowDataRateOptimize is computed automatically
+// from SF+BW by sx127x, no separate flag needed here. One real consequence:
+// a heartbeat frame's airtime goes from tens of ms at SF7 to roughly
+// 800-900ms at SF11 — still a small fraction of HEARTBEAT_INTERVAL's 60s,
+// but worth knowing if that interval is ever tightened.
+const SPREADING_FACTOR: u8 = 11;
 const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
 const CODING_RATE: CodingRate = CodingRate::Cr4_5;
 const TX_POWER_DBM: i8 = 20;

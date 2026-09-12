@@ -308,8 +308,10 @@ fastest. LoRa's spreading factor (SF) and bandwidth (BW) both trade bitrate
 for receiver sensitivity — every SF step roughly doubles symbol length and
 meaningfully improves sensitivity; halving the bandwidth does the same.
 
-Recommended: **SF11 or SF12 at 125kHz** (433MHz, CR 4:5), not the absolute
-extreme (SF12 at 7.8kHz), because:
+Applied as the default: **SF11 at 125kHz** (433MHz, CR 4:5) —
+`LORA_SF`/`SPREADING_FACTOR` on `lora-server` and `esp32-node`
+respectively, both defaulting to 11. Not the absolute extreme (SF12 at
+7.8kHz, or even SF12 at 125kHz), because:
 
 - **Airtime cost.** Symbol time scales as `2^SF / BW`, so the narrowest
   settings push airtime into multiple seconds per message. That eats into
@@ -327,6 +329,19 @@ extreme (SF12 at 7.8kHz), because:
 `LowDataRateOptimize` must be enabled whenever the symbol period exceeds
 16ms (true for SF11+ at 125kHz) — `sx127x` computes this automatically from
 the configured SF/BW rather than needing it set by hand.
+
+**Airtime, concretely:** a ~30-byte punch frame that took roughly 70ms at
+SF7 takes roughly 900ms at SF11 — about a 12x increase. A 60s heartbeat
+interval still keeps that comfortably under 2% duty cycle per node, but
+this is the number to revisit before shortening `LORA_HEARTBEAT_INTERVAL`
+or adding more per-node periodic traffic.
+
+**Deploying this change to an already-commissioned node requires physical
+access** — SF is fixed at commissioning time, like sync word and frequency
+(see "Command Packets" above), not remotely changeable. A node left on the
+old SF simply won't be heard by a base station running the new default,
+with no error message on either side to explain why — both ends need
+reflashing/redeploying together, not separately.
 
 *(Note: EBYTE E22 module support — a separate `sx126x` driver crate over
 UART — has been dropped. Every node, base station included, now runs bare

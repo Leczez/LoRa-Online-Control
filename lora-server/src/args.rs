@@ -16,8 +16,15 @@ pub struct Args {
     #[arg(long, env = "LORA_DIO0_PIN")]
     pub dio0_pin: Option<u8>,
 
-    /// LoRa spreading factor for the SPI radio (7-12)
-    #[arg(long, env = "LORA_SF", default_value_t = 7)]
+    /// LoRa spreading factor for the SPI radio (7-12). Defaults to 11 — see
+    /// docs/protocols/lora_online_control_protocol.md's "RF Parameters"
+    /// section for the range-vs-airtime tradeoff behind this choice
+    /// (SF11@125kHz over the extreme SF12/7.8kHz, and well past SF7's short
+    /// range). LowDataRateOptimize is computed automatically from SF+BW, no
+    /// separate setting needed. Commissioning-time only, like sync word and
+    /// frequency — not remotely changeable, since a bad value here can leave
+    /// a node unable to hear its own "undo" command.
+    #[arg(long, env = "LORA_SF", default_value_t = 11)]
     pub sf: u8,
 
     /// LoRa bandwidth in Hz for the SPI radio (e.g. 125000)
