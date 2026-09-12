@@ -356,16 +356,22 @@ fn main() -> anyhow::Result<()> {
         &SpiConfig::new().baudrate(4.MHz().into()).data_mode(MODE_0),
     )?;
 
-    // Two mutually exclusive DIO0 completion strategies, selected at
+    // Three mutually exclusive DIO0 completion strategies, selected at
     // compile time (not runtime) since they produce genuinely different
-    // Sx127xSpi types — see Cargo.toml's dio0-interrupt feature doc
-    // comment for why the interrupt-backed one is opt-in, not the default.
+    // Sx127xSpi types — see Cargo.toml's dio0-interrupt/dio0-none feature
+    // doc comments for why the interrupt-backed one is opt-in, and why
+    // dio0-none (bypassing DIO0 entirely) exists as a diagnostic fallback.
     #[cfg(feature = "dio0-interrupt")]
     let mut radio = {
         let waiter = dio0_interrupt::Dio0Interrupt::new(dio0)?;
         Sx127xSpi::new_with_dio0_waiter(spi, reset, Delay::new_default(), waiter)
     };
-    #[cfg(not(feature = "dio0-interrupt"))]
+    #[cfg(feature = "dio0-none")]
+    let mut radio = {
+        drop(dio0);
+        Sx127xSpi::new(spi, reset, Delay::new_default())
+    };
+    #[cfg(not(any(feature = "dio0-interrupt", feature = "dio0-none")))]
     let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
 
     // Live-changeable via Setting::TxPowerDbm (see main loop's Command

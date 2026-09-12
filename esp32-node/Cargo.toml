@@ -73,6 +73,19 @@ wifi-config-portal = []
 # root-caused and fixed before turning this back on. Build with:
 #   cargo build --release --features dio0-interrupt
 dio0-interrupt = []
+# Diagnostic: skips DIO0 entirely, falling back to the original SPI
+# register (IRQ_FLAGS) polling for TX/CAD completion — slower, but
+# independent of DIO0's wiring or mapping altogether. Added 2026-09-12 to
+# isolate a field failure where radio.send() returned Ok(()) in ~0ms at
+# SF11 under BOTH DIO0 strategies (new_with_dio0 polling and
+# dio0-interrupt) — real SF11 airtime is 280ms+, and the base station
+# received nothing either way — which pointed at the shared DIO0 pin
+# itself rather than either completion-detection mechanism. If this build
+# also completes instantly, DIO0 wiring is not the cause; if it now takes
+# real airtime and packets actually arrive, DIO0 is confirmed at fault.
+# Mutually exclusive with dio0-interrupt. Build with:
+#   cargo build --release --features dio0-none
+dio0-none = []
 
 [dependencies]
 log = { version = "0.4", default-features = false }
