@@ -78,6 +78,11 @@ impl NodeConfig {
         }
     }
 
+    // Only called from wifi_config.rs's /save handler — the ack-based
+    // config-verification revert in main.rs deliberately does NOT call this
+    // (see its own comment for why), so with the wifi-config-portal feature
+    // off this has no callers at all.
+    #[cfg_attr(not(feature = "wifi-config-portal"), allow(dead_code))]
     pub fn save(&self, nvs: &mut EspNvs<NvsDefault>) -> anyhow::Result<()> {
         nvs.set_u16(KEY_ADDR, self.addr)?;
         nvs.set_u16(KEY_DEST, self.dest)?;

@@ -256,7 +256,7 @@ Both are deliberately simple compared to `Command`/`Ack`:
   `ConfigAck` isn't itself retried or relayed, and a `VQUERY` reply that
   goes unheard just means re-issuing the query or waiting for the node's
   next boot — only the boot-announcement path (see below) actually retries
-  on a missing ack, and only for the 60s config-verification window, not
+  on a missing ack, and only for the 30s config-verification window, not
   indefinitely.
 - **`VersionQuery` still relays like `Command`** (`--relay`, forwarding
   toward `target` if not addressed to this node) so a query can still reach
@@ -363,26 +363,31 @@ changing these is unchanged: edit `/etc/lora-server/env`'s
 needed. A mismatch between the two ends still means silent
 non-communication, no error on either side, so change both together.
 
-**Config verification: a node auto-heals a bad LoRa mode instead of relying
-on someone noticing.** For `CONFIG_VERIFY_WINDOW` (60s) after boot, a node
-re-sends its boot announcement (`VERSION`, see "Version Reporting" above)
-every `CONFIG_VERIFY_RETRY_INTERVAL` (10s) — several attempts, not a single
-shot, so one lost packet in either direction can't by itself cause a false
-"this config doesn't work" conclusion. `lora-server` replies to *every*
+**Config verification: a node falls back to a known-good LoRa mode for the
+current session instead of possibly staying unreachable.** For
+`CONFIG_VERIFY_WINDOW` (30s) after boot, a node re-sends its boot
+announcement (`VERSION`, see "Version Reporting" above) every
+`CONFIG_VERIFY_RETRY_INTERVAL` (10s) — several attempts, not a single shot,
+so one lost packet in either direction can't by itself cause a false "this
+config doesn't work" conclusion. `lora-server` replies to *every*
 `VersionReport` it receives (whether unprompted or a reply to its own
 `VQUERY`) with a `ConfigAck` frame — the node's only proof its current mode
 (freq/sf/bw_hz/cr/sync_word) is actually reaching the base station. If no
 `ConfigAck` arrives before the window closes, the node reverts those fields
-to `NodeConfig::standard_rf()`'s known-good values, saves that to NVS, and
-reconfigures the radio — **`addr`/`dest` are untouched**, since those are
-per-node identity/topology assigned at commissioning, not part of "the LoRa
-mode" this recovers from. The revert is persisted, so a bad config costs
-exactly one 60-second boot before self-correcting permanently — the node
-doesn't repeat the wait-then-revert cycle on every subsequent boot. Without
-the Wi-Fi portal enabled, there is currently no *live* way to move a node
-onto a non-default LoRa mode at all short of changing `default_config()`'s
-consts and reflashing — its eventual replacement (a LoRa-triggered settings
-mode) isn't built yet.
+to `NodeConfig::standard_rf()`'s known-good values and reconfigures the
+radio — **`addr`/`dest` are untouched**, since those are per-node identity/
+topology assigned at commissioning, not part of "the LoRa mode" this
+recovers from. **The revert is deliberately NOT saved to NVS** — it only
+holds for the rest of the current boot. A power cycle loads the original
+value straight from NVS again and re-runs the same 30-second check from
+scratch, so a single bad reading (e.g. a burst of interference right at
+boot) can't quietly lock a node onto "standard" forever; a config that's
+actually broken just reverts again on every boot until it's fixed at the
+source (reflashed `default_config()`, or the Wi-Fi portal / a future
+settings mode). Without the Wi-Fi portal enabled, there is currently no
+*live* way to move a node onto a non-default LoRa mode at all short of
+changing `default_config()`'s consts and reflashing — its eventual
+replacement (a LoRa-triggered settings mode) isn't built yet.
 
 **Available values, for the portal/env file:**
 

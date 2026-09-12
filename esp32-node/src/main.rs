@@ -2,12 +2,15 @@
 //!
 //! Normal operation starts immediately from whatever's in NVS (or the
 //! defaults on first boot) — no boot-time Wi-Fi window by default. Instead,
-//! the radio's current LoRa mode (freq/sf/bw_hz/cr/sync_word) has 60 seconds
+//! the radio's current LoRa mode (freq/sf/bw_hz/cr/sync_word) has 30 seconds
 //! after boot to earn a `ConfigAck` from the base station (see
 //! `CONFIG_VERIFY_WINDOW` below and docs/protocols/lora_online_control_protocol.md,
 //! "RF Parameters"); if none arrives, it's reverted to a known-good standard
-//! mode and saved, so a bad experimental value can't strand a node
-//! indefinitely. The old Wi-Fi config portal (wifi_config.rs) that used to
+//! mode *for the rest of this boot only* — NVS is untouched, so a power
+//! cycle tries the original saved value again from scratch, rather than the
+//! node quietly getting stuck on "standard" forever after one bad reading
+//! (e.g. a stretch of interference right at boot). The old Wi-Fi config
+//! portal (wifi_config.rs) that used to
 //! be the only way to change these still exists, just disabled by default —
 //! see Cargo.toml's `wifi-config-portal` feature. Reads punches from the SI
 //! master over USB (cp210x.rs + sportident.rs) and relays them to the base
@@ -80,11 +83,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a freshly booted node gives its current LoRa mode to earn a
 /// `ConfigAck` from the base station before giving up and reverting to
-/// `NodeConfig::standard_rf()` (see main()). 60s, not some fraction of a
-/// second — LoRa drops packets routinely, and both the outbound boot
-/// announcement and the inbound ack can each be lost independently, so this
-/// needs enough margin for several retries, not just one round trip.
-const CONFIG_VERIFY_WINDOW: Duration = Duration::from_secs(60);
+/// `NodeConfig::standard_rf()` for the rest of this boot (see main()). 30s,
+/// not some fraction of a second — LoRa drops packets routinely, and both
+/// the outbound boot announcement and the inbound ack can each be lost
+/// independently, so this needs enough margin for a few retries, not just
+/// one round trip.
+const CONFIG_VERIFY_WINDOW: Duration = Duration::from_secs(30);
 
 /// How often the boot announcement is re-sent while still waiting on a
 /// `ConfigAck` — several attempts across `CONFIG_VERIFY_WINDOW` rather than
@@ -436,15 +440,20 @@ fn main() -> anyhow::Result<()> {
                 // trusted to stay reachable on it). addr/dest are untouched
                 // (see standard_rf()'s doc comment) — only the modem
                 // parameters revert.
+                //
+                // Deliberately NOT saved to NVS — this is a this-boot-only
+                // fallback, not a permanent correction. A power cycle loads
+                // the original (possibly-fine, possibly-still-bad) value
+                // from NVS again and re-runs this same check from scratch,
+                // rather than a single bad reading (e.g. a burst of
+                // interference right at boot) quietly locking the node onto
+                // "standard" forever.
                 log::warn!(
-                    "no config ack within {}s, reverting LoRa mode to standard",
+                    "no config ack within {}s, reverting LoRa mode to standard for this boot",
                     CONFIG_VERIFY_WINDOW.as_secs()
                 );
-                persistent_log::append(&mut nvs.lock().unwrap(), "config unverified: reverted to standard");
+                persistent_log::append(&mut nvs.lock().unwrap(), "config unverified: reverted to standard (this boot only)");
                 current = current.standard_rf();
-                if let Err(e) = current.save(&mut nvs.lock().unwrap()) {
-                    log::error!("failed to persist reverted config: {:?}", e);
-                }
                 radio_config = RadioConfig {
                     freq_hz: current.freq_hz,
                     addr: current.addr,
