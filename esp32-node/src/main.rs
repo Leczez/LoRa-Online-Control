@@ -30,12 +30,16 @@
 //! comes up, before anything that could hang — see Cargo.toml's
 //! debug-console feature. Never flash that build to a real field node.
 //!
-//! DIO0 completion detection defaults to `new_with_dio0`'s plain GPIO
-//! polling. `dio0_interrupt.rs` offers a real-hardware-interrupt
-//! alternative (`dio0-interrupt` feature, opt-in) — a field test found it
-//! completing sends in ~10ms at SF11 (real CAD+TX takes 280ms+), i.e.
-//! reporting success without actually transmitting; see that feature's own
-//! doc comment in Cargo.toml before re-enabling it.
+//! TX/CAD completion is detected via plain SPI IRQ_FLAGS polling
+//! (`Sx127xSpi::new()`), not DIO0 — matching lora-server's own default
+//! (it only wires DIO0 when given `--dio0-pin`, which the deployed base
+//! station doesn't pass). Both DIO0 strategies tried here (GPIO-level
+//! polling and a real interrupt) showed radio.send() reporting success in
+//! ~10ms at SF11 (real CAD+TX takes 280ms+) without anything actually
+//! reaching the base station, on 2026-09-12 field tests; SPI-only polling
+//! is slower per completion check but doesn't depend on DIO0 wiring at
+//! all. See git history (esp32_node_field_hardware memory / this repo's
+//! commit log around that date) before reintroducing DIO0 here.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for
@@ -66,10 +70,6 @@ mod config;
 // feature and main()'s own comment at that call site.
 #[cfg_attr(feature = "debug-console", allow(dead_code))]
 mod cp210x;
-// Off by default — see its own doc comment and Cargo.toml's dio0-interrupt
-// feature for why.
-#[cfg(feature = "dio0-interrupt")]
-mod dio0_interrupt;
 mod persistent_log;
 mod protocol;
 mod psram;
@@ -351,11 +351,9 @@ fn main() -> anyhow::Result<()> {
     let sdi = pins.gpio13; // MISO
     let cs = pins.gpio10; // NSS
     let reset = PinDriver::output(pins.gpio9)?;
-    // DIO0 (GPIO7 — GPIO14/15/16 are SMD probe points on this board, not
-    // usable header pins, see the wiring doc) is now physically connected,
-    // so completion (TX/CAD) is detected via this pin instead of polling
-    // IRQ_FLAGS over SPI.
-    let dio0 = PinDriver::input(pins.gpio7)?;
+    // DIO0 (GPIO7) is physically wired but deliberately unused — see this
+    // file's top doc comment: TX/CAD completion is detected via plain SPI
+    // IRQ_FLAGS polling instead, matching lora-server's own default.
 
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
@@ -370,23 +368,10 @@ fn main() -> anyhow::Result<()> {
         &SpiConfig::new().baudrate(4.MHz().into()).data_mode(MODE_0),
     )?;
 
-    // Three mutually exclusive DIO0 completion strategies, selected at
-    // compile time (not runtime) since they produce genuinely different
-    // Sx127xSpi types — see Cargo.toml's dio0-interrupt/dio0-none feature
-    // doc comments for why the interrupt-backed one is opt-in, and why
-    // dio0-none (bypassing DIO0 entirely) exists as a diagnostic fallback.
-    #[cfg(feature = "dio0-interrupt")]
-    let mut radio = {
-        let waiter = dio0_interrupt::Dio0Interrupt::new(dio0)?;
-        Sx127xSpi::new_with_dio0_waiter(spi, reset, Delay::new_default(), waiter)
-    };
-    #[cfg(feature = "dio0-none")]
-    let mut radio = {
-        drop(dio0);
-        Sx127xSpi::new(spi, reset, Delay::new_default())
-    };
-    #[cfg(not(any(feature = "dio0-interrupt", feature = "dio0-none")))]
-    let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
+    // No DIO0 — TX/CAD completion is detected via plain SPI IRQ_FLAGS
+    // polling, matching lora-server's own default (see this file's top doc
+    // comment for why DIO0 was dropped).
+    let mut radio = Sx127xSpi::new(spi, reset, Delay::new_default());
 
     // Live-changeable via Setting::TxPowerDbm (see main loop's Command
     // dispatch) — not persisted, resets to DEFAULT_TX_POWER_DBM on reboot.

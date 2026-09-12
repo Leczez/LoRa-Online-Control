@@ -55,37 +55,6 @@ debug-console = []
 # apply it). Build with:
 #   cargo build --release --features wifi-config-portal
 wifi-config-portal = []
-# Swaps DIO0 completion detection (dio0_interrupt.rs) from new_with_dio0's
-# plain GPIO-level polling to a genuine hardware interrupt + FreeRTOS task
-# notification (sx127x::DioWait) — the CPU actually blocks/idles between
-# checks instead of periodically re-reading the pin.
-#
-# Back to opt-in (was briefly default): a field test with this on showed
-# radio.send() completing in ~10ms per call at SF11/125kHz, where a real
-# CAD+TX cycle takes 280ms+ (preamble alone is ~200ms at SF11) — i.e.
-# wait_high() was returning Ok(true) almost instantly instead of waiting
-# for a genuine DIO0 edge, so every send silently transmitted nothing
-# while reporting success (no errors logged, nothing ever reached the base
-# station). Most likely a stale/latched GPIO interrupt being picked up by
-# enable_interrupt() right after the DIO_MAPPING1 remap, rather than a
-# fresh edge — unconfirmed, since this still can't be built/tested in the
-# sandbox that wrote it (no xtensa/esp-idf toolchain there). Needs that
-# root-caused and fixed before turning this back on. Build with:
-#   cargo build --release --features dio0-interrupt
-dio0-interrupt = []
-# Diagnostic: skips DIO0 entirely, falling back to the original SPI
-# register (IRQ_FLAGS) polling for TX/CAD completion — slower, but
-# independent of DIO0's wiring or mapping altogether. Added 2026-09-12 to
-# isolate a field failure where radio.send() returned Ok(()) in ~0ms at
-# SF11 under BOTH DIO0 strategies (new_with_dio0 polling and
-# dio0-interrupt) — real SF11 airtime is 280ms+, and the base station
-# received nothing either way — which pointed at the shared DIO0 pin
-# itself rather than either completion-detection mechanism. If this build
-# also completes instantly, DIO0 wiring is not the cause; if it now takes
-# real airtime and packets actually arrive, DIO0 is confirmed at fault.
-# Mutually exclusive with dio0-interrupt. Build with:
-#   cargo build --release --features dio0-none
-dio0-none = []
 
 [dependencies]
 log = { version = "0.4", default-features = false }
