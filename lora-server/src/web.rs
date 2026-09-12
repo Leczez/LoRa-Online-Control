@@ -474,6 +474,29 @@ pub fn spawn_server(
                             _ => Response::from_string("missing/invalid target/heartbeat_interval_secs").with_status_code(400),
                         }
                     }
+                    // Generic counterpart to /cmd for any Setting (see
+                    // protocol.rs) — form field `setting` is the same
+                    // key=value text Setting::encode() produces (e.g.
+                    // "sf=11", "settings_mode=1"), validated here so a typo
+                    // 400s immediately instead of silently vanishing into
+                    // the command channel with no feedback.
+                    (Method::Post, "/setcfg") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match (
+                            form.get("target").and_then(|s| s.parse::<u16>().ok()),
+                            form.get("setting").and_then(|s| crate::protocol::Setting::parse(s)),
+                        ) {
+                            (Some(target), Some(setting)) => {
+                                match cmd_tx.send(format!("SETCFG {} {}", target, setting.encode())) {
+                                    Ok(()) => Response::from_string("ok"),
+                                    Err(_) => command_channel_down(),
+                                }
+                            }
+                            _ => Response::from_string("missing/invalid target/setting").with_status_code(400),
+                        }
+                    }
                     // Returns the same small "Sent. Back" HTML as /testpunch
                     // (not a bare "ok" like /setdest, /cmd, etc.) since this
                     // is driven by an actual browser form submission in the
@@ -617,6 +640,26 @@ mod tests {
 
         ureq::post(&format!("http://{listen}/queryversion")).send_string("target=10").unwrap();
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "QUERYVERSION 10");
+    }
+
+    /// /setcfg is the generic counterpart to /cmd for any Setting (see
+    /// protocol.rs) — a valid target+setting reaches the command channel
+    /// exactly as SETCFG's own parser expects, and an unrecognized setting
+    /// key 400s immediately rather than silently vanishing.
+    #[test]
+    fn test_setcfg_endpoint_drives_command_channel_and_rejects_bad_setting() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        let listen = free_listen_addr();
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
+
+        ureq::post(&format!("http://{listen}/setcfg")).send_string("target=10&setting=sf=11").unwrap();
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "SETCFG 10 sf=11");
+
+        let bad = ureq::post(&format!("http://{listen}/setcfg")).send_string("target=10&setting=nonsense=1");
+        assert_eq!(bad.unwrap_err().into_response().unwrap().status(), 400);
+        assert!(cmd_rx.recv_timeout(Duration::from_millis(200)).is_err(), "an unrecognized setting must not reach the command channel");
     }
 
     /// /sendbin is the byte-safe counterpart to /send (see HttpRadio::send

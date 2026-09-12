@@ -137,6 +137,19 @@ pub trait Radio: Send {
         let frame = Frame::VersionQuery { target };
         self.send(target, frame.encode().as_bytes())
     }
+
+    /// Generic counterpart to send_command for any `Setting` (see
+    /// protocol.rs's module doc comment for which settings this is
+    /// actually for — the settings-mode-gated ones — and why). Same
+    /// direct-hardware-vs-daemon split: this default impl is fire-and-forget
+    /// (a direct-hardware session has no retry-tracked pending_commands of
+    /// its own — see run_daemon_loop); the daemon's HttpRadio hands it off
+    /// to the daemon itself instead (POST /setcfg — web.rs), which owns
+    /// retry-with-ack tracking the same way it already does for CMD.
+    fn send_setting(&mut self, commander: u16, target: u16, setting: Setting) -> Result<()> {
+        let frame = Frame::Command { target, commander, setting };
+        self.send(target, frame.encode().as_bytes())
+    }
 }
 
 // ── Config builder ────────────────────────────────────────────────────────────
@@ -638,6 +651,23 @@ fn run_daemon_loop(
                         pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
                     }
                 }
+            } else if let Some(rest) = cmd.strip_prefix("SETCFG ") {
+                // Generic counterpart to CMD, additive rather than a
+                // replacement for it — reuses the same retry/ack tracking
+                // for any Setting via Setting::parse's own key=value
+                // encoding, rather than needing a hardcoded field per
+                // setting the way CMD's own hb_interval shorthand is. See
+                // protocol.rs's module doc comment for which settings this
+                // is actually for (the settings-mode-gated ones) and why.
+                let mut parts = rest.splitn(2, ' ');
+                if let (Some(target_str), Some(setting_str)) = (parts.next(), parts.next()) {
+                    if let (Ok(target), Some(setting)) = (target_str.parse::<u16>(), Setting::parse(setting_str)) {
+                        send_command_frame(radio.as_mut(), &state, dest, target, own_addr, setting);
+                        pending_commands.push(PendingCommand { target, setting, sent_at: Instant::now(), attempts: 1 });
+                    } else {
+                        log::error!("SETCFG command had invalid target or setting: {:?}", rest);
+                    }
+                }
             } else if let Some(rest) = cmd.strip_prefix("QUERYVERSION ") {
                 if let Ok(target) = rest.trim().parse::<u16>() {
                     // Fire-and-forget, unlike CMD's retry-tracked
@@ -932,21 +962,39 @@ fn run_daemon_loop(
                     if let Some(frame) = Frame::parse(&payload) {
                     match frame {
                         Frame::Command { target, commander, setting } if target == own_addr => {
-                            match setting {
+                            // Only HeartbeatIntervalSecs is actually
+                            // applicable to this daemon itself — the
+                            // settings-mode-gated fields (and TxPowerDbm)
+                            // exist for esp32-node targets, since
+                            // lora-server's own radio parameters are
+                            // commissioning-time CLI args, not runtime-
+                            // reconfigurable. No ack for anything
+                            // unsupported, same as any other out-of-scope
+                            // command — the commander's own retry/no-ack
+                            // display is the signal that this daemon isn't
+                            // the right target for that setting.
+                            let applied = match setting {
                                 Setting::HeartbeatIntervalSecs(secs) => {
                                     heartbeat_period = (secs > 0).then(|| Duration::from_secs(secs as u64));
                                     log::info!("heartbeat interval changed to {}s by command from {}", secs, pkt.src_addr);
+                                    true
                                 }
+                                _ => {
+                                    log::warn!("ignoring unsupported setting {:?} from {}", setting, pkt.src_addr);
+                                    false
+                                }
+                            };
+                            if applied {
+                                // Ack names the true commander (so a relay
+                                // downstream of it knows where to forward this)
+                                // but is transmitted to whoever handed us this
+                                // packet, same pattern as the binary punch ack.
+                                let ack = Frame::Ack { origin: own_addr, commander, setting };
+                                if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
+                                    log::error!("failed to ack command: {}", e);
+                                }
+                                log_event(&state, format!("CMDAPPLIED {} {}", commander, setting.encode()));
                             }
-                            // Ack names the true commander (so a relay
-                            // downstream of it knows where to forward this)
-                            // but is transmitted to whoever handed us this
-                            // packet, same pattern as the binary punch ack.
-                            let ack = Frame::Ack { origin: own_addr, commander, setting };
-                            if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
-                                log::error!("failed to ack command: {}", e);
-                            }
-                            log_event(&state, format!("CMDAPPLIED {} {}", commander, setting.encode()));
                         }
                         Frame::Command { target, .. } if relay => {
                             // Not addressed to us — pass it on toward the
@@ -1305,6 +1353,15 @@ impl Radio for HttpRadio {
         ureq::post(&format!("{}/setcompetitionid", self.base_url))
             .send_string(&format!("competition_id={}", id))
             .map_err(|e| anyhow::anyhow!("POST /setcompetitionid failed: {}", e))?;
+        Ok(())
+    }
+
+    fn send_setting(&mut self, _commander: u16, target: u16, setting: Setting) -> Result<()> {
+        // Same reasoning as send_command above — the daemon fills in its
+        // own address as commander.
+        ureq::post(&format!("{}/setcfg", self.base_url))
+            .send_string(&format!("target={}&setting={}", target, setting.encode()))
+            .map_err(|e| anyhow::anyhow!("POST /setcfg failed: {}", e))?;
         Ok(())
     }
 }
@@ -1971,6 +2028,43 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "QUERYVERSION command never produced a VQUERY send");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(cmd_tx);
+    }
+
+    /// SETCFG is the generic counterpart to CMD (see protocol.rs's module
+    /// doc comment) — proves it reaches a real run_daemon_loop and produces
+    /// a Command frame carrying whatever Setting it was given, not just
+    /// HeartbeatIntervalSecs.
+    #[test]
+    fn test_run_daemon_loop_sends_command_frame_on_setcfg() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let radio: Box<dyn Radio> = Box::new(FakeRadio { sent: Vec::new(), to_receive: Default::default() });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        cmd_tx.send("SETCFG 10 sf=11".to_string()).unwrap();
+
+        let expected_frame = Frame::Command { target: 10, commander: 2, setting: Setting::Sf(11) };
+        let expected_tx = format!("TX 1 {}", expected_frame.encode());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sent = state_for_check.lock().unwrap().log.iter().any(|e| e.line == expected_tx);
+            if sent {
+                break;
+            }
+            assert!(Instant::now() < deadline, "SETCFG command never produced a Command send");
             std::thread::sleep(Duration::from_millis(10));
         }
 

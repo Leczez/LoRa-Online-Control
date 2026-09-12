@@ -220,6 +220,10 @@ host.
 - `POST /cmd` (form: `target`, `heartbeat_interval_secs`) — originates a
   Command Packet (see below) toward `target`, tracked with the same
   retry/ack bookkeeping any command gets.
+- `POST /setcfg` (form: `target`, `setting` — the same `key=value` text
+  `Setting::encode()` produces, e.g. `sf=11`, `settings_mode=1`) — generic
+  counterpart to `/cmd` for any `Setting`, not just heartbeat interval; this
+  is what drives a settings-mode session (see "Command Packets" below).
 - `POST /clearpunch` (form: `id`) — permanently abandons one unsent local
   punch (a genuine delete, not mark-sent, since it was never actually
   delivered). If that punch happens to be the one currently in flight (mid
@@ -264,25 +268,49 @@ limitation as noted under Relay Nodes below).
 
 ## Command Packets
 
-The base station needs a way to change limited settings on a deployed node
-(heartbeat interval, TX power) without physically hiking back out to it.
-This is a new **downlink** direction — everything else in this protocol is
-uplink (node → base station) — addressed to one node's LoRa address at a
-time, matching the addressing scheme above.
+The base station needs a way to change settings on a deployed node without
+physically hiking back out to it. This is a new **downlink** direction —
+everything else in this protocol is uplink (node → base station) —
+addressed to one node's LoRa address at a time, matching the addressing
+scheme above.
 
 - **Half-duplex constraint.** These radios can't transmit and receive
   simultaneously, so a node can't be commanded mid-transmit. A node opens a
   short listen window after each uplink send (heartbeat or punch) to check
   for a pending command before returning to its normal receive/sleep cycle.
-- **Acknowledge before applying.** The base station doesn't consider a
+- **Acknowledge confirms applied.** The base station doesn't consider a
   command delivered until the node acks it; LoRa drops packets, so a
   command with no ack gets retried, not assumed to have landed.
-- **Scope stays narrow.** Only settings that can't strand the node are
-  remotely changeable — heartbeat interval, TX power. Anything that
-  affects the radio link itself (spreading factor, bandwidth, frequency)
-  is out of scope for remote command: a bad change can leave a node unable
-  to ever hear the "undo" instruction, and it can only be fixed by physical
-  access again. Those settings stay commissioning-time only.
+- **Two tiers, split by whether a bad value can strand the node.**
+  `HeartbeatIntervalSecs`/`TxPowerDbm` apply immediately, any time — worst
+  case is a weaker signal or a noisier log, not a lost link. Everything
+  that affects reachability itself — `Addr`/`Dest`/`FreqHz`/`SyncWord`/
+  `Sf`/`BwHz`/`Cr` — only applies inside a **settings-mode session**:
+    - The base station sends `Setting::SettingsMode(true)` to a target
+      node. The node acks and starts staging changes into an in-memory
+      working copy — the *live* radio config is untouched, so an
+      in-progress session can never itself break the ongoing command
+      exchange, even when the field being staged is the sync word or SF.
+    - Any number of `Setting::Addr`/`Dest`/`FreqHz`/`SyncWord`/`Sf`/`BwHz`/
+      `Cr` commands stage into that working copy, each acked individually.
+      A field outside its valid range (SF outside 7-12, an unsupported
+      bandwidth/coding-rate value) or sent while not in settings mode gets
+      no ack at all — the same "no ack, retry or investigate" signal as
+      any other dropped command, not a distinct error frame.
+    - `Setting::SettingsMode(false)` saves the staged config to NVS, acks,
+      then **reboots the node** — there is no "apply without rebooting"
+      path, since a NodeConfig is loaded once, at boot, before the radio is
+      configured. This isn't a wrinkle to route around, though: it's what
+      makes the whole feature safe, because rebooting runs the new config
+      straight into the existing post-boot ack-verification window (see
+      "RF Parameters" below) — a bad value self-reverts after one
+      30-second boot instead of stranding the node the way an unrecoverable
+      remote change used to. This is why RF/addressing settings are safe to
+      expose over LoRa at all now, when they weren't before that mechanism
+      existed.
+  `lora-tui`'s `/settingsmode <addr> on|off` and `/setcfg <addr> <key>=<val>`
+  (or the web dashboard's equivalents, `POST /setcfg`) drive this from the
+  base station side.
 
 ## Version Reporting
 
@@ -447,11 +475,10 @@ value straight from NVS again and re-runs the same 30-second check from
 scratch, so a single bad reading (e.g. a burst of interference right at
 boot) can't quietly lock a node onto "standard" forever; a config that's
 actually broken just reverts again on every boot until it's fixed at the
-source (reflashed `default_config()`, or the Wi-Fi portal / a future
-settings mode). Without the Wi-Fi portal enabled, there is currently no
-*live* way to move a node onto a non-default LoRa mode at all short of
-changing `default_config()`'s consts and reflashing — its eventual
-replacement (a LoRa-triggered settings mode) isn't built yet.
+source — reflashed `default_config()`, the Wi-Fi portal (if enabled), or a
+LoRa-triggered settings-mode session (see "Command Packets" above), which
+is now the default way to move a node onto a non-default LoRa mode without
+physical access at all.
 
 **Available values, for the portal/env file:**
 

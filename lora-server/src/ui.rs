@@ -24,6 +24,9 @@ const HELP_TEXT: &[&str] = &[
     "  /dest <addr>                        change the address sent traffic targets",
     "  /addr <addr>                        change this session's own displayed address",
     "  /cmd <target-addr> <heartbeat-secs>  ask a node to change its heartbeat interval",
+    "  /settingsmode <target-addr> on|off   enter/exit settings mode on a node (exiting reboots it)",
+    "  /setcfg <target-addr> <key>=<val>    stage a config field while a node is in settings mode",
+    "    keys: addr, dest, freq_hz, sync_word, sf, bw_hz, cr, tx_power_dbm",
     "  /queryversion <target-addr>          ask a node to report its firmware version",
     "  /competitionid <id>                  change the competition id pushed to roc-server",
     "  /testpunch <card_id> <station> <time_s>  inject a synthetic test punch",
@@ -397,6 +400,47 @@ pub fn run_app(
                                         None => app.push_log(LogEntry::Error {
                                             timestamp: ts,
                                             message: "usage: /cmd <target-addr> <heartbeat-secs>".to_string(),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/settingsmode ") {
+                                    let mut parts = val.trim().splitn(2, ' ');
+                                    let parsed = parts.next().zip(parts.next()).and_then(|(t, onoff)| {
+                                        let enable = match onoff {
+                                            "on" => Some(true),
+                                            "off" => Some(false),
+                                            _ => None,
+                                        }?;
+                                        Some((t.parse::<u16>().ok()?, enable))
+                                    });
+                                    match parsed {
+                                        Some((target, enable)) => {
+                                            let setting = crate::protocol::Setting::SettingsMode(enable);
+                                            match radio.send_setting(app.addr, target, setting) {
+                                                Ok(()) => app.push_log(LogEntry::Tx {
+                                                    timestamp: ts, dest_addr: target, payload: setting.encode(),
+                                                }),
+                                                Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                            }
+                                        }
+                                        None => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /settingsmode <target-addr> on|off".to_string(),
+                                        }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/setcfg ") {
+                                    let mut parts = val.trim().splitn(2, ' ');
+                                    let parsed = parts.next().zip(parts.next())
+                                        .and_then(|(t, kv)| Some((t.parse::<u16>().ok()?, crate::protocol::Setting::parse(kv)?)));
+                                    match parsed {
+                                        Some((target, setting)) => match radio.send_setting(app.addr, target, setting) {
+                                            Ok(()) => app.push_log(LogEntry::Tx {
+                                                timestamp: ts, dest_addr: target, payload: setting.encode(),
+                                            }),
+                                            Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                        },
+                                        None => app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /setcfg <target-addr> <key>=<val> (addr, dest, freq_hz, sync_word, sf, bw_hz, cr, tx_power_dbm)".to_string(),
                                         }),
                                     }
                                 } else if let Some(val) = msg.strip_prefix("/queryversion ") {

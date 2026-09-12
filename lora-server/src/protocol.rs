@@ -3,10 +3,24 @@
 // Wire format for the control-plane frames layered on top of the existing
 // binary PUNCH/HB payloads (see sportident.rs and backend.rs) and the
 // binary PunchAck below: a downlink `CMD` frame lets the base station
-// change a limited set of settings on a specific node, and an uplink `ACK`
-// frame confirms it landed. Scope is deliberately narrow — only settings
-// that can't strand a node if misapplied (see the protocol doc's "Command
-// Packets" section) get a `Setting` variant here.
+// change a setting on a specific node, and an uplink `ACK` frame confirms
+// it landed.
+//
+// Two tiers of `Setting`, gated on the *receiving* node's end (see
+// esp32-node/src/main.rs), not here:
+//
+// - `HeartbeatIntervalSecs`/`TxPowerDbm` apply immediately, any time — a
+//   bad value here can't strand a node (see the protocol doc's "Command
+//   Packets" section).
+// - `SettingsMode`/`Addr`/`Dest`/`FreqHz`/`SyncWord`/`Sf`/`BwHz`/`Cr` only
+//   apply while the target node is in settings mode (entered/exited via
+//   `SettingsMode`, itself just another `Setting`) — these can affect
+//   reachability itself, so a node stages them into a pending copy rather
+//   than applying live, and only commits (save + reboot) on exit. The
+//   reboot's own post-boot ack-verification window (see "RF Parameters" in
+//   the protocol doc) is what makes this safe: a bad value self-reverts
+//   after one 30-second boot instead of stranding the node the way it
+//   would have before that mechanism existed.
 //
 // `Frame` itself stays plain ASCII text — every variant here is sent at
 // most a handful of times per node per session (a boot announcement, an
@@ -21,12 +35,38 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
     HeartbeatIntervalSecs(u32),
+    /// 2-20 dBm — see sx127x::Config::tx_power_dbm's own doc comment for the
+    /// PA_BOOST range this clamps into. Applies immediately; can't strand a
+    /// node (worst case is a weaker/stronger signal, not a lost link).
+    TxPowerDbm(i8),
+    /// Downlink only in practice (a node has no reason to ever send this
+    /// uplink) — enters (`true`) or exits (`false`) settings mode on the
+    /// target. See this module's doc comment above and
+    /// esp32-node/src/main.rs for what that actually does.
+    SettingsMode(bool),
+    /// Settings-mode-gated — see this module's doc comment.
+    Addr(u16),
+    Dest(u16),
+    FreqHz(u32),
+    SyncWord(u8),
+    Sf(u8),
+    BwHz(u32),
+    Cr(u8),
 }
 
 impl Setting {
     pub fn encode(&self) -> String {
         match self {
             Setting::HeartbeatIntervalSecs(v) => format!("hb_interval={}", v),
+            Setting::TxPowerDbm(v) => format!("tx_power_dbm={}", v),
+            Setting::SettingsMode(v) => format!("settings_mode={}", if *v { 1 } else { 0 }),
+            Setting::Addr(v) => format!("addr={}", v),
+            Setting::Dest(v) => format!("dest={}", v),
+            Setting::FreqHz(v) => format!("freq_hz={}", v),
+            Setting::SyncWord(v) => format!("sync_word={}", v),
+            Setting::Sf(v) => format!("sf={}", v),
+            Setting::BwHz(v) => format!("bw_hz={}", v),
+            Setting::Cr(v) => format!("cr={}", v),
         }
     }
 
@@ -34,6 +74,19 @@ impl Setting {
         let (key, val) = s.split_once('=')?;
         match key {
             "hb_interval" => Some(Setting::HeartbeatIntervalSecs(val.parse().ok()?)),
+            "tx_power_dbm" => Some(Setting::TxPowerDbm(val.parse().ok()?)),
+            "settings_mode" => match val {
+                "1" => Some(Setting::SettingsMode(true)),
+                "0" => Some(Setting::SettingsMode(false)),
+                _ => None,
+            },
+            "addr" => Some(Setting::Addr(val.parse().ok()?)),
+            "dest" => Some(Setting::Dest(val.parse().ok()?)),
+            "freq_hz" => Some(Setting::FreqHz(val.parse().ok()?)),
+            "sync_word" => Some(Setting::SyncWord(val.parse().ok()?)),
+            "sf" => Some(Setting::Sf(val.parse().ok()?)),
+            "bw_hz" => Some(Setting::BwHz(val.parse().ok()?)),
+            "cr" => Some(Setting::Cr(val.parse().ok()?)),
             _ => None,
         }
     }
@@ -212,6 +265,39 @@ mod tests {
         assert_eq!(Frame::parse("CMD 5 1 hb_interval=notanumber"), None);
         assert_eq!(Frame::parse("CMD 5"), None);
         assert_eq!(Frame::parse("CMD 5 1"), None);
+    }
+
+    #[test]
+    fn test_settings_mode_gated_settings_round_trip() {
+        for setting in [
+            Setting::TxPowerDbm(17),
+            Setting::SettingsMode(true),
+            Setting::SettingsMode(false),
+            Setting::Addr(10),
+            Setting::Dest(1),
+            Setting::FreqHz(433_000_000),
+            Setting::SyncWord(0x12),
+            Setting::Sf(11),
+            Setting::BwHz(125_000),
+            Setting::Cr(5),
+        ] {
+            assert_eq!(Setting::parse(&setting.encode()), Some(setting), "{:?}", setting);
+        }
+    }
+
+    #[test]
+    fn test_settings_mode_encoding_uses_1_and_0() {
+        assert_eq!(Setting::SettingsMode(true).encode(), "settings_mode=1");
+        assert_eq!(Setting::SettingsMode(false).encode(), "settings_mode=0");
+        assert_eq!(Setting::parse("settings_mode=2"), None);
+    }
+
+    #[test]
+    fn test_command_round_trips_with_settings_mode_gated_setting() {
+        let frame = Frame::Command { target: 5, commander: 1, setting: Setting::Sf(11) };
+        let encoded = frame.encode();
+        assert_eq!(encoded, "CMD 5 1 sf=11");
+        assert_eq!(Frame::parse(&encoded), Some(frame));
     }
 
     #[test]
