@@ -28,7 +28,7 @@ debug = true
 opt-level = "z"
 
 [features]
-default = ["std", "esp-idf-svc/native"]
+default = ["std", "esp-idf-svc/native", "dio0-interrupt"]
 std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
 # Bench/debug build: skips cp210x::install() and the SI-reader thread
 # entirely (main.rs), so the native USB port stays in device/console mode
@@ -58,18 +58,18 @@ wifi-config-portal = []
 # Swaps DIO0 completion detection (dio0_interrupt.rs) from new_with_dio0's
 # plain GPIO-level polling to a genuine hardware interrupt + FreeRTOS task
 # notification (sx127x::DioWait) — the CPU actually blocks/idles between
-# checks instead of periodically re-reading the pin, at the cost of using
-# ESP-IDF's GPIO ISR machinery, which is inherently harder to get exactly
-# right than a plain level read. Off by default deliberately: this is
-# unverified by any real build as of the commit that added it (no
-# xtensa/esp-idf toolchain in the sandbox that wrote it) and swapping the
-# active DIO0 strategy while an unrelated radio-reliability issue is being
-# actively debugged would add a new variable to that investigation. Try it
-# once the underlying reliability question (see
-# docs/protocols/lora_online_control_protocol.md's "RF Parameters" section
-# and sx127x::Config::cad_timeout_us/tx_timeout_us) is settled, not before.
-# Build with:
-#   cargo build --release --features dio0-interrupt
+# checks instead of periodically re-reading the pin. On by default as of
+# the commit that made it so: the SF/BW-aware timeout fix
+# (sx127x::Config::cad_timeout_us/tx_timeout_us) alone didn't resolve the
+# field reliability issue this was built to help investigate, so this is
+# now the active path rather than an opt-in experiment. Still unverified
+# by any real build as of that same commit (no xtensa/esp-idf toolchain in
+# the sandbox that wrote it) — the exact esp-idf-hal/esp-idf-svc API calls
+# in dio0_interrupt.rs (subscribe/enable_interrupt/Notification::wait/
+# TickType::new_millis) need confirming against a real `cargo build
+# --release` before trusting this around a real interrupt. To fall back to
+# the plain-polling path for comparison:
+#   cargo build --release --no-default-features --features std,esp-idf-svc/native
 dio0-interrupt = []
 
 [dependencies]

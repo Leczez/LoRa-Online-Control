@@ -30,10 +30,11 @@
 //! comes up, before anything that could hang — see Cargo.toml's
 //! debug-console feature. Never flash that build to a real field node.
 //!
-//! `--features dio0-interrupt` swaps DIO0 completion detection from plain
-//! GPIO polling to a real hardware interrupt (see dio0_interrupt.rs) — off
-//! by default and unverified by any build; see that feature's own doc
-//! comment in Cargo.toml before enabling it.
+//! DIO0 completion detection (see dio0_interrupt.rs) uses a real hardware
+//! interrupt by default (`dio0-interrupt` feature, on by default) rather
+//! than `new_with_dio0`'s plain GPIO polling — still unverified by any real
+//! build; see that feature's own doc comment in Cargo.toml, including how
+//! to build the plain-polling variant instead for comparison.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for

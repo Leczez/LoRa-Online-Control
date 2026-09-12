@@ -2,9 +2,10 @@
 //! board's DIO0 pin (GPIO7 — see the wiring doc) — see `DioWait`'s own doc
 //! comment in the `sx127x` crate for why this exists: a genuine blocking
 //! wait, letting the CPU actually idle between checks, instead of
-//! `new_with_dio0`'s plain-`InputPin` polling (which still works fine and
-//! is what this firmware uses unless the `dio0-interrupt` feature is on —
-//! see Cargo.toml's own doc comment on that feature for why it's opt-in).
+//! `new_with_dio0`'s plain-`InputPin` polling. On by default (`dio0-
+//! interrupt` feature) — see Cargo.toml's own doc comment on that feature
+//! for why, and how to build the plain-polling variant instead if this
+//! needs to be ruled in or out during field debugging.
 //!
 //! Built on esp-idf-hal's GPIO interrupt support
 //! (`PinDriver::set_interrupt_type`/`subscribe`/`enable_interrupt`) and
