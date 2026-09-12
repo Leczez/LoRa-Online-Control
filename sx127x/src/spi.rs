@@ -56,9 +56,6 @@ const IRQ_CAD_DETECTED: u8 = 0x01;
 const DIO0_MAPPING_TXDONE: u8 = 0x40;
 const DIO0_MAPPING_CADDONE: u8 = 0x80;
 
-const TX_POLL_ITERATIONS: u32 = 100_000;
-const CAD_POLL_ITERATIONS: u32 = 100_000;
-
 /// Which blocking wait `wait_for` is doing, and how to observe it either
 /// way: the IRQ_FLAGS bit to poll over SPI, or how DIO0 should be mapped to
 /// reflect the same event directly when a DIO0 pin is wired.
@@ -94,6 +91,15 @@ pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin> {
     pub(crate) delay: DELAY,
     dio0: Option<DIO0>,
     addr: u16,
+    /// The last `Config` applied via `configure()` — kept around so
+    /// `wait_for`'s CAD/TX timeouts can be computed from the *actual*
+    /// SF/BW/CR in use (see `Config::cad_timeout_us`/`tx_timeout_us`)
+    /// rather than a single fixed value that can only ever be right for
+    /// one setting. `Default::default()` here is never actually used for a
+    /// real wait — `configure()` must succeed before `send()`/CAD are ever
+    /// called — it just avoids needing an `Option` for a field every
+    /// method already assumes is populated.
+    config: Config,
 }
 
 impl<SPI, RESET, DELAY> Sx127xSpi<SPI, RESET, DELAY, NoInputPin>
@@ -106,7 +112,7 @@ where
     /// only option without a DIO0 pin wired. See `new_with_dio0` for the
     /// lower-overhead alternative.
     pub fn new(spi: SPI, reset: RESET, delay: DELAY) -> Self {
-        Self { spi, reset, delay, dio0: None, addr: 0 }
+        Self { spi, reset, delay, dio0: None, addr: 0, config: Config::default() }
     }
 }
 
@@ -124,28 +130,43 @@ where
     /// its mapping (which event it reflects) is reconfigured automatically
     /// for whichever operation is about to run.
     pub fn new_with_dio0(spi: SPI, reset: RESET, delay: DELAY, dio0: DIO0) -> Self {
-        Self { spi, reset, delay, dio0: Some(dio0), addr: 0 }
+        Self { spi, reset, delay, dio0: Some(dio0), addr: 0, config: Config::default() }
     }
 
-    fn wait_for(&mut self, event: WaitFor, poll_iterations: u32) -> Result<u8, Sx127xError<SPI::Error>> {
+    /// `wait_for` re-checks completion every `POLL_INTERVAL_US` — far
+    /// shorter than any real CAD/TX duration (milliseconds or more at any
+    /// supported SF/BW), so this adds nothing meaningful to how quickly
+    /// completion is actually detected. Using a real delay between checks,
+    /// rather than a bare unthrottled spin, is what lets `timeout_us` mean
+    /// actual elapsed time instead of an iteration count that only ever
+    /// corresponded to some particular amount of wall-clock time for one
+    /// specific CPU and one specific SF/BW (see `Config::cad_timeout_us`/
+    /// `tx_timeout_us`, which compute the right bound for whichever
+    /// SF/BW/CR is actually configured).
+    const POLL_INTERVAL_US: u32 = 100;
+
+    fn wait_for(&mut self, event: WaitFor, timeout_us: u32) -> Result<u8, Sx127xError<SPI::Error>> {
+        let max_polls = (timeout_us / Self::POLL_INTERVAL_US).max(1);
         if self.dio0.is_some() {
             self.write_register(REG_DIO_MAPPING1, event.dio0_mapping())?;
-            for _ in 0..poll_iterations {
+            for _ in 0..max_polls {
                 // Safe: confirmed Some above, and this borrow doesn't
                 // overlap the self.read_register(..) call below it.
                 let high = self.dio0.as_mut().unwrap().is_high().map_err(|_| Sx127xError::InvalidConfig)?;
                 if high {
                     return self.read_register(REG_IRQ_FLAGS);
                 }
+                self.delay.delay_us(Self::POLL_INTERVAL_US);
             }
             return Err(Sx127xError::Timeout(event.timeout_kind()));
         }
 
-        for _ in 0..poll_iterations {
+        for _ in 0..max_polls {
             let irq = self.read_register(REG_IRQ_FLAGS)?;
             if irq & event.irq_bit() != 0 {
                 return Ok(irq);
             }
+            self.delay.delay_us(Self::POLL_INTERVAL_US);
         }
         Err(Sx127xError::Timeout(event.timeout_kind()))
     }
@@ -202,7 +223,7 @@ where
     fn channel_activity_detected(&mut self) -> Result<bool, Sx127xError<SPI::Error>> {
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         self.set_mode(MODE_CAD)?;
-        let irq = self.wait_for(WaitFor::CadDone, CAD_POLL_ITERATIONS)?;
+        let irq = self.wait_for(WaitFor::CadDone, self.config.cad_timeout_us())?;
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         Ok(irq & IRQ_CAD_DETECTED != 0)
     }
@@ -219,6 +240,11 @@ where
 
     fn configure(&mut self, config: &Config) -> Result<(), Self::Error> {
         self.addr = config.addr;
+        // Cached so wait_for's CAD/TX timeouts (Config::cad_timeout_us/
+        // tx_timeout_us) can be computed from whatever SF/BW/CR is actually
+        // in effect, not a single value that could only ever be right for
+        // one setting.
+        self.config = config.clone();
         self.hardware_reset()?;
 
         // LongRangeMode can only be changed in Sleep mode.
@@ -302,7 +328,10 @@ where
 
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         self.set_mode(MODE_TX)?;
-        self.wait_for(WaitFor::TxDone, TX_POLL_ITERATIONS)?;
+        // buf.len() (not payload.len()) — the actual over-the-air byte
+        // count, including the 2-byte address prefix, is what determines
+        // real airtime.
+        self.wait_for(WaitFor::TxDone, self.config.tx_timeout_us(buf.len()))?;
         self.write_register(REG_IRQ_FLAGS, 0xFF)?;
         Ok(())
     }
@@ -667,11 +696,12 @@ mod tests {
     /// a CAD that never completes (nothing was even keyed up for
     /// transmission yet) was indistinguishable from a TxDone that never
     /// arrives (the transmission started but its completion was never
-    /// signaled) — both surfaced as the exact same generic error. Uses a
-    /// small custom poll_iterations (2), not the real TX_POLL_ITERATIONS/
-    /// CAD_POLL_ITERATIONS (100_000) send()/channel_activity_detected() use
-    /// internally — wait_for already takes this as a parameter, so a small
-    /// value here still exercises the real timeout path, just quickly.
+    /// signaled) — both surfaced as the exact same generic error. Passes a
+    /// small `timeout_us` (200, i.e. exactly `2 * POLL_INTERVAL_US`) rather
+    /// than a real CAD/TX timeout, so this exercises exactly 2 polls before
+    /// giving up — quick and deterministic with `NoopDelay`, which makes
+    /// every `delay_us` call an instant no-op regardless of the value
+    /// passed.
     #[test]
     fn test_wait_for_cad_timeout_reports_channel_activity_detection_kind() {
         let spi = SpiMock::<u8>::new(&[
@@ -685,7 +715,7 @@ mod tests {
         let reset = PinMock::new(&[]);
         let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
 
-        let result = radio.wait_for(WaitFor::CadDone, 2);
+        let result = radio.wait_for(WaitFor::CadDone, 200);
         assert!(matches!(result, Err(Sx127xError::Timeout(TimeoutKind::ChannelActivityDetection))));
 
         radio.spi.done();
@@ -707,7 +737,7 @@ mod tests {
         let dio0 = PinMock::new(&[PinTx::get(State::Low), PinTx::get(State::Low)]);
         let mut radio = Sx127xSpi::new_with_dio0(spi, reset, NoopDelay, dio0);
 
-        let result = radio.wait_for(WaitFor::TxDone, 2);
+        let result = radio.wait_for(WaitFor::TxDone, 200);
         assert!(matches!(result, Err(Sx127xError::Timeout(TimeoutKind::TxDone))));
 
         radio.spi.done();

@@ -167,12 +167,77 @@ impl Config {
         }
     }
 
+    /// LoRa symbol period in microseconds: `2^SF / BW`. The basis for every
+    /// timing figure in this module — `LowDataRateOptimize`'s own
+    /// threshold, CAD duration, and on-air transmission time all scale
+    /// directly from this.
+    pub fn symbol_period_us(&self) -> u64 {
+        (1u64 << self.spreading_factor) * 1_000_000 / self.bandwidth.hz() as u64
+    }
+
     /// LowDataRateOptimize must be set when the symbol period exceeds 16ms.
     /// Computed in microseconds so the classic SF11/125kHz case (16.384ms)
     /// doesn't get truncated down to exactly 16ms by integer division.
     pub fn low_data_rate_optimize(&self) -> bool {
-        let symbol_period_us = (1u64 << self.spreading_factor) * 1_000_000 / self.bandwidth.hz() as u64;
-        symbol_period_us > 16_000
+        self.symbol_period_us() > 16_000
+    }
+
+    /// A generous upper bound on how long Channel Activity Detection can
+    /// take at this SF/BW, for use as `wait_for`'s CAD timeout. Per the
+    /// datasheet, actual CAD duration is roughly 1.5-2 symbol periods; ×3
+    /// leaves real margin for a software-polled (not cycle-precise) wait
+    /// without risking a false timeout against a perfectly healthy radio —
+    /// this replaces what used to be a fixed iteration count that was only
+    /// ever implicitly tuned for SF7's much shorter symbol period, and
+    /// silently stopped being enough once SF11 became the default (see
+    /// docs/protocols/lora_online_control_protocol.md, "RF Parameters").
+    pub fn cad_timeout_us(&self) -> u32 {
+        (self.symbol_period_us() * 3).min(u32::MAX as u64) as u32
+    }
+
+    /// Estimated on-air transmission time for a `payload_len`-byte packet
+    /// at this Config (explicit header, this driver's own CRC setting),
+    /// per the standard LoRa time-on-air formula (Semtech AN1200.22).
+    /// Integer microseconds throughout — no floating point, so this stays
+    /// usable in a `no_std` context — with the preamble's `+4.25` symbol
+    /// term handled as a ×4 fixed-point value (17/4) rather than rounding
+    /// it away.
+    ///
+    /// Cross-checked against docs/protocols/lora_online_control_protocol.md's
+    /// own "RF Parameters" airtime figures: a ~30-byte punch frame comes out
+    /// to ~71.9ms at SF7/125kHz (doc: "~70ms") and ~905ms at SF11/125kHz
+    /// (doc: "~900ms") — both computed independently by hand when those
+    /// figures were first written, and reproduced exactly here.
+    pub fn tx_airtime_us(&self, payload_len: usize) -> u64 {
+        let ts_us = self.symbol_period_us();
+        let sf = self.spreading_factor as i64;
+        let de: i64 = if self.low_data_rate_optimize() { 1 } else { 0 };
+        let crc: i64 = if self.crc_on { 1 } else { 0 };
+        let cr = self.coding_rate.denominator() as i64 - 4; // 1..4 for 4/5..4/8
+        let pl = payload_len as i64;
+
+        // (preamble_len + 4.25) symbols, kept in integer microseconds via
+        // ×4 fixed-point (4.25 == 17/4) instead of floating point.
+        let preamble_us = (self.preamble_len as i64 * 4 + 17) as u64 * ts_us / 4;
+
+        let numerator = 8 * pl - 4 * sf + 28 + 16 * crc;
+        let denominator = 4 * (sf - 2 * de);
+        let payload_symbols = if numerator > 0 && denominator > 0 {
+            let ceil_div = (numerator + denominator - 1) / denominator;
+            8 + (ceil_div * (cr + 4)).max(0)
+        } else {
+            8
+        };
+
+        preamble_us + payload_symbols as u64 * ts_us
+    }
+
+    /// A generous upper bound for `wait_for`'s TxDone timeout — actual
+    /// estimated airtime (`tx_airtime_us`) plus margin, since this is a
+    /// software-polled timeout, not a precise measurement of when the
+    /// radio itself considers the transmission done.
+    pub fn tx_timeout_us(&self, payload_len: usize) -> u32 {
+        (self.tx_airtime_us(payload_len) * 2).min(u32::MAX as u64) as u32
     }
 
     /// (RegDetectionOptimize, RegDetectionThreshold) per datasheet section 4.1.1.6.
@@ -188,6 +253,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-checked against a 30-byte punch frame's airtime as already
+    /// published in docs/protocols/lora_online_control_protocol.md's "RF
+    /// Parameters" section ("~70ms" at SF7, "~900ms" at SF11) — both
+    /// figures were computed by hand when that doc was written, and this
+    /// test reproduces the exact same numbers from the actual
+    /// implementation, not just the same ballpark.
+    #[test]
+    fn test_tx_airtime_matches_published_punch_frame_figures() {
+        let sf7 = Config { spreading_factor: 7, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        assert_eq!(sf7.tx_airtime_us(30), 71_936); // 71.936ms
+
+        let sf11 = Config { spreading_factor: 11, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        assert_eq!(sf11.tx_airtime_us(30), 905_216); // 905.216ms
+    }
+
+    #[test]
+    fn test_tx_airtime_increases_with_spreading_factor() {
+        let base = Config { bandwidth: Bandwidth::Khz125, ..Default::default() };
+        let mut last = 0;
+        for sf in 7..=12 {
+            let airtime = Config { spreading_factor: sf, ..base.clone() }.tx_airtime_us(20);
+            assert!(airtime > last, "SF{} airtime {} should exceed SF{}'s {}", sf, airtime, sf - 1, last);
+            last = airtime;
+        }
+    }
+
+    #[test]
+    fn test_tx_airtime_increases_with_payload_length() {
+        let cfg = Config { spreading_factor: 9, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        assert!(cfg.tx_airtime_us(50) > cfg.tx_airtime_us(10));
+    }
+
+    #[test]
+    fn test_cad_timeout_scales_with_symbol_period() {
+        let sf7 = Config { spreading_factor: 7, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        let sf11 = Config { spreading_factor: 11, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        // SF11's symbol period is 16x SF7's (2^11 / 2^7) — the timeout
+        // should scale the same way, not stay fixed.
+        assert_eq!(sf11.cad_timeout_us(), sf7.cad_timeout_us() * 16);
+        assert_eq!(sf7.cad_timeout_us(), (1024 * 3) as u32); // 1.024ms symbol × 3
+    }
+
+    #[test]
+    fn test_tx_timeout_is_generous_margin_over_airtime() {
+        let cfg = Config { spreading_factor: 10, bandwidth: Bandwidth::Khz125, ..Default::default() };
+        let airtime = cfg.tx_airtime_us(20);
+        assert_eq!(cfg.tx_timeout_us(20) as u64, airtime * 2);
+    }
 
     #[test]
     fn test_bandwidth_from_hz_round_trips_every_variant() {
