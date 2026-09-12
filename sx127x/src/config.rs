@@ -45,6 +45,28 @@ impl Bandwidth {
             Bandwidth::Khz500 => 500_000,
         }
     }
+
+    /// Inverse of `hz()` — the register only accepts these exact 10 values,
+    /// so any other input (a typo, a stale/corrupt saved setting) is
+    /// rejected rather than silently rounded to the nearest one. Single
+    /// source of truth for every caller that accepts a raw Hz value from a
+    /// human (a CLI flag, a config portal form field) instead of the enum
+    /// directly.
+    pub fn from_hz(hz: u32) -> Option<Self> {
+        match hz {
+            7_800 => Some(Bandwidth::Khz7_8),
+            10_400 => Some(Bandwidth::Khz10_4),
+            15_600 => Some(Bandwidth::Khz15_6),
+            20_800 => Some(Bandwidth::Khz20_8),
+            31_250 => Some(Bandwidth::Khz31_25),
+            41_700 => Some(Bandwidth::Khz41_7),
+            62_500 => Some(Bandwidth::Khz62_5),
+            125_000 => Some(Bandwidth::Khz125),
+            250_000 => Some(Bandwidth::Khz250),
+            500_000 => Some(Bandwidth::Khz500),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +84,30 @@ impl CodingRate {
             CodingRate::Cr4_6 => 0x02,
             CodingRate::Cr4_7 => 0x03,
             CodingRate::Cr4_8 => 0x04,
+        }
+    }
+
+    /// The "5" in "4/5" — how this project's CLI/config surfaces coding
+    /// rate to a human (a single digit) instead of the `Cr4_5` spelling.
+    pub fn denominator(self) -> u8 {
+        match self {
+            CodingRate::Cr4_5 => 5,
+            CodingRate::Cr4_6 => 6,
+            CodingRate::Cr4_7 => 7,
+            CodingRate::Cr4_8 => 8,
+        }
+    }
+
+    /// Inverse of `denominator()` — see `Bandwidth::from_hz`'s doc comment
+    /// for why this rejects anything outside the 4 supported values rather
+    /// than clamping.
+    pub fn from_denominator(d: u8) -> Option<Self> {
+        match d {
+            5 => Some(CodingRate::Cr4_5),
+            6 => Some(CodingRate::Cr4_6),
+            7 => Some(CodingRate::Cr4_7),
+            8 => Some(CodingRate::Cr4_8),
+            _ => None,
         }
     }
 }
@@ -142,6 +188,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bandwidth_from_hz_round_trips_every_variant() {
+        for bw in [
+            Bandwidth::Khz7_8, Bandwidth::Khz10_4, Bandwidth::Khz15_6, Bandwidth::Khz20_8,
+            Bandwidth::Khz31_25, Bandwidth::Khz41_7, Bandwidth::Khz62_5, Bandwidth::Khz125,
+            Bandwidth::Khz250, Bandwidth::Khz500,
+        ] {
+            assert_eq!(Bandwidth::from_hz(bw.hz()), Some(bw));
+        }
+    }
+
+    #[test]
+    fn test_bandwidth_from_hz_rejects_unsupported_value() {
+        assert_eq!(Bandwidth::from_hz(100_000), None);
+    }
+
+    #[test]
+    fn test_coding_rate_from_denominator_round_trips_every_variant() {
+        for cr in [CodingRate::Cr4_5, CodingRate::Cr4_6, CodingRate::Cr4_7, CodingRate::Cr4_8] {
+            assert_eq!(CodingRate::from_denominator(cr.denominator()), Some(cr));
+        }
+    }
+
+    #[test]
+    fn test_coding_rate_from_denominator_rejects_unsupported_value() {
+        assert_eq!(CodingRate::from_denominator(9), None);
+    }
 
     #[test]
     fn test_frf_register_433mhz() {

@@ -336,12 +336,31 @@ interval still keeps that comfortably under 2% duty cycle per node, but
 this is the number to revisit before shortening `LORA_HEARTBEAT_INTERVAL`
 or adding more per-node periodic traffic.
 
-**Deploying this change to an already-commissioned node requires physical
-access** — SF is fixed at commissioning time, like sync word and frequency
-(see "Command Packets" above), not remotely changeable. A node left on the
-old SF simply won't be heard by a base station running the new default,
-with no error message on either side to explain why — both ends need
-reflashing/redeploying together, not separately.
+**Changing SF/BW/CR on an already-commissioned node requires physical
+access, but not a reflash.** Like sync word and frequency (see "Command
+Packets" above), these stay out of scope for remote LoRa command changes —
+a bad value could leave a node unable to ever hear the "undo" instruction.
+Unlike a firmware update though, they *are* exposed on `esp32-node`'s
+existing Wi-Fi config portal (`NodeConfig::sf`/`bw_hz`/`cr` in
+`config.rs`/`wifi_config.rs`) alongside addr/dest/freq/sync_word — connect
+to the node's Wi-Fi AP within its boot window, pick new values, save, and
+it reboots with them applied. On `lora-server`, the equivalent is editing
+`/etc/lora-server/env`'s `LORA_SF`/`LORA_BW_HZ`/`LORA_CR` and restarting
+the service — no rebuild needed either. Both are "at-home setup" operations
+requiring you to be physically present at each device (Wi-Fi range for a
+node, SSH/console for the base station) — a mismatch between the two ends
+still means silent non-communication, no error on either side, so change
+both together.
+
+**Available values, for the portal/env file:**
+
+| Axis | Values | Notes |
+|---|---|---|
+| Spreading factor | 7, 8, 9, 10, 11, 12 | Higher = more range, longer airtime. 11 is the current default. |
+| Bandwidth | 7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125, 250, 500 (kHz) | Lower = more range, longer airtime. Below ~20.8kHz risks exceeding this hardware's crystal drift margin (non-TCXO SX1276/RFM9x modules) — packets can simply stop arriving as temperature shifts. 125kHz is the current default; 62.5kHz is the practical next step down if more range is needed, with comfortable drift margin still intact. |
+| Coding rate | 4/5, 4/6, 4/7, 4/8 | Higher denominator = more forward error correction (better tolerance of a noisy/marginal link), more airtime overhead. 4/5 is the current default. |
+
+That's 6 × 10 × 4 = 240 raw combinations; the three axes are independent; the table above (not a full cross-product listing) is the useful reference since any SF can be paired with any BW and any CR. `sx127x::Bandwidth::from_hz`/`CodingRate::from_denominator` are the single source of truth both `lora-server` and `esp32-node` validate against, so an out-of-range value is rejected (or, on `esp32-node`'s side, silently kept at its previous value) rather than producing an unpredictable radio configuration.
 
 *(Note: EBYTE E22 module support — a separate `sx126x` driver crate over
 UART — has been dropped. Every node, base station included, now runs bare

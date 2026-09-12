@@ -134,20 +134,11 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
 /// physically re-flashing it to find out.
 const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 
-// Fixed modem parameters, shared fleet-wide — not exposed via the config
-// page (only addr/dest/freq/sync_word are; see wifi_config.rs). Must match
-// lora-base-station's deployed /etc/lora-server/env.
-//
-// SPREADING_FACTOR=11 (up from 7) trades bitrate for receiver sensitivity —
-// see docs/protocols/lora_online_control_protocol.md's "RF Parameters"
-// section for the reasoning. LowDataRateOptimize is computed automatically
-// from SF+BW by sx127x, no separate flag needed here. One real consequence:
-// a heartbeat frame's airtime goes from tens of ms at SF7 to roughly
-// 800-900ms at SF11 — still a small fraction of HEARTBEAT_INTERVAL's 60s,
-// but worth knowing if that interval is ever tightened.
-const SPREADING_FACTOR: u8 = 11;
-const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
-const CODING_RATE: CodingRate = CodingRate::Cr4_5;
+// TX power is the one modem parameter that stays a fixed const rather than
+// a NodeConfig field — it's already commandable live over LoRa itself (see
+// "Command Packets" in docs/protocols/lora_online_control_protocol.md),
+// unlike SF/BW/CR which can strand a node if changed remotely and so are
+// commissioning-time-only (NodeConfig, set via the Wi-Fi portal below).
 const TX_POWER_DBM: i8 = 20;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
@@ -156,8 +147,10 @@ const TX_POWER_DBM: i8 = 20;
 /// decimal) matches lora-base-station's own deployed default — see
 /// NodeConfig::sync_word's doc comment for why this is the one setting here
 /// that most needs changing away from the default for a real deployment.
+/// sf=11/bw_hz=125_000/cr=5 mirrors lora-server's own defaults — see
+/// docs/protocols/lora_online_control_protocol.md, "RF Parameters".
 fn default_config() -> NodeConfig {
-    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, sync_word: 0x12 }
+    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, sync_word: 0x12, sf: 11, bw_hz: 125_000, cr: 5 }
 }
 
 /// Recovers from a send failure by forcing a real hardware reset and full
@@ -251,12 +244,16 @@ fn main() -> anyhow::Result<()> {
 
     let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
 
+    // current.bw_hz/cr fall back to the same 125kHz/4:5 defaults on an
+    // unrecognized value (e.g. a NodeConfig saved by older firmware) — see
+    // NodeConfig::bw_hz's doc comment for why this is a soft fallback here,
+    // unlike lora-server's --bw-hz/--cr which just refuse to start.
     let radio_config = RadioConfig {
         freq_hz: current.freq_hz,
         addr: current.addr,
-        spreading_factor: SPREADING_FACTOR,
-        bandwidth: BANDWIDTH,
-        coding_rate: CODING_RATE,
+        spreading_factor: current.sf,
+        bandwidth: Bandwidth::from_hz(current.bw_hz).unwrap_or(Bandwidth::Khz125),
+        coding_rate: CodingRate::from_denominator(current.cr).unwrap_or(CodingRate::Cr4_5),
         sync_word: current.sync_word,
         tx_power_dbm: TX_POWER_DBM,
         ..Default::default()
@@ -266,8 +263,8 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("radio configure failed: {:?}", e))?;
 
     log::info!(
-        "esp32-node up: addr={} dest={} freq={}Hz sf={} sync_word={:#04x}",
-        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.sync_word
+        "esp32-node up: addr={} dest={} freq={}Hz sf={} bw={}Hz cr=4/{} sync_word={:#04x}",
+        current.addr, current.dest, current.freq_hz, current.sf, current.bw_hz, current.cr, current.sync_word
     );
     persistent_log::append(&mut nvs.lock().unwrap(), "radio up");
 

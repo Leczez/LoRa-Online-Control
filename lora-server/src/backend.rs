@@ -144,26 +144,10 @@ pub trait Radio: Send {
 fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
     use sx127x::{Bandwidth, CodingRate};
 
-    let bandwidth = match args.bw_hz {
-        7_800 => Bandwidth::Khz7_8,
-        10_400 => Bandwidth::Khz10_4,
-        15_600 => Bandwidth::Khz15_6,
-        20_800 => Bandwidth::Khz20_8,
-        31_250 => Bandwidth::Khz31_25,
-        41_700 => Bandwidth::Khz41_7,
-        62_500 => Bandwidth::Khz62_5,
-        125_000 => Bandwidth::Khz125,
-        250_000 => Bandwidth::Khz250,
-        500_000 => Bandwidth::Khz500,
-        b => anyhow::bail!("unsupported bandwidth {}Hz", b),
-    };
-    let coding_rate = match args.cr {
-        5 => CodingRate::Cr4_5,
-        6 => CodingRate::Cr4_6,
-        7 => CodingRate::Cr4_7,
-        8 => CodingRate::Cr4_8,
-        c => anyhow::bail!("unsupported coding rate 4/{} — use 5, 6, 7, or 8", c),
-    };
+    let bandwidth = Bandwidth::from_hz(args.bw_hz)
+        .ok_or_else(|| anyhow::anyhow!("unsupported bandwidth {}Hz", args.bw_hz))?;
+    let coding_rate = CodingRate::from_denominator(args.cr)
+        .ok_or_else(|| anyhow::anyhow!("unsupported coding rate 4/{} — use 5, 6, 7, or 8", args.cr))?;
     if !(7..=12).contains(&args.sf) {
         anyhow::bail!("unsupported spreading factor {} — use 7-12", args.sf);
     }
