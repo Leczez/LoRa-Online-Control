@@ -1,10 +1,18 @@
-//! First-two-minutes Wi-Fi config portal. No physical switch: the node
-//! always boots into an open AP + a settings page for CONFIG_WINDOW, so a
-//! technician can change addr/dest/freq without reflashing. Saving persists
-//! to NVS and reboots immediately to apply the new settings; if nothing is
-//! saved, the window closes on its own and Wi-Fi is stopped before normal
-//! operation starts — this firmware never touches Bluetooth at all, so
-//! there's nothing to shut down there.
+//! First-two-minutes Wi-Fi config portal. No physical switch: while enabled,
+//! the node boots into an open AP + a settings page for CONFIG_WINDOW, so a
+//! technician can change addr/dest/freq/LoRa mode without reflashing. Saving
+//! persists to NVS and reboots immediately to apply the new settings; if
+//! nothing is saved, the window closes on its own and Wi-Fi is stopped
+//! before normal operation starts — this firmware never touches Bluetooth
+//! at all, so there's nothing to shut down there.
+//!
+//! **Disabled by default** (behind the `wifi-config-portal` Cargo feature,
+//! see Cargo.toml) — replaced as the default safety net by main.rs's
+//! ack-based auto-revert-to-standard-config logic, which needs no operator
+//! present and doesn't cost every boot a fixed 2-minute Wi-Fi window. Kept
+//! compiling and working, not deleted, since it's still useful for a
+//! deliberate one-off reconfiguration session and may end up reused by a
+//! future LoRa-triggered settings mode (see the design doc's open items).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

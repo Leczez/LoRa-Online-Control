@@ -1,13 +1,19 @@
 //! ESP32-S3 SportIdent punch relay node.
 //!
-//! No physical config switch: the node always boots into a 2-minute Wi-Fi
-//! config portal first (see wifi_config.rs) — a technician can change
-//! addr/dest/freq there without reflashing; if nothing is saved, Wi-Fi is
-//! stopped and normal operation proceeds with whatever's in NVS (or these
-//! defaults on first boot). Reads punches from the SI master over USB
-//! (cp210x.rs + sportident.rs) and relays them to the base station over
-//! LoRa, using the same wire format lora-server already parses. The pending-
-//! punch queue is allocated in PSRAM (psram.rs), not the main heap.
+//! Normal operation starts immediately from whatever's in NVS (or the
+//! defaults on first boot) — no boot-time Wi-Fi window by default. Instead,
+//! the radio's current LoRa mode (freq/sf/bw_hz/cr/sync_word) has 60 seconds
+//! after boot to earn a `ConfigAck` from the base station (see
+//! `CONFIG_VERIFY_WINDOW` below and docs/protocols/lora_online_control_protocol.md,
+//! "RF Parameters"); if none arrives, it's reverted to a known-good standard
+//! mode and saved, so a bad experimental value can't strand a node
+//! indefinitely. The old Wi-Fi config portal (wifi_config.rs) that used to
+//! be the only way to change these still exists, just disabled by default —
+//! see Cargo.toml's `wifi-config-portal` feature. Reads punches from the SI
+//! master over USB (cp210x.rs + sportident.rs) and relays them to the base
+//! station over LoRa, using the same wire format lora-server already
+//! parses. The pending-punch queue is allocated in PSRAM (psram.rs), not the
+//! main heap.
 //!
 //! Build with `--features debug-console` for a bench/debug variant that
 //! skips SI-master reading entirely so the USB serial console stays live
@@ -33,6 +39,7 @@ use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::prelude::*;
 use esp_idf_hal::spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
+#[cfg(feature = "wifi-config-portal")]
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use sx127x::{Bandwidth, CodingRate, Config as RadioConfig, LoraRadio, Sx127xSpi};
@@ -48,6 +55,9 @@ mod persistent_log;
 mod protocol;
 mod psram;
 mod sportident;
+// Disabled by default — see its own doc comment and Cargo.toml's
+// wifi-config-portal feature.
+#[cfg(feature = "wifi-config-portal")]
 mod wifi_config;
 
 use config::NodeConfig;
@@ -67,6 +77,20 @@ const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// healthy radio should still show up as alive to the base station, not go
 /// silent just because wait_for_si_master is blocked.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a freshly booted node gives its current LoRa mode to earn a
+/// `ConfigAck` from the base station before giving up and reverting to
+/// `NodeConfig::standard_rf()` (see main()). 60s, not some fraction of a
+/// second — LoRa drops packets routinely, and both the outbound boot
+/// announcement and the inbound ack can each be lost independently, so this
+/// needs enough margin for several retries, not just one round trip.
+const CONFIG_VERIFY_WINDOW: Duration = Duration::from_secs(60);
+
+/// How often the boot announcement is re-sent while still waiting on a
+/// `ConfigAck` — several attempts across `CONFIG_VERIFY_WINDOW` rather than
+/// one, so a single lost packet (in either direction) can't by itself cause
+/// a false "this config doesn't work" conclusion and an unnecessary revert.
+const CONFIG_VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 struct PendingPunch {
     card_id: u32,
@@ -138,19 +162,26 @@ const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 // a NodeConfig field — it's already commandable live over LoRa itself (see
 // "Command Packets" in docs/protocols/lora_online_control_protocol.md),
 // unlike SF/BW/CR which can strand a node if changed remotely and so are
-// commissioning-time-only (NodeConfig, set via the Wi-Fi portal below).
+// commissioning-time-only (NodeConfig, changed via the Wi-Fi portal when
+// that feature is enabled, or self-corrected by the ack-based revert below).
 const TX_POWER_DBM: i8 = 20;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
-/// docs/protocols/lora_online_control_protocol.md). sync_word=0x12 (18
-/// decimal) matches lora-base-station's own deployed default — see
-/// NodeConfig::sync_word's doc comment for why this is the one setting here
-/// that most needs changing away from the default for a real deployment.
-/// sf=11/bw_hz=125_000/cr=5 mirrors lora-server's own defaults — see
-/// docs/protocols/lora_online_control_protocol.md, "RF Parameters".
+/// docs/protocols/lora_online_control_protocol.md). The LoRa mode fields
+/// (freq/sync_word/sf/bw_hz/cr) are `NodeConfig::standard_rf()`'s values —
+/// see its doc comment for why a brand new node and a node recovering from
+/// a bad mode both land on exactly the same numbers.
 fn default_config() -> NodeConfig {
-    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, sync_word: 0x12, sf: 11, bw_hz: 125_000, cr: 5 }
+    NodeConfig {
+        addr: 10,
+        dest: 1,
+        freq_hz: config::STANDARD_FREQ_HZ,
+        sync_word: config::STANDARD_SYNC_WORD,
+        sf: config::STANDARD_SF,
+        bw_hz: config::STANDARD_BW_HZ,
+        cr: config::STANDARD_CR,
+    }
 }
 
 /// Recovers from a send failure by forcing a real hardware reset and full
@@ -191,10 +222,12 @@ fn main() -> anyhow::Result<()> {
     log::info!("esp32-node {} booting (reset reason: {:?})", VERSION, reset_reason);
 
     let peripherals = Peripherals::take()?;
-    let sysloop = EspSystemEventLoop::take()?;
 
     let nvs = Arc::new(Mutex::new(config::open_nvs()?));
-    let current = {
+    // Mutable: the ack-based verification below can revert this to
+    // `standard_rf()` mid-boot if the value loaded here goes unacknowledged
+    // (see CONFIG_VERIFY_WINDOW).
+    let mut current = {
         let guard = nvs.lock().unwrap();
         NodeConfig::load(&guard, default_config())
     };
@@ -204,15 +237,20 @@ fn main() -> anyhow::Result<()> {
     // boot (brownout, panic, watchdog) means the live serial console is
     // long gone by the time it happens (cp210x::install(), below, steals
     // it), but this survives in NVS for the *next* boot's Wi-Fi portal
-    // (/log) to show — telling you how far this boot actually got.
+    // (/log, when the wifi-config-portal feature is enabled) to show —
+    // telling you how far this boot actually got.
     persistent_log::append(&mut nvs.lock().unwrap(), &format!("boot: {:?}", reset_reason));
 
-    // Either returns after the window closes with `current` still accurate
-    // (nothing saved), or a save inside the portal calls esp_restart()
-    // directly and this call never returns at all. NodeConfig is Copy, so
-    // passing it here doesn't consume the binding `current` is still needed
-    // below.
-    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current)?;
+    #[cfg(feature = "wifi-config-portal")]
+    {
+        let sysloop = EspSystemEventLoop::take()?;
+        // Either returns after the window closes with `current` still
+        // accurate (nothing saved), or a save inside the portal calls
+        // esp_restart() directly and this call never returns at all.
+        // NodeConfig is Copy, so passing it here doesn't consume the
+        // binding `current` is still needed below.
+        wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current)?;
+    }
 
     let pins = peripherals.pins;
 
@@ -248,7 +286,12 @@ fn main() -> anyhow::Result<()> {
     // unrecognized value (e.g. a NodeConfig saved by older firmware) — see
     // NodeConfig::bw_hz's doc comment for why this is a soft fallback here,
     // unlike lora-server's --bw-hz/--cr which just refuse to start.
-    let radio_config = RadioConfig {
+    //
+    // Mutable: rebuilt from `current` if the config-verification logic below
+    // reverts to `standard_rf()`, so every `recover_radio(&mut radio,
+    // &radio_config)` call site elsewhere in this function keeps using
+    // whichever config is actually live, not the one boot started with.
+    let mut radio_config = RadioConfig {
         freq_hz: current.freq_hz,
         addr: current.addr,
         spreading_factor: current.sf,
@@ -268,13 +311,13 @@ fn main() -> anyhow::Result<()> {
     );
     persistent_log::append(&mut nvs.lock().unwrap(), "radio up");
 
-    // Announced once, unprompted, right after the radio is up — lets
-    // lora-base-station learn a node's firmware version passively (see
-    // daemon_state::NodeStatus::version) without an operator having to
-    // remember to query every node after a redeploy. Best-effort like every
-    // other uplink send here: if this one send is lost, the node's version
-    // just won't show up until the next boot or an explicit /queryversion —
-    // not worth retrying for a value that never changes mid-session.
+    // Announced once immediately, then re-announced every
+    // CONFIG_VERIFY_RETRY_INTERVAL until either a ConfigAck arrives or
+    // CONFIG_VERIFY_WINDOW elapses (see the main loop below) — this is now
+    // also the node's "is my current LoRa mode actually reaching the base
+    // station" probe, not just a passive version-reporting convenience, so
+    // it can no longer stay a true one-shot fire-and-forget send the way it
+    // was before that mattered.
     let boot_report = protocol::encode_version_report(current.addr, VERSION);
     match radio.send(current.dest, boot_report.as_bytes()) {
         Ok(()) => {
@@ -287,6 +330,15 @@ fn main() -> anyhow::Result<()> {
             recover_radio(&mut radio, &radio_config);
         }
     }
+
+    // Config-verification state (see CONFIG_VERIFY_WINDOW's doc comment).
+    // `config_pending` covers both "still waiting" and "already reverted" —
+    // once false, the main loop below never touches this again for the rest
+    // of the boot, whether that's because a ConfigAck actually arrived or
+    // because giving up already happened.
+    let config_verify_deadline = Instant::now() + CONFIG_VERIFY_WINDOW;
+    let mut config_pending = true;
+    let mut last_config_verify_announce = Instant::now();
 
     // GPIO4: placeholder battery-sense pin, see battery.rs and the wiring
     // doc — the actual voltage-divider circuit isn't built yet.
@@ -362,12 +414,64 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                } else if let Some(target) = protocol::parse_config_ack(&text) {
+                    if target == current.addr && config_pending {
+                        log::info!("current LoRa mode acked by {:#06x} — keeping it", src_addr);
+                        persistent_log::append(&mut nvs.lock().unwrap(), "config verified");
+                        config_pending = false;
+                    }
                 } else {
                     log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
                 }
             }
             Ok(None) => {}
             Err(e) => log::warn!("receive() error: {:?}", e),
+        }
+
+        if config_pending {
+            if Instant::now() >= config_verify_deadline {
+                // No ConfigAck within CONFIG_VERIFY_WINDOW despite retries —
+                // the current LoRa mode isn't reaching the base station (or
+                // its ack isn't reaching us; either way, this node can't be
+                // trusted to stay reachable on it). addr/dest are untouched
+                // (see standard_rf()'s doc comment) — only the modem
+                // parameters revert.
+                log::warn!(
+                    "no config ack within {}s, reverting LoRa mode to standard",
+                    CONFIG_VERIFY_WINDOW.as_secs()
+                );
+                persistent_log::append(&mut nvs.lock().unwrap(), "config unverified: reverted to standard");
+                current = current.standard_rf();
+                if let Err(e) = current.save(&mut nvs.lock().unwrap()) {
+                    log::error!("failed to persist reverted config: {:?}", e);
+                }
+                radio_config = RadioConfig {
+                    freq_hz: current.freq_hz,
+                    addr: current.addr,
+                    spreading_factor: current.sf,
+                    bandwidth: Bandwidth::from_hz(current.bw_hz).unwrap_or(Bandwidth::Khz125),
+                    coding_rate: CodingRate::from_denominator(current.cr).unwrap_or(CodingRate::Cr4_5),
+                    sync_word: current.sync_word,
+                    tx_power_dbm: TX_POWER_DBM,
+                    ..Default::default()
+                };
+                recover_radio(&mut radio, &radio_config);
+                config_pending = false;
+            } else if last_config_verify_announce.elapsed() >= CONFIG_VERIFY_RETRY_INTERVAL {
+                // Still within the window: give the current config another
+                // chance to be heard rather than waiting on the one boot
+                // announcement already sent — a single lost packet (either
+                // direction) shouldn't by itself trigger a revert.
+                last_config_verify_announce = Instant::now();
+                let boot_report = protocol::encode_version_report(current.addr, VERSION);
+                match radio.send(current.dest, boot_report.as_bytes()) {
+                    Ok(()) => log::info!("VERSION (config-verify retry) to {:#06x}: {}", current.dest, boot_report),
+                    Err(e) => {
+                        log::warn!("config-verify re-announcement failed: {:?}", e);
+                        recover_radio(&mut radio, &radio_config);
+                    }
+                }
+            }
         }
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {

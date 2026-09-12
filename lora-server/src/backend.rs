@@ -845,6 +845,26 @@ fn run_daemon_loop(
                             // already is from any overheard HB.
                             state.lock().unwrap().record_version(origin, version.clone());
                             log_event(&state, format!("VERSIONRX {} {}", origin, version));
+
+                            // Doubles as this base station's answer to "is
+                            // node `origin`'s current LoRa mode actually
+                            // reaching me?" — see Frame::ConfigAck's doc
+                            // comment. Sent unconditionally for every
+                            // VersionReport, whether it's a reply to our own
+                            // VQUERY or the node's unprompted boot
+                            // announcement; harmless either way; simpler
+                            // than distinguishing the two.
+                            let ack = Frame::ConfigAck { target: origin };
+                            let ack_payload = ack.encode();
+                            match radio.send(pkt.src_addr, ack_payload.as_bytes()) {
+                                Ok(()) => log_event(&state, format!("TX {} {}", pkt.src_addr, ack_payload)),
+                                Err(e) => log::error!("failed to send config ack: {}", e),
+                            }
+                        }
+                        Frame::ConfigAck { .. } => {
+                            // Only ever sent downlink by lora-server itself
+                            // (to a node) — nothing here needs to react to
+                            // overhearing one.
                         }
                     }
                 } else if let Some(hb) = parse_heartbeat(&payload) {
@@ -1725,6 +1745,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(state_for_check.lock().unwrap().nodes[&10].version.as_deref(), Some("0.1.0+a1b2c3d4"));
+
+        drop(cmd_tx);
+    }
+
+    /// Receiving a VersionReport — whether it's a reply to our own VQUERY
+    /// or a node's unprompted boot announcement — always earns that node a
+    /// ConfigAck back, since it's the only signal a freshly booted node has
+    /// that its current LoRa mode is actually reaching this base station
+    /// (see esp32-node's boot-verification logic and Frame::ConfigAck's
+    /// doc comment).
+    #[test]
+    fn test_run_daemon_loop_sends_config_ack_for_any_version_report() {
+        let punch_buffer = Arc::new(crate::punch_buffer::PunchBuffer::open(":memory:").unwrap());
+        let report = Frame::VersionReport { origin: 10, version: "0.1.0+a1b2c3d4".to_string() }.encode();
+
+        let radio: Box<dyn Radio> = Box::new(FakeRadio {
+            sent: Vec::new(),
+            to_receive: std::collections::VecDeque::from(vec![packet(10, &report)]),
+        });
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        let (_si_tx, si_rx) = std::sync::mpsc::channel();
+        let state = crate::daemon_state::new_shared();
+        let state_for_check = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let _ = run_daemon_loop(
+                DaemonIdentity { own_addr: 2, dest: 1, heartbeat_interval: 0, relay: false },
+                cmd_rx, radio, si_rx, punch_buffer, state,
+            );
+        });
+
+        let expected_tx = format!("TX 10 {}", Frame::ConfigAck { target: 10 }.encode());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sent = state_for_check.lock().unwrap().log.iter().any(|e| e.line == expected_tx);
+            if sent {
+                break;
+            }
+            assert!(Instant::now() < deadline, "config ack for node 10 was never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         drop(cmd_tx);
     }

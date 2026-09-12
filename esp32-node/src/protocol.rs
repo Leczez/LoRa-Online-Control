@@ -33,6 +33,18 @@ pub fn encode_version_report(origin: u16, version: &str) -> String {
     std::format!("VERSION {} {}", origin, version)
 }
 
+/// Parses a `CACK <target>` wire payload — must match `lora-server`'s
+/// `Frame::ConfigAck::encode()` format exactly. Sent by the base station in
+/// reply to every `VersionReport` it receives (including the unprompted
+/// boot announcement below) — this node's proof that its current LoRa mode
+/// is actually reaching the base station. See main.rs's boot-verification
+/// logic and docs/protocols/lora_online_control_protocol.md, "RF
+/// Parameters".
+pub fn parse_config_ack(s: &str) -> Option<u16> {
+    let rest = s.strip_prefix("CACK ")?;
+    rest.trim().parse().ok()
+}
+
 /// Wraps `radio.receive`, validating the payload as UTF-8 and packaging it
 /// with the sender/RSSI into the tuple `main.rs`'s loop consumes — a
 /// malformed (non-UTF-8) payload is treated as if nothing was received, not
@@ -81,5 +93,16 @@ mod tests {
     #[test]
     fn test_encode_version_report() {
         assert_eq!(encode_version_report(10, "0.1.0+a1b2c3d4"), "VERSION 10 0.1.0+a1b2c3d4");
+    }
+
+    #[test]
+    fn test_parse_config_ack() {
+        assert_eq!(parse_config_ack("CACK 10"), Some(10));
+    }
+
+    #[test]
+    fn test_parse_config_ack_rejects_garbage() {
+        assert_eq!(parse_config_ack("CACK notanumber"), None);
+        assert_eq!(parse_config_ack("HB"), None);
     }
 }

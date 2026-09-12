@@ -1,7 +1,13 @@
 //! Field-editable node settings (address/dest/frequency/sync word/LoRa
 //! mode), persisted to NVS so they survive reboots. Defaults match
-//! lora-base-station's actual deployment (see esp32-node/src/main.rs) until
-//! a technician changes them via the Wi-Fi config page.
+//! lora-base-station's actual deployment (see esp32-node/src/main.rs).
+//!
+//! There is currently no live way to move a node onto a *non-default* LoRa
+//! mode short of changing `default_config()`'s consts and reflashing — the
+//! Wi-Fi config portal that used to do this (wifi_config.rs) is disabled by
+//! default (see its own doc comment) in favor of the ack-based
+//! auto-revert-to-standard mechanism in main.rs, and its eventual
+//! replacement (a LoRa-triggered settings mode) isn't built yet.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
@@ -13,6 +19,17 @@ const KEY_SYNC_WORD: &str = "syncword";
 const KEY_SF: &str = "sf";
 const KEY_BW_HZ: &str = "bwhz";
 const KEY_CR: &str = "cr";
+
+/// The known-good LoRa mode `NodeConfig::standard_rf()` reverts to when a
+/// node's current mode goes unacknowledged during its post-boot
+/// verification window (see main.rs) — deliberately the same values
+/// `default_config()` starts a brand new node with, so there is exactly one
+/// place these can drift out of sync with each other: nowhere.
+pub const STANDARD_FREQ_HZ: u32 = 433_000_000;
+pub const STANDARD_SYNC_WORD: u8 = 0x12;
+pub const STANDARD_SF: u8 = 11;
+pub const STANDARD_BW_HZ: u32 = 125_000;
+pub const STANDARD_CR: u8 = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NodeConfig {
@@ -70,6 +87,23 @@ impl NodeConfig {
         nvs.set_u32(KEY_BW_HZ, self.bw_hz)?;
         nvs.set_u8(KEY_CR, self.cr)?;
         Ok(())
+    }
+
+    /// Returns this config with its LoRa mode (freq/sf/bw/cr/sync word)
+    /// reset to the known-good standard values, leaving `addr`/`dest`
+    /// untouched — those are per-node identity/topology, assigned at
+    /// commissioning, not part of "the LoRa mode" this exists to recover
+    /// from a bad value in. Used by main.rs when a node's current mode goes
+    /// unacknowledged during its post-boot verification window.
+    pub fn standard_rf(self) -> Self {
+        Self {
+            freq_hz: STANDARD_FREQ_HZ,
+            sync_word: STANDARD_SYNC_WORD,
+            sf: STANDARD_SF,
+            bw_hz: STANDARD_BW_HZ,
+            cr: STANDARD_CR,
+            ..self
+        }
     }
 }
 

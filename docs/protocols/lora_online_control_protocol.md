@@ -14,8 +14,9 @@ frame (`--network-id`/`NetworkFilteredRadio`) — removed as part of a wire
 protocol efficiency pass, since it cost airtime on every single packet for
 something the radio's own hardware can already do for free: the LoRa
 **sync word** (`--sync-word`/`LORA_SYNC_WORD` on lora-server,
-`NodeConfig::sync_word` — set via the Wi-Fi config portal — on esp32-node)
-is checked by the chip itself during preamble detection, rejecting a
+`NodeConfig::sync_word` on esp32-node — see "RF Parameters" below for how
+that gets set/verified) is checked by the chip itself during preamble
+detection, rejecting a
 mismatched packet *before it's even demodulated*, rather than after
 receiving and parsing a whole extra prefix.
 
@@ -226,10 +227,13 @@ Every node and lora-server instance embeds its own build version
 const, and the repo-root `VERSION` file for the semver half). Two ways it
 reaches the base station:
 
-- **Boot announcement** — `VERSION <origin> <version>`, sent once,
-  unprompted, right after the radio comes up. Passive discovery: an
-  operator doesn't have to remember to query every node after a redeploy,
-  it just shows up in the node table the next time each node reboots.
+- **Boot announcement** — `VERSION <origin> <version>`, unprompted, right
+  after the radio comes up. Passive discovery: an operator doesn't have to
+  remember to query every node after a redeploy, it just shows up in the
+  node table the next time each node reboots. Re-sent every
+  `CONFIG_VERIFY_RETRY_INTERVAL` for up to `CONFIG_VERIFY_WINDOW` after
+  boot (not just once) — see "RF Parameters"' "Config verification" below,
+  since this doubles as that mechanism's own probe.
 - **On-demand query** — `VQUERY <target>` (downlink), answered with the
   same `VERSION <origin> <version>` uplink frame. Reachable via
   `lora-tui`'s `/queryversion <target-addr>`, the web dashboard's "Query
@@ -238,18 +242,26 @@ reaches the base station:
 
 Both are deliberately simple compared to `Command`/`Ack`:
 
-- **No `commander`/relay-routing field, no ack, no retry.** Same accepted
-  limitation as `HB` (see above) — a `VersionReport` is recorded from
-  whoever overheard it, unconditionally, the same way battery/SI-master
-  state already is from any overheard `HB`. This is a one-off diagnostic
-  value, not safety-critical config, so the complexity of `Command`'s
-  retry-tracked, relay-aware exchange isn't worth it here. A lost `VQUERY`
-  or `VERSION` reply just means re-issuing the query, or waiting for the
-  node's next boot.
+- **No `commander`/relay-routing field.** Same accepted limitation as `HB`
+  (see above) — a `VersionReport` is recorded from whoever overheard it,
+  unconditionally, the same way battery/SI-master state already is from any
+  overheard `HB`. This is a one-off diagnostic value, not safety-critical
+  config, so the complexity of `Command`'s retry-tracked, relay-aware
+  exchange isn't worth it here.
+- **`lora-server` acks every `VersionReport` it receives with a
+  `ConfigAck`** (see "RF Parameters" below), whether that report was a
+  `VQUERY` reply or the unprompted boot announcement — it doesn't
+  distinguish which prompted it, since either is equally valid proof the
+  reporting node's current LoRa mode is reaching the base station. This
+  `ConfigAck` isn't itself retried or relayed, and a `VQUERY` reply that
+  goes unheard just means re-issuing the query or waiting for the node's
+  next boot — only the boot-announcement path (see below) actually retries
+  on a missing ack, and only for the 60s config-verification window, not
+  indefinitely.
 - **`VersionQuery` still relays like `Command`** (`--relay`, forwarding
   toward `target` if not addressed to this node) so a query can still reach
-  a node behind a relay — only the *reply* skips relay/commander routing,
-  same as `HB`.
+  a node behind a relay — only the *reply* (and `ConfigAck`) skip relay/
+  commander routing, same as `HB`.
 
 ## Relay Nodes
 
@@ -340,17 +352,37 @@ or adding more per-node periodic traffic.
 access, but not a reflash.** Like sync word and frequency (see "Command
 Packets" above), these stay out of scope for remote LoRa command changes —
 a bad value could leave a node unable to ever hear the "undo" instruction.
-Unlike a firmware update though, they *are* exposed on `esp32-node`'s
-existing Wi-Fi config portal (`NodeConfig::sf`/`bw_hz`/`cr` in
-`config.rs`/`wifi_config.rs`) alongside addr/dest/freq/sync_word — connect
-to the node's Wi-Fi AP within its boot window, pick new values, save, and
-it reboots with them applied. On `lora-server`, the equivalent is editing
-`/etc/lora-server/env`'s `LORA_SF`/`LORA_BW_HZ`/`LORA_CR` and restarting
-the service — no rebuild needed either. Both are "at-home setup" operations
-requiring you to be physically present at each device (Wi-Fi range for a
-node, SSH/console for the base station) — a mismatch between the two ends
-still means silent non-communication, no error on either side, so change
-both together.
+`esp32-node` used to expose `NodeConfig::sf`/`bw_hz`/`cr` (alongside addr/
+dest/freq/sync_word) on a boot-time Wi-Fi config portal for this
+(`config.rs`/`wifi_config.rs`) — that portal still exists and still works,
+but is **disabled by default** now (`wifi-config-portal` Cargo feature) in
+favor of the self-healing mechanism below, which needs no operator present
+and doesn't cost every boot a fixed 2-minute Wi-Fi window. On `lora-server`,
+changing these is unchanged: edit `/etc/lora-server/env`'s
+`LORA_SF`/`LORA_BW_HZ`/`LORA_CR` and restart the service — no rebuild
+needed. A mismatch between the two ends still means silent
+non-communication, no error on either side, so change both together.
+
+**Config verification: a node auto-heals a bad LoRa mode instead of relying
+on someone noticing.** For `CONFIG_VERIFY_WINDOW` (60s) after boot, a node
+re-sends its boot announcement (`VERSION`, see "Version Reporting" above)
+every `CONFIG_VERIFY_RETRY_INTERVAL` (10s) — several attempts, not a single
+shot, so one lost packet in either direction can't by itself cause a false
+"this config doesn't work" conclusion. `lora-server` replies to *every*
+`VersionReport` it receives (whether unprompted or a reply to its own
+`VQUERY`) with a `ConfigAck` frame — the node's only proof its current mode
+(freq/sf/bw_hz/cr/sync_word) is actually reaching the base station. If no
+`ConfigAck` arrives before the window closes, the node reverts those fields
+to `NodeConfig::standard_rf()`'s known-good values, saves that to NVS, and
+reconfigures the radio — **`addr`/`dest` are untouched**, since those are
+per-node identity/topology assigned at commissioning, not part of "the LoRa
+mode" this recovers from. The revert is persisted, so a bad config costs
+exactly one 60-second boot before self-correcting permanently — the node
+doesn't repeat the wait-then-revert cycle on every subsequent boot. Without
+the Wi-Fi portal enabled, there is currently no *live* way to move a node
+onto a non-default LoRa mode at all short of changing `default_config()`'s
+consts and reflashing — its eventual replacement (a LoRa-triggered settings
+mode) isn't built yet.
 
 **Available values, for the portal/env file:**
 

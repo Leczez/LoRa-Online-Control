@@ -63,6 +63,18 @@ pub enum Frame {
     /// esp32-node/src/main.rs) — same wire shape either way, so parsing
     /// doesn't need to care which prompted it.
     VersionReport { origin: u16, version: String },
+    /// Downlink: sent to `target` for every `VersionReport` this base
+    /// station receives from it, whether that report was prompted by a
+    /// `VersionQuery` or was the node's own unprompted boot announcement —
+    /// doesn't distinguish which, since both cases are equally valid proof
+    /// the node's current LoRa mode (freq/SF/BW/CR/sync word) is actually
+    /// reaching this base station. A freshly booted node uses this as its
+    /// "my current config was heard" signal during a short post-boot
+    /// window, reverting to a known-good default if none arrives — see
+    /// esp32-node/src/main.rs and docs/protocols/lora_online_control_protocol.md,
+    /// "RF Parameters". No `commander`/relay-routing field — same accepted
+    /// limitation as `VersionReport`/`HB`, not relayed.
+    ConfigAck { target: u16 },
 }
 
 impl Frame {
@@ -73,6 +85,7 @@ impl Frame {
             Frame::PunchAck { node, card_id } => format!("PACK {} {}", node, card_id),
             Frame::VersionQuery { target } => format!("VQUERY {}", target),
             Frame::VersionReport { origin, version } => format!("VERSION {} {}", origin, version),
+            Frame::ConfigAck { target } => format!("CACK {}", target),
         }
     }
 
@@ -109,6 +122,10 @@ impl Frame {
                 return None;
             }
             return Some(Frame::VersionReport { origin, version });
+        }
+        if let Some(rest) = s.strip_prefix("CACK ") {
+            let target: u16 = rest.trim().parse().ok()?;
+            return Some(Frame::ConfigAck { target });
         }
         None
     }
@@ -194,5 +211,19 @@ mod tests {
         assert_eq!(Frame::parse("VERSION 10"), None);
         assert_eq!(Frame::parse("VERSION 10 "), None);
         assert_eq!(Frame::parse("VERSION"), None);
+    }
+
+    #[test]
+    fn test_config_ack_round_trips() {
+        let frame = Frame::ConfigAck { target: 10 };
+        let encoded = frame.encode();
+        assert_eq!(encoded, "CACK 10");
+        assert_eq!(Frame::parse(&encoded), Some(frame));
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_config_ack() {
+        assert_eq!(Frame::parse("CACK notanumber"), None);
+        assert_eq!(Frame::parse("CACK"), None);
     }
 }

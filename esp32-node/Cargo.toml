@@ -40,6 +40,14 @@ std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
 # Never enable this for a real field deployment — a node built this way
 # can't read punches at all.
 debug-console = []
+# Brings back the boot-time Wi-Fi config portal (wifi_config.rs), disabled
+# by default in favor of main.rs's ack-based auto-revert-to-standard-config
+# logic — see wifi_config.rs's own doc comment. Useful for a deliberate
+# one-off reconfiguration session (e.g. setting a non-default addr/dest
+# before a "standard" LoRa mode boot would otherwise never get a chance to
+# apply it). Build with:
+#   cargo build --release --features wifi-config-portal
+wifi-config-portal = []
 
 [dependencies]
 log = { version = "0.4", default-features = false }
