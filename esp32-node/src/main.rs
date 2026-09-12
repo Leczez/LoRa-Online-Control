@@ -10,13 +10,17 @@
 //! cycle tries the original saved value again from scratch, rather than the
 //! node quietly getting stuck on "standard" forever after one bad reading
 //! (e.g. a stretch of interference right at boot). The old Wi-Fi config
-//! portal (wifi_config.rs) that used to
-//! be the only way to change these still exists, just disabled by default —
-//! see Cargo.toml's `wifi-config-portal` feature. Reads punches from the SI
-//! master over USB (cp210x.rs + sportident.rs) and relays them to the base
-//! station over LoRa, using the same wire format lora-server already
-//! parses. The pending-punch queue is allocated in PSRAM (psram.rs), not the
-//! main heap.
+//! portal (wifi_config.rs) that used to be the only way to change these
+//! still exists, just disabled by default — see Cargo.toml's
+//! `wifi-config-portal` feature — superseded by a LoRa-triggered settings
+//! mode (`Setting::SettingsMode` in protocol.rs, and this file's Command
+//! dispatch in the main loop below): the base station puts a node into
+//! settings mode, stages any number of field changes, then exits — which
+//! saves and reboots, running the same post-boot verification window a bad
+//! value would otherwise need to survive. Reads punches from the SI master
+//! over USB (cp210x.rs + sportident.rs) and relays them to the base station
+//! over LoRa, using the same wire format lora-server already parses. The
+//! pending-punch queue is allocated in PSRAM (psram.rs), not the main heap.
 //!
 //! Build with `--features debug-console` for a bench/debug variant that
 //! skips SI-master reading entirely so the USB serial console stays live
@@ -78,8 +82,11 @@ const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// main thread, entirely independent of whether an SI master is connected
 /// (see spawn_si_reader_thread) — a node with a dead/unplugged reader but a
 /// healthy radio should still show up as alive to the base station, not go
-/// silent just because wait_for_si_master is blocked.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+/// silent just because wait_for_si_master is blocked. Live-changeable via a
+/// `Setting::HeartbeatIntervalSecs` command (main()'s Command dispatch) —
+/// not persisted, so a reboot resets it back to this default, same as
+/// lora-server's own `heartbeat_period` (backend.rs).
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a freshly booted node gives its current LoRa mode to earn a
 /// `ConfigAck` from the base station before giving up and reverting to
@@ -137,7 +144,7 @@ fn encode_heartbeat(battery: Option<(u8, u16)>, si_present: Option<bool>) -> [u8
 /// Owns the SI master connection end-to-end: (re)connecting, reading
 /// punches, and noticing disconnects — entirely on its own thread, so a
 /// missing/dead SI master never blocks the radio/heartbeat loop in main()
-/// (see HEARTBEAT_INTERVAL's doc comment). Hands punches to the main thread
+/// (see DEFAULT_HEARTBEAT_INTERVAL's doc comment). Hands punches to the main thread
 /// over `punch_tx` rather than touching the radio directly, mirroring
 /// lora-server's own split between sportident.rs's hotplug thread and
 /// run_daemon_loop's radio ownership. `si_present` is flipped false the
@@ -193,13 +200,16 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
 /// physically re-flashing it to find out.
 const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 
-// TX power is the one modem parameter that stays a fixed const rather than
-// a NodeConfig field — it's already commandable live over LoRa itself (see
-// "Command Packets" in docs/protocols/lora_online_control_protocol.md),
-// unlike SF/BW/CR which can strand a node if changed remotely and so are
-// commissioning-time-only (NodeConfig, changed via the Wi-Fi portal when
-// that feature is enabled, or self-corrected by the ack-based revert below).
-const TX_POWER_DBM: i8 = 20;
+// TX power is the one modem parameter that stays outside NodeConfig/NVS
+// rather than a persisted field — it's commandable live over LoRa via
+// `Setting::TxPowerDbm` (see "Command Packets" in
+// docs/protocols/lora_online_control_protocol.md and main()'s Command
+// dispatch), same as heartbeat interval: applied immediately, not
+// persisted, resets to this default on reboot. Unlike SF/BW/CR/freq/
+// sync_word/addr/dest, which can strand a node if misapplied and so are
+// gated behind settings mode instead (see Setting's doc comment in
+// protocol.rs).
+const DEFAULT_TX_POWER_DBM: i8 = 20;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
@@ -239,6 +249,25 @@ where
     log::warn!("attempting radio recovery: forcing hardware reset + reconfigure");
     if let Err(e) = radio.configure(radio_config) {
         log::error!("radio recovery reconfigure failed: {:?}", e);
+    }
+}
+
+/// Applies one field to the staged config if (and only if) this node is
+/// currently in settings mode — returns whether it did, which the caller
+/// uses to decide whether to Ack (see main()'s Command dispatch). A
+/// rejection here is a normal, expected outcome, not an error: it's the
+/// signal a commander sees as "no ack" when it sends a settings-mode-gated
+/// field to a node that was never actually put into settings mode first.
+fn stage_setting(settings_mode: &mut Option<NodeConfig>, src_addr: u16, apply: impl FnOnce(&mut NodeConfig)) -> bool {
+    match settings_mode {
+        Some(pending) => {
+            apply(pending);
+            true
+        }
+        None => {
+            log::warn!("rejecting settings-mode-gated setting from {:#06x} — node not in settings mode", src_addr);
+            false
+        }
     }
 }
 
@@ -317,6 +346,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
 
+    // Live-changeable via Setting::TxPowerDbm (see main loop's Command
+    // dispatch) — not persisted, resets to DEFAULT_TX_POWER_DBM on reboot.
+    let mut tx_power_dbm: i8 = DEFAULT_TX_POWER_DBM;
+
     // current.bw_hz/cr fall back to the same 125kHz/4:5 defaults on an
     // unrecognized value (e.g. a NodeConfig saved by older firmware) — see
     // NodeConfig::bw_hz's doc comment for why this is a soft fallback here,
@@ -333,7 +366,7 @@ fn main() -> anyhow::Result<()> {
         bandwidth: Bandwidth::from_hz(current.bw_hz).unwrap_or(Bandwidth::Khz125),
         coding_rate: CodingRate::from_denominator(current.cr).unwrap_or(CodingRate::Cr4_5),
         sync_word: current.sync_word,
-        tx_power_dbm: TX_POWER_DBM,
+        tx_power_dbm,
         ..Default::default()
     };
     radio
@@ -378,7 +411,21 @@ fn main() -> anyhow::Result<()> {
     // GPIO4: placeholder battery-sense pin, see battery.rs and the wiring
     // doc — the actual voltage-divider circuit isn't built yet.
     let mut battery = battery::BatteryMonitor::new(peripherals.adc1, pins.gpio4)?;
-    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL; // send one immediately on boot
+    // Live-changeable via Setting::HeartbeatIntervalSecs (see main loop's
+    // Command dispatch) — not persisted, resets to
+    // DEFAULT_HEARTBEAT_INTERVAL on reboot.
+    let mut heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL;
+    let mut last_heartbeat = Instant::now() - heartbeat_interval; // send one immediately on boot
+    // Settings mode (see main loop's Command dispatch and Setting's doc
+    // comment in protocol.rs): `None` = normal operation; `Some(pending)` =
+    // staging a config change, `pending` being a working copy of `current`
+    // that settings-mode-gated Command frames mutate in place. Nothing here
+    // touches the live radio until `Setting::SettingsMode(false)` saves
+    // `pending` and reboots — so an in-progress settings-mode session can
+    // never itself break the ongoing command exchange with the base
+    // station, even if the fields being staged (sync word, SF, ...) would
+    // otherwise be exactly the ones that could.
+    let mut settings_mode: Option<config::NodeConfig> = None;
     // Included in each persisted heartbeat checkpoint below — lets the next
     // boot's /log page distinguish "died on the very first attempt" from
     // "ran fine for a while, then died", not just "died somewhere".
@@ -463,6 +510,95 @@ fn main() -> anyhow::Result<()> {
                             persistent_log::append(&mut nvs.lock().unwrap(), "config verified");
                             config_pending = false;
                         }
+                    } else if let Some((target, commander, setting)) = protocol::parse_command(text) {
+                        if target == current.addr {
+                            use protocol::Setting;
+                            log::info!("CMD from {:#06x}: {:?}", src_addr, setting);
+                            let applied = match setting {
+                                Setting::HeartbeatIntervalSecs(secs) => {
+                                    heartbeat_interval = Duration::from_secs(secs as u64);
+                                    log::info!("heartbeat interval changed to {}s by command from {:#06x}", secs, src_addr);
+                                    true
+                                }
+                                Setting::TxPowerDbm(dbm) => {
+                                    tx_power_dbm = dbm;
+                                    radio_config.tx_power_dbm = tx_power_dbm;
+                                    recover_radio(&mut radio, &radio_config);
+                                    log::info!("TX power changed to {}dBm by command from {:#06x}", dbm, src_addr);
+                                    true
+                                }
+                                Setting::SettingsMode(true) => {
+                                    settings_mode = Some(current);
+                                    log::warn!("entered settings mode (command from {:#06x})", src_addr);
+                                    persistent_log::append(&mut nvs.lock().unwrap(), "entered settings mode");
+                                    true
+                                }
+                                Setting::SettingsMode(false) => match settings_mode.take() {
+                                    Some(pending) => {
+                                        if let Err(e) = pending.save(&mut nvs.lock().unwrap()) {
+                                            log::error!("failed to save staged config: {:?}", e);
+                                        }
+                                        // Ack only after the save actually
+                                        // happened, same "acknowledge
+                                        // confirms applied" contract as
+                                        // every other setting — radio.send()
+                                        // is synchronous (blocks until TX
+                                        // actually completes), so the ack is
+                                        // already on air by the time this
+                                        // returns; no artificial pre-reboot
+                                        // delay needed the way the Wi-Fi
+                                        // portal needs one for its HTTP
+                                        // response to flush over TCP first.
+                                        let ack = protocol::encode_ack(current.addr, commander, setting);
+                                        let _ = radio.send(src_addr, ack.as_bytes());
+                                        log::warn!("exiting settings mode, rebooting to apply new config");
+                                        persistent_log::append(&mut nvs.lock().unwrap(), "settings mode: config saved, rebooting");
+                                        esp_idf_hal::reset::restart();
+                                    }
+                                    None => {
+                                        log::warn!("settings_mode=0 received but node wasn't in settings mode — ignoring");
+                                        false
+                                    }
+                                },
+                                // Settings-mode-gated fields: staged into
+                                // the pending copy, never applied to the
+                                // live radio here — only committed (and
+                                // only then reconfigured) via
+                                // SettingsMode(false) above. Only accepted
+                                // (and acked) while actually in settings
+                                // mode with a valid value — see Setting's
+                                // doc comment in protocol.rs for why these
+                                // specifically can't apply live the way
+                                // HeartbeatIntervalSecs/TxPowerDbm do.
+                                Setting::Addr(v) => stage_setting(&mut settings_mode, src_addr, |c| c.addr = v),
+                                Setting::Dest(v) => stage_setting(&mut settings_mode, src_addr, |c| c.dest = v),
+                                Setting::FreqHz(v) => stage_setting(&mut settings_mode, src_addr, |c| c.freq_hz = v),
+                                Setting::SyncWord(v) => stage_setting(&mut settings_mode, src_addr, |c| c.sync_word = v),
+                                Setting::Sf(v) if (7..=12).contains(&v) => {
+                                    stage_setting(&mut settings_mode, src_addr, |c| c.sf = v)
+                                }
+                                Setting::BwHz(v) if Bandwidth::from_hz(v).is_some() => {
+                                    stage_setting(&mut settings_mode, src_addr, |c| c.bw_hz = v)
+                                }
+                                Setting::Cr(v) if CodingRate::from_denominator(v).is_some() => {
+                                    stage_setting(&mut settings_mode, src_addr, |c| c.cr = v)
+                                }
+                                _ => {
+                                    log::warn!("rejecting {:?} from {:#06x} — invalid value or not in settings mode", setting, src_addr);
+                                    false
+                                }
+                            };
+                            if applied {
+                                let ack = protocol::encode_ack(current.addr, commander, setting);
+                                match radio.send(src_addr, ack.as_bytes()) {
+                                    Ok(()) => log::info!("ACK to {:#06x}: {}", src_addr, ack),
+                                    Err(e) => {
+                                        log::warn!("failed to ack command: {:?}", e);
+                                        recover_radio(&mut radio, &radio_config);
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         log::info!("RX from {:#06x} rssi={:?}: {}", src_addr, rssi, text);
                     }
@@ -503,7 +639,7 @@ fn main() -> anyhow::Result<()> {
                     bandwidth: Bandwidth::from_hz(current.bw_hz).unwrap_or(Bandwidth::Khz125),
                     coding_rate: CodingRate::from_denominator(current.cr).unwrap_or(CodingRate::Cr4_5),
                     sync_word: current.sync_word,
-                    tx_power_dbm: TX_POWER_DBM,
+                    tx_power_dbm,
                     ..Default::default()
                 };
                 recover_radio(&mut radio, &radio_config);
@@ -525,7 +661,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+        if last_heartbeat.elapsed() >= heartbeat_interval {
             last_heartbeat = Instant::now();
             let battery_reading = match battery.read() {
                 Ok((pct, mv)) => Some((pct, mv)),

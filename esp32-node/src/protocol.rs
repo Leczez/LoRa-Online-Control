@@ -2,10 +2,18 @@
 //! variants esp32-node itself needs to understand. This node only
 //! originates punches and doesn't relay Command/Ack frames for other nodes,
 //! so the full `Frame` enum isn't needed here — just enough to recognize the
-//! ack for our own outstanding send, and (as of the version-query addition)
-//! to reply to a version query addressed to us and to announce our own
-//! version once on boot. See docs/protocols/lora_online_control_protocol.md,
-//! "Punch Delivery" and "Version Reporting".
+//! ack for our own outstanding send, to reply to a version query addressed
+//! to us, to announce our own version once on boot, and (as of the
+//! settings-mode addition) to receive a `Command` addressed to us and reply
+//! with an `Ack`. See docs/protocols/lora_online_control_protocol.md,
+//! "Punch Delivery", "Version Reporting", and "Command Packets".
+//!
+//! `Setting` mirrors lora-server's own enum of the same name exactly (same
+//! variants, same wire encoding) — see its module doc comment for which
+//! settings apply immediately versus only while in settings mode. This node
+//! never originates a `Command`/`Ack` (only lora-server ever commands a
+//! node, never the reverse), so unlike lora-server's `Frame::Command`/`Ack`
+//! this only needs a parser for the former and an encoder for the latter.
 //!
 //! PACK is binary (see `parse_punch_ack`); VQUERY/VERSION/CACK stay plain
 //! text — see docs/protocols/lora_online_control_protocol.md, "Wire
@@ -54,6 +62,80 @@ pub fn encode_version_report(origin: u16, version: &str) -> String {
 pub fn parse_config_ack(s: &str) -> Option<u16> {
     let rest = s.strip_prefix("CACK ")?;
     rest.trim().parse().ok()
+}
+
+/// Mirrors lora-server's own `Setting` enum exactly — see its module doc
+/// comment (protocol.rs there) for the full rationale. `HeartbeatIntervalSecs`
+/// and `TxPowerDbm` apply immediately, any time; the rest only apply while
+/// this node is in settings mode (see main.rs's Command dispatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    HeartbeatIntervalSecs(u32),
+    TxPowerDbm(i8),
+    SettingsMode(bool),
+    Addr(u16),
+    Dest(u16),
+    FreqHz(u32),
+    SyncWord(u8),
+    Sf(u8),
+    BwHz(u32),
+    Cr(u8),
+}
+
+impl Setting {
+    pub fn encode(&self) -> String {
+        match self {
+            Setting::HeartbeatIntervalSecs(v) => std::format!("hb_interval={}", v),
+            Setting::TxPowerDbm(v) => std::format!("tx_power_dbm={}", v),
+            Setting::SettingsMode(v) => std::format!("settings_mode={}", if *v { 1 } else { 0 }),
+            Setting::Addr(v) => std::format!("addr={}", v),
+            Setting::Dest(v) => std::format!("dest={}", v),
+            Setting::FreqHz(v) => std::format!("freq_hz={}", v),
+            Setting::SyncWord(v) => std::format!("sync_word={}", v),
+            Setting::Sf(v) => std::format!("sf={}", v),
+            Setting::BwHz(v) => std::format!("bw_hz={}", v),
+            Setting::Cr(v) => std::format!("cr={}", v),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Setting> {
+        let (key, val) = s.split_once('=')?;
+        match key {
+            "hb_interval" => Some(Setting::HeartbeatIntervalSecs(val.parse().ok()?)),
+            "tx_power_dbm" => Some(Setting::TxPowerDbm(val.parse().ok()?)),
+            "settings_mode" => match val {
+                "1" => Some(Setting::SettingsMode(true)),
+                "0" => Some(Setting::SettingsMode(false)),
+                _ => None,
+            },
+            "addr" => Some(Setting::Addr(val.parse().ok()?)),
+            "dest" => Some(Setting::Dest(val.parse().ok()?)),
+            "freq_hz" => Some(Setting::FreqHz(val.parse().ok()?)),
+            "sync_word" => Some(Setting::SyncWord(val.parse().ok()?)),
+            "sf" => Some(Setting::Sf(val.parse().ok()?)),
+            "bw_hz" => Some(Setting::BwHz(val.parse().ok()?)),
+            "cr" => Some(Setting::Cr(val.parse().ok()?)),
+            _ => None,
+        }
+    }
+}
+
+/// Parses a `CMD <target> <commander> <key>=<value>` wire payload — must
+/// match lora-server's own `Frame::Command::encode()` format exactly.
+pub fn parse_command(s: &str) -> Option<(u16, u16, Setting)> {
+    let rest = s.strip_prefix("CMD ")?;
+    let mut parts = rest.splitn(3, ' ');
+    let target: u16 = parts.next()?.parse().ok()?;
+    let commander: u16 = parts.next()?.parse().ok()?;
+    let setting = Setting::parse(parts.next()?)?;
+    Some((target, commander, setting))
+}
+
+/// Encodes an `ACK <origin> <commander> <key>=<value>` wire payload — must
+/// match lora-server's own `Frame::Ack::encode()` format exactly, since
+/// that's what parses it on the other end.
+pub fn encode_ack(origin: u16, commander: u16, setting: Setting) -> String {
+    std::format!("ACK {} {} {}", origin, commander, setting.encode())
 }
 
 /// Wraps `radio.receive`, packaging the raw payload bytes with the
@@ -121,5 +203,42 @@ mod tests {
     fn test_parse_config_ack_rejects_garbage() {
         assert_eq!(parse_config_ack("CACK notanumber"), None);
         assert_eq!(parse_config_ack("HB"), None);
+    }
+
+    #[test]
+    fn test_setting_round_trips_every_variant() {
+        for setting in [
+            Setting::HeartbeatIntervalSecs(30),
+            Setting::TxPowerDbm(17),
+            Setting::SettingsMode(true),
+            Setting::SettingsMode(false),
+            Setting::Addr(10),
+            Setting::Dest(1),
+            Setting::FreqHz(433_000_000),
+            Setting::SyncWord(0x12),
+            Setting::Sf(11),
+            Setting::BwHz(125_000),
+            Setting::Cr(5),
+        ] {
+            assert_eq!(Setting::parse(&setting.encode()), Some(setting));
+        }
+    }
+
+    #[test]
+    fn test_parse_command() {
+        assert_eq!(parse_command("CMD 10 2 sf=11"), Some((10, 2, Setting::Sf(11))));
+    }
+
+    #[test]
+    fn test_parse_command_rejects_garbage() {
+        assert_eq!(parse_command("CMD notanumber 2 sf=11"), None);
+        assert_eq!(parse_command("CMD 10 2 unknown=11"), None);
+        assert_eq!(parse_command("CMD 10"), None);
+        assert_eq!(parse_command("HB"), None);
+    }
+
+    #[test]
+    fn test_encode_ack() {
+        assert_eq!(encode_ack(10, 2, Setting::Sf(11)), "ACK 10 2 sf=11");
     }
 }

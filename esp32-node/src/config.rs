@@ -2,12 +2,17 @@
 //! mode), persisted to NVS so they survive reboots. Defaults match
 //! lora-base-station's actual deployment (see esp32-node/src/main.rs).
 //!
-//! There is currently no live way to move a node onto a *non-default* LoRa
-//! mode short of changing `default_config()`'s consts and reflashing — the
-//! Wi-Fi config portal that used to do this (wifi_config.rs) is disabled by
-//! default (see its own doc comment) in favor of the ack-based
-//! auto-revert-to-standard mechanism in main.rs, and its eventual
-//! replacement (a LoRa-triggered settings mode) isn't built yet.
+//! Live-changeable two ways: the Wi-Fi config portal (wifi_config.rs,
+//! disabled by default — see its own doc comment) for local/physical
+//! access, or a LoRa-triggered settings-mode session (see
+//! `Setting::SettingsMode` in protocol.rs and main()'s Command dispatch)
+//! for remote access — the latter is what actually supersedes the portal
+//! as the default workflow. Both end the same way: a save to NVS here,
+//! followed by a reboot, which re-runs the ack-based post-boot
+//! verification window (`CONFIG_VERIFY_WINDOW` in main.rs) — that's what
+//! makes it safe to change SF/BW/CR/freq/sync_word remotely at all, since a
+//! bad value self-reverts after one 30-second boot instead of stranding
+//! the node.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
@@ -78,11 +83,12 @@ impl NodeConfig {
         }
     }
 
-    // Only called from wifi_config.rs's /save handler — the ack-based
-    // config-verification revert in main.rs deliberately does NOT call this
-    // (see its own comment for why), so with the wifi-config-portal feature
-    // off this has no callers at all.
-    #[cfg_attr(not(feature = "wifi-config-portal"), allow(dead_code))]
+    // Called from wifi_config.rs's /save handler (when that feature is
+    // enabled) and from main.rs's Command dispatch when a LoRa-triggered
+    // settings-mode session exits (see Setting::SettingsMode in
+    // protocol.rs) — deliberately NOT called by the ack-based
+    // config-verification revert in main.rs (see its own comment for why:
+    // that revert is this-boot-only, on purpose).
     pub fn save(&self, nvs: &mut EspNvs<NvsDefault>) -> anyhow::Result<()> {
         nvs.set_u16(KEY_ADDR, self.addr)?;
         nvs.set_u16(KEY_DEST, self.dest)?;
