@@ -30,11 +30,12 @@
 //! comes up, before anything that could hang — see Cargo.toml's
 //! debug-console feature. Never flash that build to a real field node.
 //!
-//! DIO0 completion detection (see dio0_interrupt.rs) uses a real hardware
-//! interrupt by default (`dio0-interrupt` feature, on by default) rather
-//! than `new_with_dio0`'s plain GPIO polling — still unverified by any real
-//! build; see that feature's own doc comment in Cargo.toml, including how
-//! to build the plain-polling variant instead for comparison.
+//! DIO0 completion detection defaults to `new_with_dio0`'s plain GPIO
+//! polling. `dio0_interrupt.rs` offers a real-hardware-interrupt
+//! alternative (`dio0-interrupt` feature, opt-in) — a field test found it
+//! completing sends in ~10ms at SF11 (real CAD+TX takes 280ms+), i.e.
+//! reporting success without actually transmitting; see that feature's own
+//! doc comment in Cargo.toml before re-enabling it.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for

@@ -28,7 +28,7 @@ debug = true
 opt-level = "z"
 
 [features]
-default = ["std", "esp-idf-svc/native", "dio0-interrupt"]
+default = ["std", "esp-idf-svc/native"]
 std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
 # Bench/debug build: skips cp210x::install() and the SI-reader thread
 # entirely (main.rs), so the native USB port stays in device/console mode
@@ -58,18 +58,20 @@ wifi-config-portal = []
 # Swaps DIO0 completion detection (dio0_interrupt.rs) from new_with_dio0's
 # plain GPIO-level polling to a genuine hardware interrupt + FreeRTOS task
 # notification (sx127x::DioWait) — the CPU actually blocks/idles between
-# checks instead of periodically re-reading the pin. On by default as of
-# the commit that made it so: the SF/BW-aware timeout fix
-# (sx127x::Config::cad_timeout_us/tx_timeout_us) alone didn't resolve the
-# field reliability issue this was built to help investigate, so this is
-# now the active path rather than an opt-in experiment. Still unverified
-# by any real build as of that same commit (no xtensa/esp-idf toolchain in
-# the sandbox that wrote it) — the exact esp-idf-hal/esp-idf-svc API calls
-# in dio0_interrupt.rs (subscribe/enable_interrupt/Notification::wait/
-# TickType::new_millis) need confirming against a real `cargo build
-# --release` before trusting this around a real interrupt. To fall back to
-# the plain-polling path for comparison:
-#   cargo build --release --no-default-features --features std,esp-idf-svc/native
+# checks instead of periodically re-reading the pin.
+#
+# Back to opt-in (was briefly default): a field test with this on showed
+# radio.send() completing in ~10ms per call at SF11/125kHz, where a real
+# CAD+TX cycle takes 280ms+ (preamble alone is ~200ms at SF11) — i.e.
+# wait_high() was returning Ok(true) almost instantly instead of waiting
+# for a genuine DIO0 edge, so every send silently transmitted nothing
+# while reporting success (no errors logged, nothing ever reached the base
+# station). Most likely a stale/latched GPIO interrupt being picked up by
+# enable_interrupt() right after the DIO_MAPPING1 remap, rather than a
+# fresh edge — unconfirmed, since this still can't be built/tested in the
+# sandbox that wrote it (no xtensa/esp-idf toolchain there). Needs that
+# root-caused and fixed before turning this back on. Build with:
+#   cargo build --release --features dio0-interrupt
 dio0-interrupt = []
 
 [dependencies]

@@ -2,10 +2,13 @@
 //! board's DIO0 pin (GPIO7 — see the wiring doc) — see `DioWait`'s own doc
 //! comment in the `sx127x` crate for why this exists: a genuine blocking
 //! wait, letting the CPU actually idle between checks, instead of
-//! `new_with_dio0`'s plain-`InputPin` polling. On by default (`dio0-
-//! interrupt` feature) — see Cargo.toml's own doc comment on that feature
-//! for why, and how to build the plain-polling variant instead if this
-//! needs to be ruled in or out during field debugging.
+//! `new_with_dio0`'s plain-`InputPin` polling. Opt-in (`dio0-interrupt`
+//! feature) — a field test found sends completing in ~10ms at SF11
+//! (real CAD+TX takes 280ms+), meaning `wait_high` was returning `Ok(true)`
+//! without a genuine DIO0 edge, so nothing was actually transmitted while
+//! every send still reported success. See Cargo.toml's own doc comment on
+//! this feature for the suspected cause (a stale/latched GPIO interrupt
+//! picked up by `enable_interrupt()`) before re-enabling it.
 //!
 //! Built on esp-idf-hal's GPIO interrupt support
 //! (`PinDriver::set_interrupt_type`/`subscribe`/`enable_interrupt`) and
