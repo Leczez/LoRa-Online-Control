@@ -76,7 +76,7 @@ impl<'d> sx127x::DioWait for Dio0Interrupt<'d> {
         // FreeRTOS tick this ultimately becomes can't represent
         // microsecond precision anyway, so this only ever rounds up to the
         // next whole millisecond, never down.
-        let timeout_ms = timeout_us.div_ceil(1000).max(1);
+        let timeout_ms = timeout_us.div_ceil(1000).max(1) as u64;
         let notified = self.notification.wait(TickType::new_millis(timeout_ms).ticks());
         Ok(notified.is_some())
     }
