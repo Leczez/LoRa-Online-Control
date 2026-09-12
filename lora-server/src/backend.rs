@@ -1,11 +1,20 @@
 use anyhow::Result;
 use sx127x::ReceivedPacket;
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{Frame, Setting};
 use crate::Args;
+
+/// The current competition's ID (see Args::competition_id), shared between
+/// the pusher thread (reads it fresh on every push) and the web dashboard
+/// (POST /setcompetitionid writes it, GET /status.json reads it) — plain
+/// `Arc<Mutex<String>>` rather than routing through the daemon's command
+/// channel like most other runtime settings, since nothing in
+/// run_daemon_loop's own radio-side logic needs to know it at all; this is
+/// purely an HTTP-push-to-roc-server concern.
+pub type SharedCompetitionId = Arc<Mutex<String>>;
 
 // ── Delay ─────────────────────────────────────────────────────────────────────
 
@@ -92,6 +101,16 @@ pub trait Radio: Send {
     /// Abandons every stuck unsent local punch (see PunchBuffer::clear_all_local_unsent).
     fn clear_all_punches(&mut self) -> Result<()> {
         anyhow::bail!("clear punches requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
+    }
+
+    /// Changes the competition ID the daemon's pusher thread sends with
+    /// every future punch push (see backend::SharedCompetitionId and
+    /// pusher.rs) — takes effect immediately, no restart needed. Same
+    /// "needs an attached daemon" restriction as send_test_punch: a
+    /// direct-hardware session has no pusher thread/roc-server relationship
+    /// at all to change this for.
+    fn set_competition_id(&mut self, _id: &str) -> Result<()> {
+        anyhow::bail!("setting competition id requires attaching to a running daemon (see lora-tui) — not available in direct hardware mode")
     }
 
     fn set_dest(&mut self, _dest: u16) -> Result<()> { Ok(()) }
@@ -317,8 +336,10 @@ fn run_spi(args: Args) -> Result<()> {
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
     let state = crate::daemon_state::new_shared();
+    let competition_id: SharedCompetitionId = Arc::new(Mutex::new(args.competition_id.clone()));
     crate::web::spawn_server(
-        args.web_listen.clone(), args.addr, Arc::clone(&state), Arc::clone(&radio_ready), args.roc_health_url.clone(), cmd_tx,
+        args.web_listen.clone(), args.addr, Arc::clone(&state), Arc::clone(&radio_ready), args.roc_health_url.clone(),
+        cmd_tx, Arc::clone(&competition_id),
     );
 
     let radio: Box<dyn Radio> = loop {
@@ -335,7 +356,7 @@ fn run_spi(args: Args) -> Result<()> {
         }
     };
 
-    let punch_buffer = setup_punch_pipeline(&args)?;
+    let punch_buffer = setup_punch_pipeline(&args, competition_id)?;
     run_daemon_loop(
         DaemonIdentity { own_addr: args.addr, dest: args.dest, heartbeat_interval: args.heartbeat_interval, relay: args.relay },
         cmd_rx, radio, si_rx, punch_buffer, state,
@@ -355,7 +376,7 @@ fn log_event(state: &crate::daemon_state::SharedState, msg: String) {
 /// starts the background pusher thread. Called once per daemon startup;
 /// the returned buffer is fed by run_daemon_loop for both local and remote
 /// punches regardless of whether pushing is enabled.
-fn setup_punch_pipeline(args: &Args) -> Result<Arc<crate::punch_buffer::PunchBuffer>> {
+fn setup_punch_pipeline(args: &Args, competition_id: SharedCompetitionId) -> Result<Arc<crate::punch_buffer::PunchBuffer>> {
     if let Some(parent) = std::path::Path::new(&args.punch_db).parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -366,6 +387,7 @@ fn setup_punch_pipeline(args: &Args) -> Result<Arc<crate::punch_buffer::PunchBuf
             Arc::clone(&buffer),
             push_to.clone(),
             Duration::from_secs(args.push_interval_secs),
+            competition_id,
         );
         log::info!("punch pusher started, pushing to {}", push_to);
     } else {
@@ -1194,6 +1216,13 @@ impl Radio for HttpRadio {
             .map_err(|e| anyhow::anyhow!("POST /queryversion failed: {}", e))?;
         Ok(())
     }
+
+    fn set_competition_id(&mut self, id: &str) -> Result<()> {
+        ureq::post(&format!("{}/setcompetitionid", self.base_url))
+            .send_string(&format!("competition_id={}", id))
+            .map_err(|e| anyhow::anyhow!("POST /setcompetitionid failed: {}", e))?;
+        Ok(())
+    }
 }
 
 /// `addr` is discovered from the attached daemon itself (its own
@@ -1367,7 +1396,7 @@ mod tests {
         let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         let listen = free_test_listen_addr();
-        crate::web::spawn_server(listen.clone(), 5, state, radio_ready, None, cmd_tx);
+        crate::web::spawn_server(listen.clone(), 5, state, radio_ready, None, cmd_tx, Arc::new(Mutex::new("evt-1".to_string())));
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 
@@ -1393,7 +1422,7 @@ mod tests {
         let radio_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<String>();
         let listen = free_test_listen_addr();
-        crate::web::spawn_server(listen.clone(), 5, Arc::clone(&state), radio_ready, None, cmd_tx);
+        crate::web::spawn_server(listen.clone(), 5, Arc::clone(&state), radio_ready, None, cmd_tx, Arc::new(Mutex::new("evt-1".to_string())));
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 

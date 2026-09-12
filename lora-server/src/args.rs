@@ -106,4 +106,20 @@ pub struct Args {
     /// How often the background pusher checks the buffer for unsent punches.
     #[arg(long, env = "LORA_PUSH_INTERVAL_SECS", default_value_t = 10)]
     pub push_interval_secs: u64,
+
+    /// The current competition's ID — mandatory, and must equal whatever
+    /// roc-server's own --competition-id/ROC_SERVER_COMPETITION_ID is set
+    /// to. Sent with every punch pushed to roc-server (see pusher.rs);
+    /// roc-server rejects a push whose competition_id doesn't match its own
+    /// configured value, and only ever serves /mip and /roc punches tagged
+    /// with the current one — this is what actually stops a previous
+    /// event's punches from leaking into a new one that reuses the same
+    /// roc-server (see roc-server's own Args::competition_id doc comment
+    /// for the full rationale). Runtime-changeable without a restart via
+    /// POST /setcompetitionid (web.rs) or lora-tui's /competitionid
+    /// command — this value is only a *starting* point for whatever a
+    /// technician sets at the start of an event, not fixed at boot like
+    /// most of the other settings here.
+    #[arg(long, env = "LORA_COMPETITION_ID")]
+    pub competition_id: String,
 }

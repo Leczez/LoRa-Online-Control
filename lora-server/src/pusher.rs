@@ -6,6 +6,7 @@
 // only delays delivery (punches stay in the buffer, unsent), it never blocks
 // or affects the daemon's own reception/logging.
 
+use crate::backend::SharedCompetitionId;
 use crate::punch_buffer::PunchBuffer;
 use serde::Serialize;
 use std::sync::Arc;
@@ -17,22 +18,32 @@ struct PunchPush<'a> {
     station: u8,
     time_s: u32,
     source: &'a str,
+    /// The *current* value at push time, not whatever it was when this
+    /// punch was originally received — a technician can change the
+    /// competition ID live (POST /setcompetitionid) without restarting,
+    /// and any punch still sitting unsent in the buffer when that happens
+    /// should go out tagged with the new value, not a stale one. roc-server
+    /// rejects a mismatch against its own configured value; see
+    /// Args::competition_id's doc comment for the full rationale.
+    competition_id: &'a str,
 }
 
 /// Spawns the pusher thread. `push_url` is the output server's ingestion
 /// endpoint, e.g. `http://100.x.y.z:8080/punches`.
-pub fn spawn(buffer: Arc<PunchBuffer>, push_url: String, poll_interval: Duration) {
+pub fn spawn(buffer: Arc<PunchBuffer>, push_url: String, poll_interval: Duration, competition_id: SharedCompetitionId) {
     std::thread::Builder::new()
         .name("punch-pusher".into())
         .spawn(move || loop {
             match buffer.unsent() {
                 Ok(unsent) => {
+                    let current_competition_id = competition_id.lock().unwrap().clone();
                     for punch in unsent {
                         let body = PunchPush {
                             card_id: punch.card_id,
                             station: punch.station,
                             time_s: punch.time_s,
                             source: &punch.source,
+                            competition_id: &current_competition_id,
                         };
                         match ureq::post(&push_url)
                             .timeout(Duration::from_secs(5))
@@ -107,10 +118,12 @@ mod tests {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
         });
 
-        spawn(Arc::clone(&buffer), format!("http://{}/punches", addr), Duration::from_millis(50));
+        let competition_id: SharedCompetitionId = Arc::new(std::sync::Mutex::new("evt-42".to_string()));
+        spawn(Arc::clone(&buffer), format!("http://{}/punches", addr), Duration::from_millis(50), competition_id);
 
         let body = body_rx.recv_timeout(Duration::from_secs(2)).expect("pusher never sent a request");
         assert!(body.contains("\"card_id\":123456"), "body was: {body}");
+        assert!(body.contains("\"competition_id\":\"evt-42\""), "body was: {body}");
         assert!(body.contains("\"station\":31"), "body was: {body}");
         assert!(body.contains("\"time_s\":36070"), "body was: {body}");
         assert!(body.contains("\"source\":\"local\""), "body was: {body}");

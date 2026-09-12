@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use tiny_http::{Header, Method, Response, Server};
 
+use crate::backend::SharedCompetitionId;
 use crate::daemon_state::SharedState;
 use crate::health::RadioReady;
 
@@ -57,6 +58,11 @@ struct StatusView {
     /// deploy script) confirm a redeploy actually took by comparing this
     /// against the commit they just pushed, without SSHing in.
     version: &'static str,
+    /// The competition ID currently being sent with every pushed punch (see
+    /// pusher.rs) — runtime-changeable via POST /setcompetitionid, so this
+    /// is the live value, not necessarily what --competition-id was set to
+    /// at boot.
+    competition_id: String,
     radio_ready: bool,
     roc_reachable: Option<bool>,
     nodes: Vec<NodeView>,
@@ -71,7 +77,10 @@ fn secs_ago(t: SystemTime) -> u64 {
 /// background checker thread's state here too — avoids two different
 /// notions of "reachable" needing to agree, at the cost of a sub-second
 /// HTTP round trip per dashboard load.
-fn build_status(own_addr: u16, state: &SharedState, radio_ready: &RadioReady, roc_health_url: &Option<String>) -> StatusView {
+fn build_status(
+    own_addr: u16, state: &SharedState, radio_ready: &RadioReady, roc_health_url: &Option<String>,
+    competition_id: &SharedCompetitionId,
+) -> StatusView {
     let guard = state.lock().unwrap();
     let mut nodes: Vec<NodeView> = guard
         .nodes
@@ -105,6 +114,7 @@ fn build_status(own_addr: u16, state: &SharedState, radio_ready: &RadioReady, ro
     StatusView {
         own_addr,
         version: crate::version::VERSION,
+        competition_id: competition_id.lock().unwrap().clone(),
         radio_ready: radio_ready.load(Ordering::SeqCst),
         roc_reachable,
         nodes,
@@ -190,6 +200,7 @@ fn pill(good: bool, text: &str) -> String {
 fn render_html(v: &StatusView) -> String {
     let own_addr = v.own_addr;
     let version = html_escape(v.version);
+    let competition_id = html_escape(&v.competition_id);
     let radio_cell = if v.radio_ready {
         pill(true, "ready")
     } else {
@@ -256,7 +267,21 @@ fn render_html(v: &StatusView) -> String {
 <table>
 <tr><th>Radio</th><td>{radio_cell}</td></tr>
 <tr><th>roc-server</th><td>{roc_cell}</td></tr>
+<tr><th>Competition</th><td class="mono">{competition_id}</td></tr>
 </table>
+</div>
+
+<h2>Competition ID</h2>
+<div class="card">
+<p class="hint">Sent with every punch pushed to roc-server, which rejects a mismatch
+against its own configured value — must equal whatever MEOS's Online Input dialog
+is configured with. Change this at the start of a new event; the previous
+event's punches (which roc-server keeps around) will never leak into a
+different competition ID's results. Takes effect immediately, no restart needed.</p>
+<form method="POST" action="/setcompetitionid">
+  <label>Competition ID <input type="text" name="competition_id" value="{competition_id}" required></label>
+  <button type="submit">Save</button>
+</form>
 </div>
 
 <h2>Nodes</h2>
@@ -317,7 +342,8 @@ fn command_channel_down() -> Response<std::io::Cursor<Vec<u8>>> {
 /// health::spawn_checker already uses) — `None` means "don't check,
 /// roc-server reachability just won't be shown."
 pub fn spawn_server(
-    listen: String, own_addr: u16, state: SharedState, radio_ready: RadioReady, roc_health_url: Option<String>, cmd_tx: Sender<String>,
+    listen: String, own_addr: u16, state: SharedState, radio_ready: RadioReady, roc_health_url: Option<String>,
+    cmd_tx: Sender<String>, competition_id: SharedCompetitionId,
 ) {
     std::thread::Builder::new()
         .name("web-server".into())
@@ -338,15 +364,34 @@ pub fn spawn_server(
 
                 let response = match (&method, path.as_str()) {
                     (Method::Get, "/status.json") => {
-                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url);
+                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url, &competition_id);
                         let body = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string());
                         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
                         Response::from_string(body).with_header(header)
                     }
                     (Method::Get, "/") => {
-                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url);
+                        let v = build_status(own_addr, &state, &radio_ready, &roc_health_url, &competition_id);
                         let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
                         Response::from_string(render_html(&v)).with_header(header)
+                    }
+                    // Runtime-changeable without a restart, unlike most of
+                    // this daemon's other settings — see
+                    // backend::SharedCompetitionId's doc comment for why
+                    // this writes straight to the shared value instead of
+                    // going through cmd_tx like /setdest, /cmd, etc.
+                    (Method::Post, "/setcompetitionid") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let form = parse_form(&body);
+                        match form.get("competition_id").filter(|s| !s.is_empty()) {
+                            Some(id) => {
+                                *competition_id.lock().unwrap() = id.to_string();
+                                log::info!("competition id changed to {:?}", id);
+                                let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+                                Response::from_string("<html><body>Saved. <a href=\"/\">Back</a></body></html>").with_header(header)
+                            }
+                            None => Response::from_string("missing/empty competition_id").with_status_code(400),
+                        }
                     }
                     (Method::Post, "/testpunch") => {
                         let mut body = String::new();
@@ -481,7 +526,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
 
-        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let json = loop {
@@ -528,7 +573,7 @@ mod tests {
         let radio_ready = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, Arc::clone(&state), radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let json = loop {
@@ -553,13 +598,53 @@ mod tests {
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "QUERYVERSION 10");
     }
 
+    /// /setcompetitionid writes straight to the shared value (not via
+    /// cmd_tx like the endpoints above) — confirms a real POST actually
+    /// changes what /status.json reports immediately after, and that an
+    /// empty value is rejected rather than silently accepted (an empty
+    /// competition_id could never match anything roc-server checks against,
+    /// so accepting it would just mean every future push/poll starts
+    /// failing until someone notices).
+    #[test]
+    fn test_setcompetitionid_endpoint_changes_live_value() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<String>();
+        let listen = free_listen_addr();
+        let competition_id = Arc::new(std::sync::Mutex::new("evt-1".to_string()));
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx, Arc::clone(&competition_id));
+        let base_url = format!("http://{listen}");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ureq::get(&format!("{base_url}/status.json")).call() {
+                Ok(resp) => {
+                    assert!(resp.into_string().unwrap().contains("\"competition_id\": \"evt-1\""));
+                    break;
+                }
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("web dashboard never came up: {e}"),
+            }
+        }
+
+        let resp = ureq::post(&format!("{base_url}/setcompetitionid")).send_string("competition_id=evt-2").unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(*competition_id.lock().unwrap(), "evt-2");
+        let json = ureq::get(&format!("{base_url}/status.json")).call().unwrap().into_string().unwrap();
+        assert!(json.contains("\"competition_id\": \"evt-2\""), "status.json was: {json}");
+
+        let empty = ureq::post(&format!("{base_url}/setcompetitionid")).send_string("competition_id=");
+        assert_eq!(empty.unwrap_err().into_response().unwrap().status(), 400);
+        assert_eq!(*competition_id.lock().unwrap(), "evt-2", "empty value should not have overwritten the real one");
+    }
+
     #[test]
     fn test_clearpunch_and_clearpunches_endpoints_drive_command_channel() {
         let state = crate::daemon_state::new_shared();
         let radio_ready = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -588,7 +673,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
         drop(cmd_rx); // simulates the daemon loop having died
         let listen = free_listen_addr();
-        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx);
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {

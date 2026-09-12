@@ -117,6 +117,14 @@ LORA_HEALTH_CHECK_INTERVAL_SECS=30
 # default: lora-server still serves its own /health on LORA_HEALTH_LISTEN
 # regardless, it just won't check roc-server's.
 #LORA_ROC_HEALTH_URL=http://127.0.0.1:8080/health
+# Mandatory — the daemon refuses to start without it. Must equal whatever
+# roc-server's own --competition-id/ROC_SERVER_COMPETITION_ID is set to,
+# and whatever MEOS's Online Input dialog is configured with. Changeable
+# live without a restart via the web dashboard or lora-tui's
+# /competitionid command once the daemon is running — this is just the
+# starting value. Set this to a real value before starting the service;
+# do not leave the placeholder in place.
+LORA_COMPETITION_ID=your-competition-id
 ENV
     echo "Created /etc/lora-server/env (edit to configure)"
 else

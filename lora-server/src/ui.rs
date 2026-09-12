@@ -25,6 +25,7 @@ const HELP_TEXT: &[&str] = &[
     "  /addr <addr>                        change this session's own displayed address",
     "  /cmd <target-addr> <heartbeat-secs>  ask a node to change its heartbeat interval",
     "  /queryversion <target-addr>          ask a node to report its firmware version",
+    "  /competitionid <id>                  change the competition id pushed to roc-server",
     "  /testpunch <card_id> <station> <time_s>  inject a synthetic test punch",
     "  /clearpunch <id>                     abandon one stuck unsent local punch",
     "  /clearpunches                        abandon every stuck unsent local punch",
@@ -412,6 +413,22 @@ pub fn run_app(
                                             timestamp: ts,
                                             message: "usage: /queryversion <target-addr>".to_string(),
                                         }),
+                                    }
+                                } else if let Some(val) = msg.strip_prefix("/competitionid ") {
+                                    let id = val.trim();
+                                    if id.is_empty() {
+                                        app.push_log(LogEntry::Error {
+                                            timestamp: ts,
+                                            message: "usage: /competitionid <id>".to_string(),
+                                        });
+                                    } else {
+                                        match radio.set_competition_id(id) {
+                                            Ok(()) => app.push_log(LogEntry::Info {
+                                                timestamp: ts,
+                                                message: format!("competition id set to {id:?}"),
+                                            }),
+                                            Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
+                                        }
                                     }
                                 } else if let Some(val) = msg.strip_prefix("/testpunch ") {
                                     let mut parts = val.trim().splitn(3, ' ');
