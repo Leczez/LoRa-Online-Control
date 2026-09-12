@@ -115,6 +115,15 @@ const CONFIG_VERIFY_WINDOW: Duration = Duration::from_secs(30);
 /// a false "this config doesn't work" conclusion and an unnecessary revert.
 const CONFIG_VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a normal (non-debug-console) build keeps the native USB port in
+/// device/console mode after boot before `cp210x::install()` switches it to
+/// host mode for SI-master reading — see that call's own doc comment for why
+/// the switch costs the serial console for the rest of the boot. Gives
+/// anyone watching a live console (no SI reader plugged in, no need for the
+/// debug-console build) a window to see boot/radio/config-verify output
+/// before it goes dark, without needing a special build for it.
+const USB_HOST_DELAY: Duration = Duration::from_secs(10);
+
 struct PendingPunch {
     card_id: u32,
     payload: Vec<u8>,
@@ -296,6 +305,11 @@ fn main() -> anyhow::Result<()> {
     // serial log.
     let reset_reason = esp_idf_hal::reset::ResetReason::get();
     log::info!("esp32-node {} booting (reset reason: {:?})", VERSION, reset_reason);
+    // Captured this early so the USB_HOST_DELAY wait below (right before
+    // cp210x::install() steals the console) accounts for time already
+    // spent on radio/config setup, instead of adding a flat 10s on top of
+    // whatever that took.
+    let boot_instant = Instant::now();
 
     let peripherals = Peripherals::take()?;
 
@@ -512,7 +526,14 @@ fn main() -> anyhow::Result<()> {
         // the serial console for the rest of the boot. The debug-console
         // feature (Cargo.toml) skips this (and SI reading) entirely so the
         // console survives instead, for exactly the debugging situation
-        // this comment is attached to.
+        // this comment is attached to. USB_HOST_DELAY buys the same console
+        // visibility for a normal build too, for its first few seconds:
+        // subtracting what boot/radio/config setup already took means this
+        // never waits longer than USB_HOST_DELAY total since power-on.
+        let elapsed = boot_instant.elapsed();
+        if elapsed < USB_HOST_DELAY {
+            std::thread::sleep(USB_HOST_DELAY - elapsed);
+        }
         cp210x::install()?;
         spawn_si_reader_thread(punch_tx, Arc::clone(&si_present));
     }
