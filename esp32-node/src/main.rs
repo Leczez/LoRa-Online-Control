@@ -135,21 +135,21 @@ fn spawn_si_reader_thread(punch_tx: mpsc::Sender<CardReadout>, si_present: Arc<A
 const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 
 // Fixed modem parameters, shared fleet-wide — not exposed via the config
-// page (only addr/dest/freq are; see wifi_config.rs). Must match
+// page (only addr/dest/freq/sync_word are; see wifi_config.rs). Must match
 // lora-base-station's deployed /etc/lora-server/env.
 const SPREADING_FACTOR: u8 = 7;
 const BANDWIDTH: Bandwidth = Bandwidth::Khz125;
 const CODING_RATE: CodingRate = CodingRate::Cr4_5;
-const SYNC_WORD: u8 = 0x12;
 const TX_POWER_DBM: i8 = 20;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
-/// docs/protocols/lora_online_control_protocol.md). A function, not a
-/// const, since NodeConfig::network_id is a heap String — String::from
-/// isn't callable in a const context.
+/// docs/protocols/lora_online_control_protocol.md). sync_word=0x12 (18
+/// decimal) matches lora-base-station's own deployed default — see
+/// NodeConfig::sync_word's doc comment for why this is the one setting here
+/// that most needs changing away from the default for a real deployment.
 fn default_config() -> NodeConfig {
-    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, network_id: "LOC".to_string() }
+    NodeConfig { addr: 10, dest: 1, freq_hz: 433_000_000, sync_word: 0x12 }
 }
 
 /// Recovers from a send failure by forcing a real hardware reset and full
@@ -208,9 +208,10 @@ fn main() -> anyhow::Result<()> {
 
     // Either returns after the window closes with `current` still accurate
     // (nothing saved), or a save inside the portal calls esp_restart()
-    // directly and this call never returns at all. Cloned since `current`
-    // (not Copy — network_id is a String) is still needed below.
-    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current.clone())?;
+    // directly and this call never returns at all. NodeConfig is Copy, so
+    // passing it here doesn't consume the binding `current` is still needed
+    // below.
+    wifi_config::run(peripherals.modem, sysloop, Arc::clone(&nvs), current)?;
 
     let pins = peripherals.pins;
 
@@ -248,7 +249,7 @@ fn main() -> anyhow::Result<()> {
         spreading_factor: SPREADING_FACTOR,
         bandwidth: BANDWIDTH,
         coding_rate: CODING_RATE,
-        sync_word: SYNC_WORD,
+        sync_word: current.sync_word,
         tx_power_dbm: TX_POWER_DBM,
         ..Default::default()
     };
@@ -257,8 +258,8 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("radio configure failed: {:?}", e))?;
 
     log::info!(
-        "esp32-node up: addr={} dest={} freq={}Hz sf={} network_id={}",
-        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.network_id
+        "esp32-node up: addr={} dest={} freq={}Hz sf={} sync_word={:#04x}",
+        current.addr, current.dest, current.freq_hz, SPREADING_FACTOR, current.sync_word
     );
     persistent_log::append(&mut nvs.lock().unwrap(), "radio up");
 
@@ -270,7 +271,7 @@ fn main() -> anyhow::Result<()> {
     // just won't show up until the next boot or an explicit /queryversion —
     // not worth retrying for a value that never changes mid-session.
     let boot_report = protocol::encode_version_report(current.addr, VERSION);
-    match protocol::send_framed(&mut radio, current.dest, boot_report.as_bytes(), &current.network_id) {
+    match radio.send(current.dest, boot_report.as_bytes()) {
         Ok(()) => {
             log::info!("VERSION to {:#06x}: {}", current.dest, boot_report);
             persistent_log::append(&mut nvs.lock().unwrap(), "boot announce: ok");
@@ -336,7 +337,7 @@ fn main() -> anyhow::Result<()> {
     let mut pending_punch: Option<PendingPunch> = None;
 
     loop {
-        match protocol::receive_framed(&mut radio, &current.network_id) {
+        match protocol::receive_text(&mut radio) {
             Ok(Some((src_addr, rssi, text))) => {
                 if let Some((node, card_id)) = protocol::parse_punch_ack(&text) {
                     if node == current.addr
@@ -348,7 +349,7 @@ fn main() -> anyhow::Result<()> {
                 } else if let Some(target) = protocol::parse_version_query(&text) {
                     if target == current.addr {
                         let report = protocol::encode_version_report(current.addr, VERSION);
-                        match protocol::send_framed(&mut radio, src_addr, report.as_bytes(), &current.network_id) {
+                        match radio.send(src_addr, report.as_bytes()) {
                             Ok(()) => log::info!("VERSION to {:#06x}: {}", src_addr, report),
                             Err(e) => {
                                 log::warn!("version query reply failed: {:?}", e);
@@ -379,7 +380,7 @@ fn main() -> anyhow::Result<()> {
             let si_flag = if si_present.load(Ordering::SeqCst) { '1' } else { '0' };
             let hb_payload = std::format!("HB {} {}", battery_field, si_flag);
             hb_attempt += 1;
-            match protocol::send_framed(&mut radio, current.dest, hb_payload.as_bytes(), &current.network_id) {
+            match radio.send(current.dest, hb_payload.as_bytes()) {
                 Ok(()) => {
                     log::info!("HB to {:#06x}: {}", current.dest, hb_payload);
                     persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("hb #{}: ok", hb_attempt));
@@ -402,7 +403,7 @@ fn main() -> anyhow::Result<()> {
         if pending_punch.is_none() {
             if let Some(readout) = punch_queue.pop_front() {
                 let payload = readout.to_payload(current.addr, current.dest);
-                match protocol::send_framed(&mut radio, current.dest, payload.as_bytes(), &current.network_id) {
+                match radio.send(current.dest, payload.as_bytes()) {
                     Ok(()) => {
                         log::info!("PUNCH to {:#06x}: {}", current.dest, payload);
                         pending_punch = Some(PendingPunch {
@@ -420,7 +421,7 @@ fn main() -> anyhow::Result<()> {
             if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
                 p.attempts += 1;
                 p.sent_at = Instant::now();
-                match protocol::send_framed(&mut radio, current.dest, p.payload.as_bytes(), &current.network_id) {
+                match radio.send(current.dest, p.payload.as_bytes()) {
                     Ok(()) => log::info!("PUNCH retry #{} to {:#06x}: {}", p.attempts, current.dest, p.payload),
                     Err(e) => {
                         log::warn!("PUNCH retry failed: {:?}", e);

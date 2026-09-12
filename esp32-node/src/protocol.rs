@@ -33,33 +33,22 @@ pub fn encode_version_report(origin: u16, version: &str) -> String {
     std::format!("VERSION {} {}", origin, version)
 }
 
-/// Wraps `radio.send`, prepending the shared deployment network ID (see
-/// docs/protocols/lora_online_control_protocol.md, "Network Identification")
-/// — must match `lora-server`'s `NetworkFilteredRadio::send` exactly, since
-/// that's the same envelope on the other end.
-pub fn send_framed<R: sx127x::LoraRadio>(
-    radio: &mut R, dest: u16, payload: &[u8], network_id: &str,
-) -> Result<(), R::Error> {
-    let mut framed = std::vec::Vec::with_capacity(network_id.len() + 1 + payload.len());
-    framed.extend_from_slice(network_id.as_bytes());
-    framed.push(b' ');
-    framed.extend_from_slice(payload);
-    radio.send(dest, &framed)
-}
-
-/// Wraps `radio.receive`, stripping and validating the network ID before
-/// handing back the inner payload as a `String` — a mismatched or missing ID
-/// is treated as if nothing was received, not misparsed as one of our own
-/// malformed frames. Mirrors `lora-server`'s `NetworkFilteredRadio::receive`.
-pub fn receive_framed<R: sx127x::LoraRadio>(
-    radio: &mut R, network_id: &str,
+/// Wraps `radio.receive`, validating the payload as UTF-8 and packaging it
+/// with the sender/RSSI into the tuple `main.rs`'s loop consumes — a
+/// malformed (non-UTF-8) payload is treated as if nothing was received, not
+/// misparsed as one of our own malformed frames. No longer strips a shared
+/// deployment network ID (removed — the radio's own sync word already
+/// guards against cross-talk with another deployment nearby, for free, at
+/// the hardware level, checked during preamble detection before the chip
+/// even demodulates a mismatched packet — see
+/// docs/protocols/lora_online_control_protocol.md, "Network Identification"
+/// and NodeConfig::sync_word).
+pub fn receive_text<R: sx127x::LoraRadio>(
+    radio: &mut R,
 ) -> Result<Option<(u16, Option<i16>, String)>, R::Error> {
     let Some(pkt) = radio.receive()? else { return Ok(None) };
     let Ok(text) = core::str::from_utf8(&pkt.payload) else { return Ok(None) };
-    let Some(rest) = text.strip_prefix(network_id).and_then(|s| s.strip_prefix(' ')) else {
-        return Ok(None);
-    };
-    Ok(Some((pkt.src_addr, pkt.rssi, rest.to_string())))
+    Ok(Some((pkt.src_addr, pkt.rssi, text.to_string())))
 }
 
 #[cfg(test)]

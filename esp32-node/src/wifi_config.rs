@@ -87,15 +87,15 @@ pub fn run(
             addr: form.get("addr").and_then(|v| v.parse().ok()).unwrap_or(current.addr),
             dest: form.get("dest").and_then(|v| v.parse().ok()).unwrap_or(current.dest),
             freq_hz: form.get("freq").and_then(|v| v.parse().ok()).unwrap_or(current.freq_hz),
-            network_id: form.get("network_id").map(|v| v.to_string()).unwrap_or_else(|| current.network_id.clone()),
+            sync_word: form.get("sync_word").and_then(|v| v.parse().ok()).unwrap_or(current.sync_word),
         };
         {
             let mut guard = save_nvs.lock().unwrap();
             updated.save(&mut guard)?;
         }
         log::info!(
-            "config saved (addr={} dest={} freq={} network_id={}), rebooting to apply",
-            updated.addr, updated.dest, updated.freq_hz, updated.network_id
+            "config saved (addr={} dest={} freq={} sync_word={}), rebooting to apply",
+            updated.addr, updated.dest, updated.freq_hz, updated.sync_word
         );
 
         let mut resp = req.into_ok_response()?;
@@ -128,15 +128,18 @@ fn render_page(cfg: &NodeConfig) -> String {
   <label>Node address <input type="number" name="addr" value="{addr}"></label><br>
   <label>Base/dest address <input type="number" name="dest" value="{dest}"></label><br>
   <label>Frequency (Hz) <input type="number" name="freq" value="{freq}"></label><br>
-  <label>Network ID <input type="text" name="network_id" value="{network_id}"></label><br>
+  <label>Sync word (0-255, decimal) <input type="number" name="sync_word" min="0" max="255" value="{sync_word}"></label><br>
   <button type="submit">Save &amp; restart</button>
 </form>
+<p>Sync word is the only guard against cross-talk with another
+event running this same firmware nearby — must match lora-server's own
+--sync-word exactly.</p>
 <p><a href="/log">View boot/checkpoint log</a></p>
 </body></html>"#,
         addr = cfg.addr,
         dest = cfg.dest,
         freq = cfg.freq_hz,
-        network_id = cfg.network_id,
+        sync_word = cfg.sync_word,
     )
 }
 
