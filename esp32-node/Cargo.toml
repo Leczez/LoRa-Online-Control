@@ -55,6 +55,22 @@ debug-console = []
 # apply it). Build with:
 #   cargo build --release --features wifi-config-portal
 wifi-config-portal = []
+# Swaps DIO0 completion detection (dio0_interrupt.rs) from new_with_dio0's
+# plain GPIO-level polling to a genuine hardware interrupt + FreeRTOS task
+# notification (sx127x::DioWait) — the CPU actually blocks/idles between
+# checks instead of periodically re-reading the pin, at the cost of using
+# ESP-IDF's GPIO ISR machinery, which is inherently harder to get exactly
+# right than a plain level read. Off by default deliberately: this is
+# unverified by any real build as of the commit that added it (no
+# xtensa/esp-idf toolchain in the sandbox that wrote it) and swapping the
+# active DIO0 strategy while an unrelated radio-reliability issue is being
+# actively debugged would add a new variable to that investigation. Try it
+# once the underlying reliability question (see
+# docs/protocols/lora_online_control_protocol.md's "RF Parameters" section
+# and sx127x::Config::cad_timeout_us/tx_timeout_us) is settled, not before.
+# Build with:
+#   cargo build --release --features dio0-interrupt
+dio0-interrupt = []
 
 [dependencies]
 log = { version = "0.4", default-features = false }

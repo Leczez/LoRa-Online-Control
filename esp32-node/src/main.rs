@@ -29,6 +29,11 @@
 //! relays the persisted checkpoint log over LoRa right after the radio
 //! comes up, before anything that could hang — see Cargo.toml's
 //! debug-console feature. Never flash that build to a real field node.
+//!
+//! `--features dio0-interrupt` swaps DIO0 completion detection from plain
+//! GPIO polling to a real hardware interrupt (see dio0_interrupt.rs) — off
+//! by default and unverified by any build; see that feature's own doc
+//! comment in Cargo.toml before enabling it.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for
@@ -59,6 +64,10 @@ mod config;
 // feature and main()'s own comment at that call site.
 #[cfg_attr(feature = "debug-console", allow(dead_code))]
 mod cp210x;
+// Off by default — see its own doc comment and Cargo.toml's dio0-interrupt
+// feature for why.
+#[cfg(feature = "dio0-interrupt")]
+mod dio0_interrupt;
 mod persistent_log;
 mod protocol;
 mod psram;
@@ -345,6 +354,16 @@ fn main() -> anyhow::Result<()> {
         &SpiConfig::new().baudrate(4.MHz().into()).data_mode(MODE_0),
     )?;
 
+    // Two mutually exclusive DIO0 completion strategies, selected at
+    // compile time (not runtime) since they produce genuinely different
+    // Sx127xSpi types — see Cargo.toml's dio0-interrupt feature doc
+    // comment for why the interrupt-backed one is opt-in, not the default.
+    #[cfg(feature = "dio0-interrupt")]
+    let mut radio = {
+        let waiter = dio0_interrupt::Dio0Interrupt::new(dio0)?;
+        Sx127xSpi::new_with_dio0_waiter(spi, reset, Delay::new_default(), waiter)
+    };
+    #[cfg(not(feature = "dio0-interrupt"))]
     let mut radio = Sx127xSpi::new_with_dio0(spi, reset, Delay::new_default(), dio0);
 
     // Live-changeable via Setting::TxPowerDbm (see main loop's Command
