@@ -35,7 +35,14 @@ std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
 # for the whole session instead of cp210x::install() switching it into host
 # mode partway through boot. Trades away SI-master reading for a live
 # serial console across the whole boot sequence — including every
-# heartbeat send, not just the boot-time Wi-Fi portal window. Build with:
+# heartbeat send, not just the boot-time Wi-Fi portal window. Also relays
+# the persisted checkpoint log (persistent_log.rs) over LoRa as plain text
+# frames right after the radio comes up, before anything else that could
+# hang — useful when a live serial console isn't an option either (e.g.
+# powering the node from a bench supply on a different machine than the one
+# watching logs): the checkpoint history, including how far a previous
+# stuck boot got, shows up in lora-tui/the web dashboard regardless. Build
+# with:
 #   cargo build --release --features debug-console
 # Never enable this for a real field deployment — a node built this way
 # can't read punches at all.

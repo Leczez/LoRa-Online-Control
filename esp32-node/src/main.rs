@@ -25,9 +25,10 @@
 //! Build with `--features debug-console` for a bench/debug variant that
 //! skips SI-master reading entirely so the USB serial console stays live
 //! for the whole session (normally lost partway through boot once
-//! cp210x::install() switches the native USB port into host mode) — see
-//! Cargo.toml's debug-console feature. Never flash that build to a real
-//! field node.
+//! cp210x::install() switches the native USB port into host mode), and
+//! relays the persisted checkpoint log over LoRa right after the radio
+//! comes up, before anything that could hang — see Cargo.toml's
+//! debug-console feature. Never flash that build to a real field node.
 
 // `Allocator` is nightly-only; the esp-rs Xtensa toolchain is itself a
 // nightly build, so this is available — see psram.rs's own doc comment for
@@ -378,6 +379,45 @@ fn main() -> anyhow::Result<()> {
         current.addr, current.dest, current.freq_hz, current.sf, current.bw_hz, current.cr, current.sync_word
     );
     persistent_log::append(&mut nvs.lock().unwrap(), "radio up");
+
+    // Relays the persisted checkpoint log (persistent_log.rs — normally
+    // only visible via the Wi-Fi portal's /log page, itself disabled by
+    // default) over LoRa instead, as plain uplink text frames, right here —
+    // as early as possible after the radio comes up, before anything else
+    // this boot does that could hang or fail. The point: if a bug further
+    // down (heartbeat send, config verification, ...) leaves this boot
+    // stuck with no way to get a live serial console attached (e.g.
+    // powering from a bench supply on a different machine than the one
+    // watching logs), the checkpoint history — including how far the
+    // *previous*, now-stuck boot got — has already gone out over the air
+    // and shows up in lora-tui/the web dashboard regardless. Each line is
+    // its own frame (not one combined payload) since the persisted history
+    // can exceed a single LoRa packet's payload limit, and losing one frame
+    // to a collision shouldn't take the rest with it. Gated behind
+    // debug-console since normal field operation has no use for this
+    // (extra boot-time airtime, and a technician isn't watching lora-tui
+    // during ordinary deployment) — this is purely a bring-up/bench
+    // debugging aid.
+    #[cfg(feature = "debug-console")]
+    {
+        let lines = persistent_log::read_lines(&nvs.lock().unwrap());
+        log::info!("debug-console: relaying {} persistent-log line(s) over LoRa", lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            let payload = format!("DBGLOG {}/{} {}", i + 1, lines.len(), line);
+            match radio.send(current.dest, payload.as_bytes()) {
+                Ok(()) => log::info!("DBGLOG to {:#06x}: {}", current.dest, payload),
+                Err(e) => {
+                    log::warn!("debug-console: failed to relay log line: {:?}", e);
+                    recover_radio(&mut radio, &radio_config);
+                }
+            }
+            // Purely to keep the dashboard/lora-tui log readable one line at
+            // a time rather than as a burst — radio.send() already blocks
+            // until each frame's airtime is actually done, so this isn't
+            // needed for correctness, just legibility.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     // Announced once immediately, then re-announced every
     // CONFIG_VERIFY_RETRY_INTERVAL until either a ConfigAck arrives or
