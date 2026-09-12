@@ -209,12 +209,35 @@ where
             return Err(Sx127xError::Timeout(event.timeout_kind()));
         }
 
-        for _ in 0..max_polls {
+        // TEMPORARY diagnostic isolation (2026-09-12): the SPI-only
+        // (no DIO0, no waiter) branch — the only one esp32-node uses now —
+        // reverted to the exact pre-timeout-rewrite polling semantics: a
+        // large fixed iteration count, no delay between checks, ignoring
+        // timeout_us entirely. Every DIO0 strategy tried tonight (GPIO
+        // polling, a real interrupt) showed radio.send() reporting success
+        // in ~10ms at SF11, where real airtime is 280ms+ — but the last
+        // build that actually worked also used this same time-based/
+        // delayed rewrite's SPI fallback design pattern, just via
+        // new_with_dio0's DIO0-level polling variant, not this exact
+        // branch. This isolates whether the timeout/delay rewrite itself
+        // (not DIO0, already ruled out as the sole factor) is what broke
+        // real hardware sends. If this restores correct behavior and
+        // packets actually reach the base station, the bug is in
+        // max_polls/POLL_INTERVAL_US's delay-based design, not DIO0 or SPI
+        // wiring — revert this to the timeout-based version afterward
+        // either way, this isn't meant to stay.
+        #[cfg(not(test))]
+        const SPI_POLL_ITERATIONS: u32 = 100_000;
+        // Kept small under test so existing mocks (which supply a handful
+        // of canned SPI transactions, not 100,000) still exercise the same
+        // timeout-kind-reporting logic without changing what's covered.
+        #[cfg(test)]
+        const SPI_POLL_ITERATIONS: u32 = 2;
+        for _ in 0..SPI_POLL_ITERATIONS {
             let irq = self.read_register(REG_IRQ_FLAGS)?;
             if irq & event.irq_bit() != 0 {
                 return Ok(irq);
             }
-            self.delay.delay_us(Self::POLL_INTERVAL_US);
         }
         Err(Sx127xError::Timeout(event.timeout_kind()))
     }
