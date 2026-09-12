@@ -6,7 +6,7 @@ use embedded_hal::{
     spi::SpiDevice,
 };
 
-use crate::{Config, LoraRadio, NoInputPin, ReceivedPacket, Sx127xError, TimeoutKind};
+use crate::{Config, DioWait, LoraRadio, NoInputPin, NoWaiter, ReceivedPacket, Sx127xError, TimeoutKind};
 
 const REG_FIFO: u8 = 0x00;
 const REG_OP_MODE: u8 = 0x01;
@@ -85,11 +85,18 @@ impl WaitFor {
     }
 }
 
-pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin> {
+pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin, W = NoWaiter> {
     pub(crate) spi: SPI,
     pub(crate) reset: RESET,
     pub(crate) delay: DELAY,
     dio0: Option<DIO0>,
+    /// Set only by `new_with_dio0_waiter` — a real blocking-with-timeout
+    /// wait (see `DioWait`), checked by `wait_for` before falling back to
+    /// `dio0`'s plain polling. Mutually exclusive with `dio0` in practice
+    /// (a given instance uses one DIO0 strategy or the other), but nothing
+    /// stops both being `Some` at the type level — `wait_for` just always
+    /// prefers `waiter` when present.
+    waiter: Option<W>,
     addr: u16,
     /// The last `Config` applied via `configure()` — kept around so
     /// `wait_for`'s CAD/TX timeouts can be computed from the *actual*
@@ -102,21 +109,21 @@ pub struct Sx127xSpi<SPI, RESET, DELAY, DIO0 = NoInputPin> {
     config: Config,
 }
 
-impl<SPI, RESET, DELAY> Sx127xSpi<SPI, RESET, DELAY, NoInputPin>
+impl<SPI, RESET, DELAY> Sx127xSpi<SPI, RESET, DELAY, NoInputPin, NoWaiter>
 where
     SPI: SpiDevice,
     RESET: OutputPin,
     DELAY: DelayNs,
 {
     /// Completion (TX/CAD) is detected by polling IRQ_FLAGS over SPI — the
-    /// only option without a DIO0 pin wired. See `new_with_dio0` for the
-    /// lower-overhead alternative.
+    /// only option without a DIO0 pin wired. See `new_with_dio0`/
+    /// `new_with_dio0_waiter` for lower-overhead alternatives.
     pub fn new(spi: SPI, reset: RESET, delay: DELAY) -> Self {
-        Self { spi, reset, delay, dio0: None, addr: 0, config: Config::default() }
+        Self { spi, reset, delay, dio0: None, waiter: None, addr: 0, config: Config::default() }
     }
 }
 
-impl<SPI, RESET, DELAY, DIO0> Sx127xSpi<SPI, RESET, DELAY, DIO0>
+impl<SPI, RESET, DELAY, DIO0> Sx127xSpi<SPI, RESET, DELAY, DIO0, NoWaiter>
 where
     SPI: SpiDevice,
     RESET: OutputPin,
@@ -128,12 +135,42 @@ where
     /// SPI transaction, so this busy-waits much more efficiently than the
     /// SPI-polling default. Requires wiring the module's DIO0 pin to `dio0`;
     /// its mapping (which event it reflects) is reconfigured automatically
-    /// for whichever operation is about to run.
+    /// for whichever operation is about to run. See `new_with_dio0_waiter`
+    /// for a real-interrupt alternative on a platform that supports one.
     pub fn new_with_dio0(spi: SPI, reset: RESET, delay: DELAY, dio0: DIO0) -> Self {
-        Self { spi, reset, delay, dio0: Some(dio0), addr: 0, config: Config::default() }
+        Self { spi, reset, delay, dio0: Some(dio0), waiter: None, addr: 0, config: Config::default() }
     }
+}
 
-    /// `wait_for` re-checks completion every `POLL_INTERVAL_US` — far
+impl<SPI, RESET, DELAY, W> Sx127xSpi<SPI, RESET, DELAY, NoInputPin, W>
+where
+    SPI: SpiDevice,
+    RESET: OutputPin,
+    DELAY: DelayNs,
+    W: DioWait,
+{
+    /// Like `new_with_dio0`, but completion (TX/CAD) is detected via a
+    /// genuine blocking wait (typically backed by a real hardware
+    /// interrupt) rather than polling — see `DioWait`'s doc comment. `wait`
+    /// owns its own timeout entirely; `wait_for` calls it exactly once per
+    /// wait rather than driving a poll loop itself. See esp32-node's own
+    /// DIO0 wrapper for a concrete ESP-IDF-backed implementation.
+    pub fn new_with_dio0_waiter(spi: SPI, reset: RESET, delay: DELAY, wait: W) -> Self {
+        Self { spi, reset, delay, dio0: None, waiter: Some(wait), addr: 0, config: Config::default() }
+    }
+}
+
+impl<SPI, RESET, DELAY, DIO0, W> Sx127xSpi<SPI, RESET, DELAY, DIO0, W>
+where
+    SPI: SpiDevice,
+    RESET: OutputPin,
+    DELAY: DelayNs,
+    DIO0: InputPin,
+    W: DioWait,
+{
+    /// Only used by the `dio0` (plain polling) path — `waiter`'s own
+    /// `wait_high` owns its entire timeout internally, no re-checking
+    /// needed here. Re-checks completion every `POLL_INTERVAL_US` — far
     /// shorter than any real CAD/TX duration (milliseconds or more at any
     /// supported SF/BW), so this adds nothing meaningful to how quickly
     /// completion is actually detected. Using a real delay between checks,
@@ -146,6 +183,18 @@ where
     const POLL_INTERVAL_US: u32 = 100;
 
     fn wait_for(&mut self, event: WaitFor, timeout_us: u32) -> Result<u8, Sx127xError<SPI::Error>> {
+        if self.waiter.is_some() {
+            self.write_register(REG_DIO_MAPPING1, event.dio0_mapping())?;
+            // Safe: confirmed Some above, and this borrow doesn't overlap
+            // the self.read_register(..) call below it.
+            let high = self.waiter.as_mut().unwrap().wait_high(timeout_us).map_err(|_| Sx127xError::InvalidConfig)?;
+            return if high {
+                self.read_register(REG_IRQ_FLAGS)
+            } else {
+                Err(Sx127xError::Timeout(event.timeout_kind()))
+            };
+        }
+
         let max_polls = (timeout_us / Self::POLL_INTERVAL_US).max(1);
         if self.dio0.is_some() {
             self.write_register(REG_DIO_MAPPING1, event.dio0_mapping())?;
@@ -229,12 +278,13 @@ where
     }
 }
 
-impl<SPI, RESET, DELAY, DIO0> LoraRadio for Sx127xSpi<SPI, RESET, DELAY, DIO0>
+impl<SPI, RESET, DELAY, DIO0, W> LoraRadio for Sx127xSpi<SPI, RESET, DELAY, DIO0, W>
 where
     SPI: SpiDevice,
     RESET: OutputPin,
     DELAY: DelayNs,
     DIO0: InputPin,
+    W: DioWait,
 {
     type Error = Sx127xError<SPI::Error>;
 
@@ -743,5 +793,69 @@ mod tests {
         radio.spi.done();
         radio.reset.done();
         radio.dio0.unwrap().done();
+    }
+
+    /// A `DioWait` test double — queued `Ok(bool)`/`Err(())` responses,
+    /// returned in order, one per `wait_high` call. Unlike `PinMock`-backed
+    /// `dio0`, this owns its entire wait (including "timing out"), matching
+    /// what a real interrupt-backed implementation does — see `DioWait`'s
+    /// doc comment.
+    struct MockWaiter {
+        responses: std::vec::Vec<Result<bool, ()>>,
+    }
+
+    impl DioWait for MockWaiter {
+        type Error = ();
+        fn wait_high(&mut self, _timeout_us: u32) -> Result<bool, ()> {
+            assert!(!self.responses.is_empty(), "wait_high called more times than expected");
+            self.responses.remove(0)
+        }
+    }
+
+    /// Proves `wait_for` prefers `waiter` over `dio0`/SPI-polling when
+    /// present, and — unlike the polling paths — calls `wait_high` exactly
+    /// once per wait rather than looping, since the waiter owns its own
+    /// timeout.
+    #[test]
+    fn test_wait_for_via_waiter_happy_path_calls_wait_high_exactly_once() {
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_CADDONE]),
+            SpiTx::transaction_end(),
+            SpiTx::transaction_start(),
+            SpiTx::transfer_in_place(std::vec![REG_IRQ_FLAGS & 0x7F, 0x00], std::vec![0x00, IRQ_CAD_DONE]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let waiter = MockWaiter { responses: std::vec![Ok(true)] };
+        let mut radio = Sx127xSpi::new_with_dio0_waiter(spi, reset, NoopDelay, waiter);
+
+        let irq = radio.wait_for(WaitFor::CadDone, 30_000).unwrap();
+        assert_eq!(irq, IRQ_CAD_DONE);
+        assert!(radio.waiter.unwrap().responses.is_empty(), "wait_high should have been called exactly once");
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    /// A `wait_high` timeout (`Ok(false)`) is a clean, expected outcome —
+    /// no retry inside `wait_for` itself, since the waiter already spent
+    /// the full `timeout_us` internally.
+    #[test]
+    fn test_wait_for_via_waiter_timeout_reports_correct_kind() {
+        let spi = SpiMock::<u8>::new(&[
+            SpiTx::transaction_start(),
+            SpiTx::write_vec(std::vec![REG_DIO_MAPPING1 | 0x80, DIO0_MAPPING_TXDONE]),
+            SpiTx::transaction_end(),
+        ]);
+        let reset = PinMock::new(&[]);
+        let waiter = MockWaiter { responses: std::vec![Ok(false)] };
+        let mut radio = Sx127xSpi::new_with_dio0_waiter(spi, reset, NoopDelay, waiter);
+
+        let result = radio.wait_for(WaitFor::TxDone, 30_000);
+        assert!(matches!(result, Err(Sx127xError::Timeout(TimeoutKind::TxDone))));
+
+        radio.spi.done();
+        radio.reset.done();
     }
 }

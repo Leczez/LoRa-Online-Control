@@ -34,6 +34,43 @@ impl embedded_hal::digital::InputPin for NoInputPin {
     }
 }
 
+/// A DIO0 pin (or equivalent) capable of a genuine blocking wait for its
+/// own rising edge — typically backed by a real hardware GPIO interrupt —
+/// rather than the plain level-polling `new_with_dio0`'s `InputPin` bound
+/// gets you. Entirely optional and additive: `new_with_dio0`'s existing
+/// polling behavior is unchanged and doesn't require this trait at all;
+/// this is only for `new_with_dio0_waiter`, for a platform that can do
+/// better than polling.
+///
+/// The implementor owns the *entire* wait, timeout included — unlike the
+/// `InputPin` polling path (where `wait_for` itself drives the poll loop
+/// and the delay between checks), `wait_for` calls `wait_high` exactly
+/// once per wait and trusts it to honor `timeout_us` internally (e.g. via
+/// a real interrupt plus a task notification with a timeout, letting the
+/// CPU actually idle instead of spinning). See esp32-node's own DIO0
+/// wrapper for a concrete ESP-IDF-backed implementation.
+pub trait DioWait {
+    type Error: core::fmt::Debug;
+    /// Blocks until this pin's rising edge occurs, or `timeout_us`
+    /// microseconds elapse — whichever comes first. `Ok(true)` on a real
+    /// edge, `Ok(false)` on timeout.
+    fn wait_high(&mut self, timeout_us: u32) -> Result<bool, Self::Error>;
+}
+
+/// Placeholder for `Sx127xSpi` instances constructed without a real
+/// `DioWait` implementation (i.e. anything using `new`/`new_with_dio0`
+/// rather than `new_with_dio0_waiter`) — mirrors `NoInputPin`'s role for
+/// the polling path. Never actually exercised.
+#[derive(Debug, Default)]
+pub struct NoWaiter;
+
+impl DioWait for NoWaiter {
+    type Error = core::convert::Infallible;
+    fn wait_high(&mut self, _timeout_us: u32) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
 /// A packet received from the radio.
 #[derive(Debug)]
 pub struct ReceivedPacket {
