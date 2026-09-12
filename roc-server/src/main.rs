@@ -34,20 +34,34 @@ struct Args {
     #[arg(long, env = "ROC_SERVER_HEALTH_CHECK_INTERVAL_SECS", default_value_t = 30)]
     health_check_interval_secs: u64,
 
-    /// Expected competition ID. MEOS sends one on every /mip (a "competition"
-    /// header) and /roc (a "unitId" query param) request — verified against
-    /// the real MEOS source (onlineinput.cpp's OnlineInput::process): both
-    /// protocols send it, this server just never checked it before. Unset
-    /// by default (`None`): every request is accepted regardless of what
-    /// competition ID it names, which is exactly today's behavior and the
-    /// only sane default for a single-event deployment — this server has no
-    /// concept of "competitions" to scope by, and it's what every existing
-    /// deployment already assumes. Set this only if MEOS is configured with
-    /// a matching ID and you want /mip and /roc to reject requests that
-    /// don't name it (e.g. a stray or misconfigured second MEOS instance
-    /// pointed at the same server).
+    /// The current competition's ID. Mandatory — every /mip request (a
+    /// "competition" header), /roc request (a "unitId" query param), and
+    /// /punches push from lora-server (a body field) must name exactly this
+    /// value or gets rejected (403). Verified against the real MEOS source
+    /// (onlineinput.cpp's OnlineInput::process): MEOS always sends one on
+    /// both protocols, this server just didn't check it until now.
+    ///
+    /// This is what actually stops punches from a *previous* competition
+    /// (still sitting in this server's SQLite store — the data volume
+    /// persists across redeploys/restarts by design) from being served to a
+    /// *new* one reusing the same server: every stored punch is tagged with
+    /// whichever competition_id was configured when it was pushed, and
+    /// `/mip`/`/roc` only ever return punches matching the currently
+    /// configured value — a plain `lastId`/cursor check alone can't do this,
+    /// since a fresh MEOS Online Input setup naturally starts from
+    /// `lastId=0` and would otherwise happily receive every punch this
+    /// server has ever stored, from any event. An old deployment's punches
+    /// (recorded before this column existed) get backfilled to an empty
+    /// string on migration — see store.rs — which can never match a real,
+    /// non-empty competition_id, so they're naturally excluded going
+    /// forward without needing to manually wipe anything.
+    ///
+    /// Deliberately mandatory, not optional: an operator forgetting to set
+    /// this for a new event is exactly the failure mode this exists to
+    /// prevent, so there's no "unconfigured = accept anything" fallback to
+    /// silently reintroduce it.
     #[arg(long, env = "ROC_SERVER_COMPETITION_ID")]
-    competition_id: Option<String>,
+    competition_id: String,
 }
 
 /// Mirrors lora-server's own health-check thread (lora-server/src/
@@ -88,6 +102,11 @@ struct PunchPush {
     time_s: u32,
     #[allow(dead_code)]
     source: String,
+    /// lora-server's own currently-configured competition ID (see its
+    /// --competition-id) — checked against this server's own configured
+    /// value in handle_punches, so a mismatch between the two servers'
+    /// configuration is a loud rejection, not silently-stored wrong data.
+    competition_id: String,
 }
 
 fn main() -> Result<()> {
@@ -119,7 +138,7 @@ fn main() -> Result<()> {
 /// hand-built request/response values.
 fn run_server(
     listen: &str, store: Arc<Store>, activity: SharedActivity,
-    lora_health_url: Option<String>, competition_id: Option<String>,
+    lora_health_url: Option<String>, competition_id: String,
 ) -> Result<()> {
     log::info!("roc-server listening on {}", listen);
     let server = Server::http(listen).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -130,7 +149,7 @@ fn run_server(
         let path = url.split('?').next().unwrap_or("").to_string();
 
         let response = match (&method, path.as_str()) {
-            (Method::Post, "/punches") => handle_punches(&mut request, &store, &activity),
+            (Method::Post, "/punches") => handle_punches(&mut request, &store, &activity, &competition_id),
             (Method::Get, "/mip") => handle_mip(&request, &url, &store, &activity, &competition_id),
             (Method::Get, "/roc") => handle_roc(&url, &store, &activity, &competition_id),
             (Method::Get, "/health") => text_response(200, "ok"),
@@ -156,7 +175,9 @@ fn xml_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body).with_header(header)
 }
 
-fn handle_punches(request: &mut tiny_http::Request, store: &Store, activity: &SharedActivity) -> Response<std::io::Cursor<Vec<u8>>> {
+fn handle_punches(
+    request: &mut tiny_http::Request, store: &Store, activity: &SharedActivity, expected_competition_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut body = String::new();
     if let Err(e) = request.as_reader().read_to_string(&mut body) {
         log::warn!("failed to read /punches body: {e}");
@@ -171,7 +192,23 @@ fn handle_punches(request: &mut tiny_http::Request, store: &Store, activity: &Sh
         }
     };
 
-    match store.record(punch.card_id, punch.station, punch.time_s, &punch.source) {
+    // Catches lora-server and roc-server being configured with two
+    // different competition IDs — a real misconfiguration this rejects
+    // loudly (and visibly, via the activity log) rather than silently
+    // storing punches tagged with the wrong ID.
+    if punch.competition_id != expected_competition_id {
+        log::warn!(
+            "/punches push rejected: competition id {:?} doesn't match {:?}",
+            punch.competition_id, expected_competition_id
+        );
+        activity.lock().unwrap().push_log(format!(
+            "PUNCH rejected: competition id {:?} doesn't match this server's {:?}",
+            punch.competition_id, expected_competition_id
+        ));
+        return text_response(403, "wrong competition id");
+    }
+
+    match store.record(punch.card_id, punch.station, punch.time_s, &punch.source, &punch.competition_id) {
         Ok(id) => {
             log::info!("recorded punch id={id} card={} station={}", punch.card_id, punch.station);
             let mut a = activity.lock().unwrap();
@@ -229,20 +266,16 @@ fn competition_id_from_roc_request(url: &str) -> Option<String> {
     query_param(url, "unitId")
 }
 
-/// `expected` unset (`None`) means "don't check" — every request is
-/// accepted regardless of what competition ID it names, or whether it
-/// names one at all. That's the default and matches every existing
-/// deployment's actual behavior; see Args::competition_id's doc comment.
-fn competition_id_ok(expected: &Option<String>, actual: Option<&str>) -> bool {
-    match expected {
-        None => true,
-        Some(want) => actual == Some(want.as_str()),
-    }
+/// Mandatory exact match — no "unconfigured, accept anything" bypass, since
+/// an operator forgetting to set this is exactly the failure mode it exists
+/// to prevent (see Args::competition_id's doc comment).
+fn competition_id_ok(expected: &str, actual: Option<&str>) -> bool {
+    actual == Some(expected)
 }
 
 fn handle_mip(
     request: &tiny_http::Request, url: &str, store: &Store, activity: &SharedActivity,
-    expected_competition_id: &Option<String>,
+    expected_competition_id: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let actual_competition_id = competition_id_from_mip_request(request);
     if !competition_id_ok(expected_competition_id, actual_competition_id.as_deref()) {
@@ -251,7 +284,7 @@ fn handle_mip(
         return text_response(403, "wrong competition id");
     }
     let last_id = last_id_from_request(request, url);
-    match store.since(last_id) {
+    match store.since(last_id, expected_competition_id) {
         Ok(punches) => {
             let new_last_id = punches.last().map(|p| p.id).unwrap_or(last_id);
             activity.lock().unwrap().push_log(format!("MIP poll lastid={last_id} -> {} punch(es)", punches.len()));
@@ -265,7 +298,7 @@ fn handle_mip(
 }
 
 fn handle_roc(
-    url: &str, store: &Store, activity: &SharedActivity, expected_competition_id: &Option<String>,
+    url: &str, store: &Store, activity: &SharedActivity, expected_competition_id: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let actual_competition_id = competition_id_from_roc_request(url);
     if !competition_id_ok(expected_competition_id, actual_competition_id.as_deref()) {
@@ -274,7 +307,7 @@ fn handle_roc(
         return text_response(403, "wrong competition id");
     }
     let last_id: i64 = query_param(url, "lastId").and_then(|v| v.parse().ok()).unwrap_or(0);
-    match store.since(last_id) {
+    match store.since(last_id, expected_competition_id) {
         Ok(punches) => {
             let date = match store.today() {
                 Ok(d) => d,
@@ -485,17 +518,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_competition_id_ok_when_unconfigured_accepts_anything() {
-        assert!(competition_id_ok(&None, None));
-        assert!(competition_id_ok(&None, Some("anything")));
-    }
-
-    #[test]
-    fn test_competition_id_ok_requires_exact_match_when_configured() {
-        let expected = Some("evt-42".to_string());
-        assert!(competition_id_ok(&expected, Some("evt-42")));
-        assert!(!competition_id_ok(&expected, Some("evt-43")));
-        assert!(!competition_id_ok(&expected, None));
+    fn test_competition_id_ok_requires_exact_match() {
+        assert!(competition_id_ok("evt-42", Some("evt-42")));
+        assert!(!competition_id_ok("evt-42", Some("evt-43")));
+        assert!(!competition_id_ok("evt-42", None));
     }
 
     #[test]
@@ -525,12 +551,11 @@ mod tests {
     /// Real run_server, real HTTP requests — not just competition_id_ok in
     /// isolation. Confirms a mismatched competition id gets 403'd on both
     /// /mip (header-based) and /roc (query-param-based), and that the exact
-    /// same requests succeed once no competition id is configured at all
-    /// (today's behavior, and the default).
+    /// same requests succeed once the right one is sent.
     #[test]
-    fn test_endpoints_reject_wrong_competition_id_when_configured() {
+    fn test_endpoints_reject_wrong_competition_id() {
         let store = Arc::new(Store::open(":memory:").unwrap());
-        store.record(123456, 31, 100, "local").unwrap();
+        store.record(123456, 31, 100, "local", "evt-42").unwrap();
         let activity = activity::new_shared();
         let listen = free_listen_addr();
         let listen_for_thread = listen.clone();
@@ -539,7 +564,7 @@ mod tests {
 
         std::thread::spawn(move || {
             let _ = run_server(
-                &listen_for_thread, store_for_thread, activity_for_thread, None, Some("evt-42".to_string()),
+                &listen_for_thread, store_for_thread, activity_for_thread, None, "evt-42".to_string(),
             );
         });
         let base_url = format!("http://{listen}");
@@ -562,12 +587,11 @@ mod tests {
         assert_eq!(roc_right.unwrap().status(), 200);
     }
 
-    /// Same real server, but with no competition_id configured at all —
-    /// every request must succeed regardless of what (if anything) it
-    /// sends, since this is the default for every existing single-event
-    /// deployment.
+    /// Same check, for /punches (lora-server's push endpoint) — a body
+    /// whose competition_id doesn't match this server's configured value
+    /// must be rejected, not silently stored under the wrong id.
     #[test]
-    fn test_endpoints_accept_any_competition_id_when_unconfigured() {
+    fn test_punches_endpoint_rejects_wrong_competition_id() {
         let store = Arc::new(Store::open(":memory:").unwrap());
         let activity = activity::new_shared();
         let listen = free_listen_addr();
@@ -576,21 +600,22 @@ mod tests {
         let activity_for_thread = Arc::clone(&activity);
 
         std::thread::spawn(move || {
-            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+            let _ = run_server(
+                &listen_for_thread, store_for_thread, activity_for_thread, None, "evt-42".to_string(),
+            );
         });
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 
-        assert_eq!(ureq::get(&format!("{base_url}/mip")).call().unwrap().status(), 200);
-        assert_eq!(
-            ureq::get(&format!("{base_url}/mip")).set("competition", "whatever").call().unwrap().status(),
-            200
-        );
-        assert_eq!(ureq::get(&format!("{base_url}/roc?lastId=0")).call().unwrap().status(), 200);
-        assert_eq!(
-            ureq::get(&format!("{base_url}/roc?unitId=whatever&lastId=0")).call().unwrap().status(),
-            200
-        );
+        let wrong = ureq::post(&format!("{base_url}/punches"))
+            .send_string(r#"{"card_id":1,"station":1,"time_s":100,"source":"local","competition_id":"evt-99"}"#);
+        assert_eq!(wrong.unwrap_err().into_response().unwrap().status(), 403);
+        assert!(store.since(0, "evt-42").unwrap().is_empty(), "wrong-competition punch was stored anyway");
+
+        let right = ureq::post(&format!("{base_url}/punches"))
+            .send_string(r#"{"card_id":1,"station":1,"time_s":100,"source":"local","competition_id":"evt-42"}"#);
+        assert_eq!(right.unwrap().status(), 200);
+        assert_eq!(store.since(0, "evt-42").unwrap().len(), 1);
     }
 
     /// Real handle_roc against a real store: confirms /roc's timestamp
@@ -601,7 +626,7 @@ mod tests {
     #[test]
     fn test_roc_endpoint_reports_time_of_day_from_punch_time_s_not_receipt_time() {
         let store = Arc::new(Store::open(":memory:").unwrap());
-        store.record(123456, 31, 36070, "local").unwrap();
+        store.record(123456, 31, 36070, "local", "evt-42").unwrap();
         let activity = activity::new_shared();
         let listen = free_listen_addr();
         let listen_for_thread = listen.clone();
@@ -609,12 +634,12 @@ mod tests {
         let activity_for_thread = Arc::clone(&activity);
 
         std::thread::spawn(move || {
-            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, "evt-42".to_string());
         });
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
 
-        let body = ureq::get(&format!("{base_url}/roc?lastId=0")).call().unwrap().into_string().unwrap();
+        let body = ureq::get(&format!("{base_url}/roc?unitId=evt-42&lastId=0")).call().unwrap().into_string().unwrap();
         assert!(body.ends_with("10:01:10"), "expected time-of-day derived from time_s=36070, got: {body}");
     }
 
@@ -632,7 +657,7 @@ mod tests {
         let activity_for_thread = Arc::clone(&activity);
 
         std::thread::spawn(move || {
-            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, None);
+            let _ = run_server(&listen_for_thread, store_for_thread, activity_for_thread, None, "evt-42".to_string());
         });
         let base_url = format!("http://{listen}");
         wait_for_server(&base_url);
