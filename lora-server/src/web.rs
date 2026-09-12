@@ -426,6 +426,27 @@ pub fn spawn_server(
                             }
                         }
                     }
+                    // Hex-encoded body — byte-safe counterpart to /send,
+                    // used internally by HttpRadio::send (see backend.rs)
+                    // rather than by a human operator: a payload here can
+                    // be one of the binary hot-path frames (PUNCH/PACK/HB),
+                    // which /send's plain-text contract can't carry without
+                    // corrupting it. Validated as hex here so a malformed
+                    // body 400s immediately instead of silently failing
+                    // deeper in the daemon loop.
+                    (Method::Post, "/sendbin") => {
+                        let mut body = String::new();
+                        let _ = request.as_reader().read_to_string(&mut body);
+                        let hex = body.trim();
+                        if hex.is_empty() || crate::backend::from_hex(hex).is_none() {
+                            Response::from_string("empty or invalid hex payload").with_status_code(400)
+                        } else {
+                            match cmd_tx.send(format!("SENDBIN {}", hex)) {
+                                Ok(()) => Response::from_string("ok"),
+                                Err(_) => command_channel_down(),
+                            }
+                        }
+                    }
                     (Method::Post, "/setdest") => {
                         let mut body = String::new();
                         let _ = request.as_reader().read_to_string(&mut body);
@@ -596,6 +617,27 @@ mod tests {
 
         ureq::post(&format!("http://{listen}/queryversion")).send_string("target=10").unwrap();
         assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "QUERYVERSION 10");
+    }
+
+    /// /sendbin is the byte-safe counterpart to /send (see HttpRadio::send
+    /// in backend.rs) — a hex body round-trips into a `SENDBIN <hex>`
+    /// command line unchanged, and a malformed body is rejected with 400
+    /// before it ever reaches the command channel.
+    #[test]
+    fn test_sendbin_endpoint_drives_command_channel_and_rejects_bad_hex() {
+        let state = crate::daemon_state::new_shared();
+        let radio_ready = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        let listen = free_listen_addr();
+        spawn_server(listen.clone(), 10, state, radio_ready, None, cmd_tx, Arc::new(std::sync::Mutex::new("evt-1".to_string())));
+
+        let resp = ureq::post(&format!("http://{listen}/sendbin")).send_string("0102ff").unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "SENDBIN 0102ff");
+
+        let bad = ureq::post(&format!("http://{listen}/sendbin")).send_string("not hex");
+        assert_eq!(bad.unwrap_err().into_response().unwrap().status(), 400);
+        assert!(cmd_rx.recv_timeout(Duration::from_millis(200)).is_err(), "invalid hex must not reach the command channel");
     }
 
     /// /setcompetitionid writes straight to the shared value (not via

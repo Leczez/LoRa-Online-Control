@@ -1,12 +1,22 @@
 // lora-server/src/protocol.rs
 //
 // Wire format for the control-plane frames layered on top of the existing
-// free-text "HB"/"PUNCH ..." payloads (see sportident.rs and
-// docs/protocols/lora_online_control_protocol.md): a downlink `CMD` frame
-// lets the base station change a limited set of settings on a specific
-// node, and an uplink `ACK` frame confirms it landed. Scope is deliberately
-// narrow — only settings that can't strand a node if misapplied (see the
-// protocol doc's "Command Packets" section) get a `Setting` variant here.
+// binary PUNCH/HB payloads (see sportident.rs and backend.rs) and the
+// binary PunchAck below: a downlink `CMD` frame lets the base station
+// change a limited set of settings on a specific node, and an uplink `ACK`
+// frame confirms it landed. Scope is deliberately narrow — only settings
+// that can't strand a node if misapplied (see the protocol doc's "Command
+// Packets" section) get a `Setting` variant here.
+//
+// `Frame` itself stays plain ASCII text — every variant here is sent at
+// most a handful of times per node per session (a boot announcement, an
+// occasional settings change), so the airtime cost of decimal-text framing
+// is negligible in aggregate, and staying human-readable in lora-tui's raw
+// traffic log or a serial console is worth more than the few bytes binary
+// framing would save. `encode_punch_ack`/`parse_punch_ack` below are the
+// one exception — `PunchAck` used to be a `Frame` variant too, but it's
+// sent once per punch, so it moved to packed binary alongside PUNCH/HB (see
+// docs/protocols/lora_online_control_protocol.md, "Wire Format").
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
@@ -43,12 +53,6 @@ pub enum Frame {
     /// back to `commander` (echoed from the `Command` that prompted it) so
     /// a relay forwarding this ack knows where it's ultimately headed.
     Ack { origin: u16, commander: u16, setting: Setting },
-    /// Confirms to `node` that its punch for `card_id` was received. A node
-    /// holds its next punch (stop-and-wait, see the protocol doc) until this
-    /// arrives or a retry timeout elapses, so only one punch is ever
-    /// unacknowledged at a time per node — `card_id` alone is enough to
-    /// disambiguate since there's never more than one outstanding.
-    PunchAck { node: u16, card_id: u32 },
     /// Downlink: asks node `target` to report its firmware version.
     /// Distinct from `Command`/`Ack` (which apply a `Setting` the commander
     /// already knows the value of) since a version's value is exactly what
@@ -82,7 +86,6 @@ impl Frame {
         match self {
             Frame::Command { target, commander, setting } => format!("CMD {} {} {}", target, commander, setting.encode()),
             Frame::Ack { origin, commander, setting } => format!("ACK {} {} {}", origin, commander, setting.encode()),
-            Frame::PunchAck { node, card_id } => format!("PACK {} {}", node, card_id),
             Frame::VersionQuery { target } => format!("VQUERY {}", target),
             Frame::VersionReport { origin, version } => format!("VERSION {} {}", origin, version),
             Frame::ConfigAck { target } => format!("CACK {}", target),
@@ -104,12 +107,6 @@ impl Frame {
             let setting = Setting::parse(parts.next()?)?;
             return Some(Frame::Ack { origin, commander, setting });
         }
-        if let Some(rest) = s.strip_prefix("PACK ") {
-            let mut parts = rest.splitn(2, ' ');
-            let node: u16 = parts.next()?.parse().ok()?;
-            let card_id: u32 = parts.next()?.parse().ok()?;
-            return Some(Frame::PunchAck { node, card_id });
-        }
         if let Some(rest) = s.strip_prefix("VQUERY ") {
             let target: u16 = rest.trim().parse().ok()?;
             return Some(Frame::VersionQuery { target });
@@ -129,6 +126,39 @@ impl Frame {
         }
         None
     }
+}
+
+// Wire tag byte for the binary PunchAck frame — see sportident.rs's
+// TAG_PUNCH doc comment for the full tag registry.
+const TAG_PUNCH_ACK: u8 = 0x02;
+// tag + node(2) + card_id(4), always this exact length.
+const PUNCH_ACK_LEN: usize = 7;
+
+/// Confirms to `node` that its punch for `card_id` was received. A node
+/// holds its next punch (stop-and-wait, see the protocol doc) until this
+/// arrives or a retry timeout elapses, so only one punch is ever
+/// unacknowledged at a time per node — `card_id` alone is enough to
+/// disambiguate since there's never more than one outstanding. Binary, not
+/// part of the `Frame` enum above — see this module's doc comment for why:
+/// sent once per punch, same traffic volume as PUNCH itself.
+///
+/// Wire format: `[tag:1][node:u16][card_id:u32]`, big-endian.
+pub fn encode_punch_ack(node: u16, card_id: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(PUNCH_ACK_LEN);
+    buf.push(TAG_PUNCH_ACK);
+    buf.extend_from_slice(&node.to_be_bytes());
+    buf.extend_from_slice(&card_id.to_be_bytes());
+    buf
+}
+
+/// Inverse of `encode_punch_ack`.
+pub fn parse_punch_ack(bytes: &[u8]) -> Option<(u16, u32)> {
+    if bytes.len() != PUNCH_ACK_LEN || bytes[0] != TAG_PUNCH_ACK {
+        return None;
+    }
+    let node = u16::from_be_bytes([bytes[1], bytes[2]]);
+    let card_id = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+    Some((node, card_id))
 }
 
 #[cfg(test)]
@@ -153,17 +183,18 @@ mod tests {
 
     #[test]
     fn test_punch_ack_round_trips() {
-        let frame = Frame::PunchAck { node: 12, card_id: 123456 };
-        let encoded = frame.encode();
-        assert_eq!(encoded, "PACK 12 123456");
-        assert_eq!(Frame::parse(&encoded), Some(frame));
+        let encoded = encode_punch_ack(12, 123456);
+        assert_eq!(encoded, vec![TAG_PUNCH_ACK, 0x00, 0x0C, 0x00, 0x01, 0xE2, 0x40]);
+        assert_eq!(parse_punch_ack(&encoded), Some((12, 123456)));
     }
 
     #[test]
-    fn test_parse_rejects_malformed_punch_ack() {
-        assert_eq!(Frame::parse("PACK notanumber 123"), None);
-        assert_eq!(Frame::parse("PACK 12 notanumber"), None);
-        assert_eq!(Frame::parse("PACK 12"), None);
+    fn test_parse_punch_ack_rejects_wrong_tag_or_length() {
+        let mut wrong_tag = encode_punch_ack(12, 123456);
+        wrong_tag[0] = 0xFF;
+        assert_eq!(parse_punch_ack(&wrong_tag), None);
+        assert_eq!(parse_punch_ack(&encode_punch_ack(12, 123456)[..6]), None);
+        assert_eq!(parse_punch_ack(&[]), None);
     }
 
     #[test]

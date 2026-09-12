@@ -350,13 +350,24 @@ const PUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 struct PendingPunch {
     card_id: u32,
     row_ids: Vec<i64>,
-    payload: String,
+    payload: Vec<u8>,
     sent_at: Instant,
     attempts: u32,
 }
 
-/// A parsed heartbeat payload — see parse_heartbeat's doc comment for the
-/// three wire shapes this covers.
+// Wire tag byte for the binary HB frame — see sportident.rs's TAG_PUNCH doc
+// comment for the full tag registry.
+const TAG_HB: u8 = 0x03;
+// tag + flags + battery_pct + battery_mv(2) — always this exact length,
+// unused fields zeroed, so parsing never has to branch on which of several
+// shapes it's looking at (the old text format supported three).
+const HB_LEN: usize = 5;
+const HB_FLAG_BATTERY_VALID: u8 = 0b001;
+const HB_FLAG_SI_KNOWN: u8 = 0b010;
+const HB_FLAG_SI_CONNECTED: u8 = 0b100;
+
+/// A parsed heartbeat payload — see `parse_heartbeat`'s doc comment for the
+/// wire layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Heartbeat {
     battery: Option<(u8, u16)>,
@@ -364,45 +375,119 @@ struct Heartbeat {
     /// only ESP32 punch nodes report this (see esp32-node/src/main.rs's
     /// spawn_si_reader_thread); `None` means the sender didn't say, either
     /// because it's a mains-powered relay with no SI-reader concept at all
-    /// (lora-server's own bare "HB") or older firmware.
+    /// (lora-server's own bare heartbeat) or older firmware.
     si_present: Option<bool>,
 }
 
-/// Parses a heartbeat payload. Three shapes: bare `HB` (mains-powered
-/// relays, or any node without an SI-master-presence concept — no battery,
-/// no SI status), legacy `HB <pct> <mv>` (battery only, kept for backward
-/// compatibility though nothing currently emits it), and `HB <pct-or-"-">
-/// <mv-or-"-"> <0-or-1>` — the shape ESP32 punch nodes actually send, where
-/// the battery pair is `-` `-` if the read failed and the trailing field is
-/// whether an SI master is currently connected (see esp32-node/src/main.rs).
-/// Returns `None` if `payload` isn't a heartbeat at all.
-fn parse_heartbeat(payload: &str) -> Option<Heartbeat> {
-    if payload == "HB" {
-        return Some(Heartbeat { battery: None, si_present: None });
+/// Binary wire format: `[tag:1][flags:1][battery_pct:1][battery_mv:2]`
+/// (big-endian), always exactly `HB_LEN` bytes — see
+/// docs/protocols/lora_online_control_protocol.md, "Wire Format". `flags`
+/// bit 0 is whether `battery_pct`/`battery_mv` are meaningful (both zeroed
+/// otherwise), bit 1 is whether the sender said anything about SI-master
+/// presence at all, and bit 2 (only meaningful if bit 1 is set) is that
+/// presence itself. Replaces the old three-shapes text format (bare `HB`,
+/// legacy `HB <pct> <mv>`, full `HB <pct-or-"-"> <mv-or-"-"> <0-or-1>`) with
+/// one fixed-width shape covering every sender.
+pub(crate) fn encode_heartbeat(battery: Option<(u8, u16)>, si_present: Option<bool>) -> Vec<u8> {
+    let mut flags = 0u8;
+    let (pct, mv) = match battery {
+        Some((pct, mv)) => {
+            flags |= HB_FLAG_BATTERY_VALID;
+            (pct, mv)
+        }
+        None => (0, 0),
+    };
+    if let Some(si) = si_present {
+        flags |= HB_FLAG_SI_KNOWN;
+        if si {
+            flags |= HB_FLAG_SI_CONNECTED;
+        }
     }
-    let rest = payload.strip_prefix("HB ")?;
-    let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-    match parts.as_slice() {
-        [pct, mv] => {
-            let battery = Some((pct.parse().ok()?, mv.parse().ok()?));
-            Some(Heartbeat { battery, si_present: None })
-        }
-        [pct, mv, si] => {
-            let battery = if *pct == "-" && *mv == "-" {
-                None
-            } else {
-                Some((pct.parse().ok()?, mv.parse().ok()?))
-            };
-            let si_present = match *si {
-                "1" => Some(true),
-                "0" => Some(false),
-                _ => return None,
-            };
-            Some(Heartbeat { battery, si_present })
-        }
-        _ => None,
+    let mv_bytes = mv.to_be_bytes();
+    vec![TAG_HB, flags, pct, mv_bytes[0], mv_bytes[1]]
+}
+
+/// Inverse of `encode_heartbeat`. Returns `None` if `bytes` isn't a
+/// well-formed HB frame (wrong tag or wrong length) rather than a heartbeat
+/// at all — the fixed length means there's no partial/truncated case to
+/// handle beyond a flat length check.
+fn parse_heartbeat(bytes: &[u8]) -> Option<Heartbeat> {
+    if bytes.len() != HB_LEN || bytes[0] != TAG_HB {
+        return None;
+    }
+    let flags = bytes[1];
+    let battery = (flags & HB_FLAG_BATTERY_VALID != 0)
+        .then(|| (bytes[2], u16::from_be_bytes([bytes[3], bytes[4]])));
+    let si_present = (flags & HB_FLAG_SI_KNOWN != 0).then_some(flags & HB_FLAG_SI_CONNECTED != 0);
+    Some(Heartbeat { battery, si_present })
+}
+
+/// Decodes a binary hot-path payload (PUNCH/PUNCH_ACK/HB) into a
+/// human-readable description for logging. The wire format itself is
+/// packed binary for airtime efficiency (see docs/protocols/
+/// lora_online_control_protocol.md, "Wire Format"), but every log line —
+/// journal output and the dashboard/lora-tui traffic log alike — should
+/// stay exactly as readable as it was back when these frames were plain
+/// text. Falls back to a byte count for anything that doesn't decode as one
+/// of the three known shapes, which should only happen for genuinely
+/// foreign or corrupt traffic, never for a payload this daemon just built
+/// itself to send.
+pub(crate) fn describe_payload(bytes: &[u8]) -> String {
+    if let Some((origin, dest, readout)) = crate::sportident::CardReadout::parse_payload(bytes) {
+        let punches: String = readout.punches.iter()
+            .map(|p| format!("{}:{}", p.station, p.time_s))
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("PUNCH origin={} dest={} card={} [{}]", origin, dest, readout.card_id, punches);
+    }
+    if let Some((node, card_id)) = crate::protocol::parse_punch_ack(bytes) {
+        return format!("PACK node={} card={}", node, card_id);
+    }
+    if let Some(hb) = parse_heartbeat(bytes) {
+        let battery = hb.battery
+            .map(|(pct, mv)| format!("{}% {}mV", pct, mv))
+            .unwrap_or_else(|| "no battery data".to_string());
+        let si = match hb.si_present {
+            Some(true) => ", SI master connected",
+            Some(false) => ", SI master not connected",
+            None => "",
+        };
+        return format!("HB {}{}", battery, si);
+    }
+    // Not one of the three binary shapes — most likely one of the plain-text
+    // control frames (CMD/ACK/VQUERY/VERSION/CACK), which are valid UTF-8 by
+    // construction, so show the text directly rather than a byte count.
+    // Only genuinely foreign/corrupt binary ever falls through to the count.
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => format!("<{} bytes>", bytes.len()),
     }
 }
+
+/// Lowercase hex encoding — no crate pulled in just for this. Used only to
+/// carry an arbitrary byte payload safely through the existing text-based
+/// HTTP/`cmd_tx` control plane (`HttpRadio::send`, the `/sendbin` endpoint,
+/// and the `SENDBIN` command below) without corrupting it, the way a lossy
+/// UTF-8 reinterpretation of a binary PUNCH/PACK/HB payload would. Not
+/// related to the actual over-the-air wire format, which stays raw bytes.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Inverse of `to_hex`. `None` on odd length or a non-hex character, rather
+/// than panicking on attacker- or bug-supplied input from an HTTP body.
+pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// (card_id, row ids covered, binary wire payload) — see next_local_batch.
+type PunchBatch = (u32, Vec<i64>, Vec<u8>);
 
 /// The next batch of local, unsent punches to (re)transmit: the oldest
 /// unsent local row, plus any immediately-following unsent local rows that
@@ -414,7 +499,7 @@ fn parse_heartbeat(payload: &str) -> Option<Heartbeat> {
 /// itself as the intended final recipient (see to_payload's doc comment) —
 /// this daemon's own currently-configured next hop, which for a leaf node
 /// with no relay hops in between is also the final consumer.
-fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16, dest: u16) -> Result<Option<(u32, Vec<i64>, String)>> {
+fn next_local_batch(buffer: &crate::punch_buffer::PunchBuffer, own_addr: u16, dest: u16) -> Result<Option<PunchBatch>> {
     let unsent = buffer.unsent_local()?;
     let Some(first) = unsent.first() else { return Ok(None) };
     let card_id = first.card_id;
@@ -460,14 +545,21 @@ fn send_command_frame(
 /// wait between the original sender and the final consumer; a lost forward
 /// just means that sender's own retry resends the punch, which gets
 /// forwarded again.
+// Takes raw bytes, not `&str` — relays both the binary hot-path frames
+// (PUNCH/PACK) and the plain-text control frames (CMD/ACK/VQUERY)
+// identically, since a relay just re-transmits whatever bytes it received
+// unchanged and doesn't need to understand their content either way. Its
+// own log line uses describe_payload rather than assuming the bytes are
+// printable text.
 fn forward(
     radio: &mut dyn Radio, state: &crate::daemon_state::SharedState,
-    next_hop: u16, raw_payload: &str,
+    next_hop: u16, raw_payload: &[u8],
 ) {
-    match radio.send(next_hop, raw_payload.as_bytes()) {
+    match radio.send(next_hop, raw_payload) {
         Ok(()) => {
-            log::info!("relayed to {}: {}", next_hop, raw_payload);
-            log_event(state, format!("TX {} {}", next_hop, raw_payload));
+            let description = describe_payload(raw_payload);
+            log::info!("relayed to {}: {}", next_hop, description);
+            log_event(state, format!("TX {} {}", next_hop, description));
         }
         Err(e) => {
             log::error!("relay forward failed: {}", e);
@@ -517,6 +609,25 @@ fn run_daemon_loop(
                         log::error!("TX failed: {}", e);
                         log_event(&state, format!("ERR TX: {}", e));
                     }
+                }
+            } else if let Some(hex) = cmd.strip_prefix("SENDBIN ") {
+                // Byte-safe counterpart to SEND — see HttpRadio::send and
+                // web.rs's /sendbin handler for why this exists: a payload
+                // relayed this way can be one of the binary hot-path frames
+                // (PUNCH/PACK/HB), which plain text (SEND) can't carry
+                // without corruption.
+                match from_hex(hex) {
+                    Some(bytes) => match radio.send(dest, &bytes) {
+                        Ok(()) => {
+                            log::info!("TX to {}: {}", dest, describe_payload(&bytes));
+                            log_event(&state, format!("TX {} {}", dest, describe_payload(&bytes)));
+                        }
+                        Err(e) => {
+                            log::error!("TX failed: {}", e);
+                            log_event(&state, format!("ERR TX: {}", e));
+                        }
+                    },
+                    None => log::error!("SENDBIN command had invalid hex payload"),
                 }
             } else if let Some(rest) = cmd.strip_prefix("CMD ") {
                 let mut parts = rest.splitn(2, ' ');
@@ -679,10 +790,10 @@ fn run_daemon_loop(
         } else if pending_punch.is_none() {
             match next_local_batch(&punch_buffer, own_addr, dest) {
                 Ok(Some((card_id, row_ids, payload))) => {
-                    match radio.send(dest, payload.as_bytes()) {
+                    match radio.send(dest, &payload) {
                         Ok(()) => {
-                            log::info!("PUNCH to {}: {}", dest, payload);
-                            log_event(&state, format!("TX {} {}", dest, payload));
+                            log::info!("PUNCH to {}: {}", dest, describe_payload(&payload));
+                            log_event(&state, format!("TX {} {}", dest, describe_payload(&payload)));
                             pending_punch = Some(PendingPunch { card_id, row_ids, payload, sent_at: Instant::now(), attempts: 1 });
                         }
                         Err(e) => {
@@ -698,10 +809,10 @@ fn run_daemon_loop(
             if p.sent_at.elapsed() >= PUNCH_RETRY_INTERVAL {
                 p.attempts += 1;
                 p.sent_at = Instant::now();
-                match radio.send(dest, p.payload.as_bytes()) {
+                match radio.send(dest, &p.payload) {
                     Ok(()) => {
-                        log::info!("PUNCH retry #{} to {}: {}", p.attempts, dest, p.payload);
-                        log_event(&state, format!("TX {} {}", dest, p.payload));
+                        log::info!("PUNCH retry #{} to {}: {}", p.attempts, dest, describe_payload(&p.payload));
+                        log_event(&state, format!("TX {} {}", dest, describe_payload(&p.payload)));
                     }
                     Err(e) => {
                         log::error!("PUNCH retry failed: {}", e);
@@ -713,13 +824,27 @@ fn run_daemon_loop(
 
         match radio.receive() {
             Ok(Some(pkt)) => {
-                let payload = String::from_utf8_lossy(&pkt.payload).into_owned();
                 let rssi_str = pkt.rssi.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
-                match pkt.rssi {
-                    Some(dbm) => log::info!("RX from {}: {} (RSSI: {}dBm)", pkt.src_addr, payload, dbm),
-                    None      => log::info!("RX from {}: {}", pkt.src_addr, payload),
-                }
-                if let Some((origin, punch_dest, readout)) = crate::sportident::CardReadout::parse_payload(&payload) {
+                let rssi_suffix = pkt.rssi.map(|dbm| format!(" (RSSI: {}dBm)", dbm)).unwrap_or_default();
+
+                // Binary hot-path frames (PUNCH/PACK/HB) are checked
+                // directly against the raw bytes, before any UTF-8
+                // conversion — see sportident.rs's TAG_PUNCH doc comment and
+                // docs/protocols/lora_online_control_protocol.md's "Wire
+                // Format": these payloads are arbitrary binary, and
+                // String::from_utf8_lossy would silently corrupt them
+                // (substituting invalid sequences) rather than fail
+                // cleanly. Only once none of the three binary shapes match
+                // do we fall back to decoding text, for the remaining (rare,
+                // genuinely textual) control frames. `payload_display` is
+                // always a human-readable description regardless of which
+                // branch runs — see describe_payload's doc comment for why
+                // this matters even though the wire bytes themselves aren't
+                // readable anymore.
+                let payload_display;
+                if let Some((origin, punch_dest, readout)) = crate::sportident::CardReadout::parse_payload(&pkt.payload) {
+                    payload_display = describe_payload(&pkt.payload);
+                    log::info!("RX from {}: {}{}", pkt.src_addr, payload_display, rssi_suffix);
                     // LoRa is a broadcast medium — every node in radio range
                     // decodes every packet regardless of what `dest` its
                     // sender used (see CardReadout::to_payload's doc
@@ -743,8 +868,8 @@ fn run_daemon_loop(
                         // retry timeout resends the punch, prompting another
                         // ack attempt — self-healing without needing the ack
                         // path itself to be reliable.
-                        let ack = Frame::PunchAck { node: origin, card_id: readout.card_id };
-                        if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
+                        let ack = crate::protocol::encode_punch_ack(origin, readout.card_id);
+                        if let Err(e) = radio.send(pkt.src_addr, &ack) {
                             log::error!("failed to ack punch: {}", e);
                         }
                     } else if relay {
@@ -753,9 +878,58 @@ fn run_daemon_loop(
                         // final destination, not us) travels along with it
                         // untouched, so whoever ends up consuming it still
                         // checks against the right address.
-                        forward(radio.as_mut(), &state, dest, &payload);
+                        forward(radio.as_mut(), &state, dest, &pkt.payload);
                     }
-                } else if let Some(frame) = Frame::parse(&payload) {
+                } else if let Some((node, card_id)) = crate::protocol::parse_punch_ack(&pkt.payload) {
+                    payload_display = describe_payload(&pkt.payload);
+                    log::info!("RX from {}: {}{}", pkt.src_addr, payload_display, rssi_suffix);
+                    if node == own_addr {
+                        if pending_punch.as_ref().is_some_and(|p| p.card_id == card_id) {
+                            let p = pending_punch.take().unwrap();
+                            for id in &p.row_ids {
+                                if let Err(e) = punch_buffer.mark_sent(*id) {
+                                    log::error!("failed to mark punch {} sent: {}", id, e);
+                                }
+                            }
+                            log::info!("PUNCH card {} acked by {}", card_id, pkt.src_addr);
+                            log_event(&state, format!("PACKOK {} {}", card_id, pkt.src_addr));
+                        }
+                    } else if relay {
+                        // Named node isn't us — pass the ack on toward it
+                        // directly (single-hop relay: assumed within direct
+                        // reach downstream of this relay).
+                        forward(radio.as_mut(), &state, node, &pkt.payload);
+                    }
+                } else if let Some(hb) = parse_heartbeat(&pkt.payload) {
+                    payload_display = describe_payload(&pkt.payload);
+                    log::info!("RX from {}: {}{}", pkt.src_addr, payload_display, rssi_suffix);
+                    // Heartbeats don't carry an origin field yet (they can't
+                    // relay — see docs/protocols/lora_online_control_protocol.md),
+                    // so pkt.src_addr is always the true origin here, unlike
+                    // the punch/command branches which use an explicit
+                    // `origin`/`commander` field for exactly this reason.
+                    state.lock().unwrap().record_heartbeat(pkt.src_addr, hb.battery, hb.si_present);
+                    let battery_field = hb.battery
+                        .map(|(pct, mv)| format!("{} {}", pct, mv))
+                        .unwrap_or_else(|| "-".to_string());
+                    let si_field = match hb.si_present {
+                        Some(true) => "1",
+                        Some(false) => "0",
+                        None => "-",
+                    };
+                    log_event(&state, format!("HBRX {} {} {}", pkt.src_addr, battery_field, si_field));
+                } else {
+                    // None of the binary hot-path shapes matched — only now
+                    // is it safe to assume text, for the remaining plain-text
+                    // control frames (CMD/ACK/VQUERY/VERSION/CACK). A lossy
+                    // decode here is fine: this daemon never sends any of
+                    // those frames as anything but valid UTF-8, so lossiness
+                    // only ever shows up on genuinely foreign/corrupt input,
+                    // which Frame::parse then correctly rejects anyway.
+                    let payload = String::from_utf8_lossy(&pkt.payload).into_owned();
+                    payload_display = payload.clone();
+                    log::info!("RX from {}: {}{}", pkt.src_addr, payload, rssi_suffix);
+                    if let Some(frame) = Frame::parse(&payload) {
                     match frame {
                         Frame::Command { target, commander, setting } if target == own_addr => {
                             match setting {
@@ -767,7 +941,7 @@ fn run_daemon_loop(
                             // Ack names the true commander (so a relay
                             // downstream of it knows where to forward this)
                             // but is transmitted to whoever handed us this
-                            // packet, same pattern as PunchAck.
+                            // packet, same pattern as the binary punch ack.
                             let ack = Frame::Ack { origin: own_addr, commander, setting };
                             if let Err(e) = radio.send(pkt.src_addr, ack.encode().as_bytes()) {
                                 log::error!("failed to ack command: {}", e);
@@ -778,7 +952,7 @@ fn run_daemon_loop(
                             // Not addressed to us — pass it on toward the
                             // named target directly (single-hop relay:
                             // assumed within direct reach downstream).
-                            forward(radio.as_mut(), &state, target, &payload);
+                            forward(radio.as_mut(), &state, target, payload.as_bytes());
                         }
                         Frame::Command { .. } => {
                             // Not addressed to us and not relaying — ignore.
@@ -794,30 +968,9 @@ fn run_daemon_loop(
                         Frame::Ack { commander, .. } if relay => {
                             // Not for us — forward toward the commander who
                             // originally issued this command.
-                            forward(radio.as_mut(), &state, commander, &payload);
+                            forward(radio.as_mut(), &state, commander, payload.as_bytes());
                         }
                         Frame::Ack { .. } => {
-                            // Not relaying and not ours — ignore.
-                        }
-                        Frame::PunchAck { node, card_id } if node == own_addr => {
-                            if pending_punch.as_ref().is_some_and(|p| p.card_id == card_id) {
-                                let p = pending_punch.take().unwrap();
-                                for id in &p.row_ids {
-                                    if let Err(e) = punch_buffer.mark_sent(*id) {
-                                        log::error!("failed to mark punch {} sent: {}", id, e);
-                                    }
-                                }
-                                log::info!("PUNCH card {} acked by {}", card_id, pkt.src_addr);
-                                log_event(&state, format!("PACKOK {} {}", card_id, pkt.src_addr));
-                            }
-                        }
-                        Frame::PunchAck { node, .. } if relay => {
-                            // Named node isn't us — pass the ack on toward
-                            // it directly (single-hop relay: assumed within
-                            // direct reach downstream of this relay).
-                            forward(radio.as_mut(), &state, node, &payload);
-                        }
-                        Frame::PunchAck { .. } => {
                             // Not relaying and not ours — ignore.
                         }
                         Frame::VersionQuery { target } if target == own_addr => {
@@ -832,7 +985,7 @@ fn run_daemon_loop(
                         Frame::VersionQuery { target } if relay => {
                             // Not addressed to us — pass it on toward the
                             // named target directly, same pattern as Command.
-                            forward(radio.as_mut(), &state, target, &payload);
+                            forward(radio.as_mut(), &state, target, payload.as_bytes());
                         }
                         Frame::VersionQuery { .. } => {
                             // Not addressed to us and not relaying — ignore.
@@ -867,36 +1020,9 @@ fn run_daemon_loop(
                             // overhearing one.
                         }
                     }
-                } else if let Some(hb) = parse_heartbeat(&payload) {
-                    match (hb.battery, hb.si_present) {
-                        (Some((pct, mv)), Some(si)) => log::info!(
-                            "HB from {}: battery {}% ({}mV), SI master {}",
-                            pkt.src_addr, pct, mv, if si { "connected" } else { "not connected" }
-                        ),
-                        (Some((pct, mv)), None) => log::info!("HB from {}: battery {}% ({}mV)", pkt.src_addr, pct, mv),
-                        (None, Some(si)) => log::info!(
-                            "HB from {} (no battery data), SI master {}",
-                            pkt.src_addr, if si { "connected" } else { "not connected" }
-                        ),
-                        (None, None) => log::info!("HB from {} (no battery data)", pkt.src_addr),
                     }
-                    // Heartbeats don't carry an origin field yet (they can't
-                    // relay — see docs/protocols/lora_online_control_protocol.md),
-                    // so pkt.src_addr is always the true origin here, unlike
-                    // the punch/command branches which use an explicit
-                    // `origin`/`commander` field for exactly this reason.
-                    state.lock().unwrap().record_heartbeat(pkt.src_addr, hb.battery, hb.si_present);
-                    let battery_field = hb.battery
-                        .map(|(pct, mv)| format!("{} {}", pct, mv))
-                        .unwrap_or_else(|| "-".to_string());
-                    let si_field = match hb.si_present {
-                        Some(true) => "1",
-                        Some(false) => "0",
-                        None => "-",
-                    };
-                    log_event(&state, format!("HBRX {} {} {}", pkt.src_addr, battery_field, si_field));
                 }
-                log_event(&state, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload));
+                log_event(&state, format!("RX {} {} {}", pkt.src_addr, rssi_str, payload_display));
             }
             Ok(None) => {}
             Err(e) => {
@@ -1106,10 +1232,19 @@ impl HttpRadio {
 }
 
 impl Radio for HttpRadio {
+    // Posts to /sendbin (hex-encoded body), not the older /send (raw text
+    // body) — a payload here can now be one of the binary hot-path frames
+    // (PUNCH/PACK/HB), and lossily reinterpreting arbitrary bytes as UTF-8
+    // (the old `String::from_utf8_lossy` approach) would corrupt them.
+    // /send's own plain-text contract is untouched — it's still what an
+    // operator's manual "send raw payload" action uses — this just gives
+    // this daemon-internal caller (e.g. lora-tui forwarding a directly
+    // attached SI reader's punches, or its own heartbeat, through a remote
+    // daemon) a byte-safe path alongside it. See `to_hex`/`from_hex`.
     fn send(&mut self, _dest: u16, payload: &[u8]) -> Result<()> {
-        ureq::post(&format!("{}/send", self.base_url))
-            .send_string(&String::from_utf8_lossy(payload))
-            .map_err(|e| anyhow::anyhow!("POST /send failed: {}", e))?;
+        ureq::post(&format!("{}/sendbin", self.base_url))
+            .send_string(&to_hex(payload))
+            .map_err(|e| anyhow::anyhow!("POST /sendbin failed: {}", e))?;
         Ok(())
     }
 
@@ -1193,6 +1328,25 @@ pub fn attach(server_url: &str, dest: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hex_round_trips_arbitrary_bytes() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(from_hex(&to_hex(&bytes)), Some(bytes));
+    }
+
+    #[test]
+    fn test_hex_encode_matches_known_vector() {
+        assert_eq!(to_hex(&[0x00, 0x01, 0xFF]), "0001ff");
+        assert_eq!(from_hex("0001ff"), Some(vec![0x00, 0x01, 0xFF]));
+    }
+
+    #[test]
+    fn test_from_hex_rejects_odd_length_or_non_hex() {
+        assert_eq!(from_hex("abc"), None);
+        assert_eq!(from_hex("zz"), None);
+        assert_eq!(from_hex(""), Some(vec![]));
+    }
 
     #[test]
     fn test_next_local_batch_empty_buffer_is_none() {
@@ -1403,45 +1557,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_heartbeat_bare() {
-        assert_eq!(parse_heartbeat("HB"), Some(Heartbeat { battery: None, si_present: None }));
+    fn test_heartbeat_round_trips_bare() {
+        let encoded = encode_heartbeat(None, None);
+        assert_eq!(encoded, vec![TAG_HB, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(parse_heartbeat(&encoded), Some(Heartbeat { battery: None, si_present: None }));
     }
 
     #[test]
-    fn test_parse_heartbeat_legacy_battery_only() {
+    fn test_heartbeat_round_trips_with_battery_and_si_present() {
+        let encoded = encode_heartbeat(Some((82, 3950)), Some(true));
         assert_eq!(
-            parse_heartbeat("HB 82 3950"),
-            Some(Heartbeat { battery: Some((82, 3950)), si_present: None })
-        );
-    }
-
-    #[test]
-    fn test_parse_heartbeat_with_battery_and_si_present() {
-        assert_eq!(
-            parse_heartbeat("HB 82 3950 1"),
+            parse_heartbeat(&encoded),
             Some(Heartbeat { battery: Some((82, 3950)), si_present: Some(true) })
         );
+        let encoded = encode_heartbeat(Some((82, 3950)), Some(false));
         assert_eq!(
-            parse_heartbeat("HB 82 3950 0"),
+            parse_heartbeat(&encoded),
             Some(Heartbeat { battery: Some((82, 3950)), si_present: Some(false) })
         );
     }
 
     #[test]
-    fn test_parse_heartbeat_no_battery_but_si_present() {
-        assert_eq!(
-            parse_heartbeat("HB - - 1"),
-            Some(Heartbeat { battery: None, si_present: Some(true) })
-        );
+    fn test_heartbeat_round_trips_no_battery_but_si_present() {
+        let encoded = encode_heartbeat(None, Some(true));
+        assert_eq!(parse_heartbeat(&encoded), Some(Heartbeat { battery: None, si_present: Some(true) }));
     }
 
     #[test]
-    fn test_parse_heartbeat_rejects_non_heartbeat() {
-        assert_eq!(parse_heartbeat("PUNCH 5 123456 31:100"), None);
-        assert_eq!(parse_heartbeat(""), None);
-        assert_eq!(parse_heartbeat("HB notanumber 3950"), None);
-        assert_eq!(parse_heartbeat("HB 82"), None);
-        assert_eq!(parse_heartbeat("HB 82 3950 maybe"), None);
+    fn test_parse_heartbeat_rejects_wrong_tag_or_length() {
+        let mut wrong_tag = encode_heartbeat(Some((82, 3950)), Some(true));
+        wrong_tag[0] = 0xFF;
+        assert_eq!(parse_heartbeat(&wrong_tag), None);
+        assert_eq!(parse_heartbeat(b""), None);
+        assert_eq!(parse_heartbeat(&encode_heartbeat(None, None)[..4]), None);
     }
 
     /// A radio double that just records what was sent and lets a test queue
@@ -1461,9 +1609,13 @@ mod tests {
         }
     }
 
-    fn packet(src_addr: u16, payload: &str) -> ReceivedPacket {
+    // Generic over `impl AsRef<[u8]>` so the same helper builds a
+    // ReceivedPacket from either a text frame (`&str`) or one of the binary
+    // hot-path frames (`&Vec<u8>`/`&[u8]`) without needing two near-identical
+    // functions.
+    fn packet(src_addr: u16, payload: impl AsRef<[u8]>) -> ReceivedPacket {
         let mut p = heapless::Vec::<u8, 240>::new();
-        let _ = p.extend_from_slice(payload.as_bytes());
+        let _ = p.extend_from_slice(payload.as_ref());
         ReceivedPacket { src_addr, payload: p, rssi: None }
     }
 

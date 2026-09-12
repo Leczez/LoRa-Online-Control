@@ -119,6 +119,13 @@ pub struct ControlPunch {
     pub time_s: u32,
 }
 
+// Wire tag byte for the binary PUNCH frame (see CardReadout::to_payload) —
+// safe against collision with any of the plain-text control frames in
+// protocol.rs (CMD/ACK/VQUERY/VERSION/CACK), all of which start with an
+// ASCII uppercase letter (0x41+); this project's other binary hot-path
+// frames use 0x02 (PUNCH_ACK, protocol.rs) and 0x03 (HB, backend.rs).
+const TAG_PUNCH: u8 = 0x01;
+
 #[derive(Debug, Clone)]
 pub struct CardReadout {
     pub card_id: u32,
@@ -126,8 +133,16 @@ pub struct CardReadout {
 }
 
 impl CardReadout {
-    /// Wire format sent over LoRa: `PUNCH <origin> <dest> <card_id>
-    /// <station>:<time_s>,...`
+    /// Binary wire format sent over LoRa (see the airtime-efficiency pass in
+    /// docs/protocols/lora_online_control_protocol.md, "Wire Format"):
+    /// `[tag:1][origin:u16][dest:u16][card_id:u32][count:u8]{[station:u8][time_s:u32]}*count`,
+    /// all multi-byte integers big-endian. Every field is fixed-width except
+    /// the trailing punch list, whose length is given by `count` rather than
+    /// a delimiter — cheaper to parse and smaller on the wire than the
+    /// previous `PUNCH <origin> <dest> <card_id> <station>:<time_s>,...`
+    /// text format, at the cost of no longer being human-readable in a raw
+    /// hex dump (lora-server/lora-tui decode it back to text for logging —
+    /// see backend.rs's punch RX handling).
     ///
     /// `origin` is the LoRa address of the node that actually read this
     /// card — carried explicitly in the payload, not inferred from the
@@ -143,40 +158,58 @@ impl CardReadout {
     /// that overhears this frame needs `dest` embedded in the payload
     /// itself to tell "this is mine to consume" apart from "not mine, and
     /// not mine to relay either." A relay's forward() re-transmits the raw
-    /// payload unchanged, so `dest` stays the original final destination
-    /// all the way through a multi-hop chain — no intermediate hop needs to
-    /// know the full path, just whether `dest == own_addr`.
-    pub fn to_payload(&self, origin: u16, dest: u16) -> String {
-        let punches: String = self.punches.iter()
-            .map(|p| format!("{}:{}", p.station, p.time_s))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("PUNCH {} {} {} {}", origin, dest, self.card_id, punches)
+    /// bytes unchanged, so `dest` stays the original final destination all
+    /// the way through a multi-hop chain — no intermediate hop needs to know
+    /// the full path, just whether `dest == own_addr`.
+    ///
+    /// `count` is a single byte (max 255 punches per card) — `.take(255)`
+    /// below makes that limit explicit rather than silently truncating the
+    /// count while still writing more punch records than it claims; no real
+    /// SI card holds anywhere near that many punches.
+    pub fn to_payload(&self, origin: u16, dest: u16) -> Vec<u8> {
+        let punches: Vec<_> = self.punches.iter().take(255).collect();
+        let mut buf = Vec::with_capacity(10 + punches.len() * 5);
+        buf.push(TAG_PUNCH);
+        buf.extend_from_slice(&origin.to_be_bytes());
+        buf.extend_from_slice(&dest.to_be_bytes());
+        buf.extend_from_slice(&self.card_id.to_be_bytes());
+        buf.push(punches.len() as u8);
+        for p in punches {
+            buf.push(p.station);
+            buf.extend_from_slice(&p.time_s.to_be_bytes());
+        }
+        buf
     }
 
-    /// Inverse of `to_payload` — decodes a `PUNCH <origin> <dest> <card_id>
-    /// <station>:<time_s>,...` wire payload back into the originating
-    /// node's address, the intended final destination, and the card data
-    /// itself.
-    pub fn parse_payload(s: &str) -> Option<(u16, u16, CardReadout)> {
-        let rest = s.strip_prefix("PUNCH ")?;
-        let mut parts = rest.splitn(4, ' ');
-        let origin: u16 = parts.next()?.parse().ok()?;
-        let dest: u16 = parts.next()?.parse().ok()?;
-        let card_id: u32 = parts.next()?.parse().ok()?;
-        let punches = parts.next().unwrap_or("");
+    /// Inverse of `to_payload` — decodes a binary PUNCH wire payload back
+    /// into the originating node's address, the intended final destination,
+    /// and the card data itself. Returns `None` for anything that isn't a
+    /// well-formed PUNCH frame (wrong tag, or too short for the `count` it
+    /// claims) rather than panicking on a corrupt or foreign packet — every
+    /// length is checked before the corresponding slice is read.
+    pub fn parse_payload(bytes: &[u8]) -> Option<(u16, u16, CardReadout)> {
+        if bytes.first() != Some(&TAG_PUNCH) || bytes.len() < 10 {
+            return None;
+        }
+        let origin = u16::from_be_bytes([bytes[1], bytes[2]]);
+        let dest = u16::from_be_bytes([bytes[3], bytes[4]]);
+        let card_id = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+        let count = bytes[9] as usize;
 
-        let mut result = Vec::new();
-        if !punches.is_empty() {
-            for p in punches.split(',') {
-                let (station_str, time_str) = p.split_once(':')?;
-                let station: u8 = station_str.parse().ok()?;
-                let time_s: u32 = time_str.parse().ok()?;
-                result.push(ControlPunch { station, time_s });
+        let mut punches = Vec::with_capacity(count);
+        let mut offset: usize = 10;
+        for _ in 0..count {
+            let end = offset.checked_add(5)?;
+            if end > bytes.len() {
+                return None;
             }
+            let station = bytes[offset];
+            let time_s = u32::from_be_bytes([bytes[offset + 1], bytes[offset + 2], bytes[offset + 3], bytes[offset + 4]]);
+            punches.push(ControlPunch { station, time_s });
+            offset = end;
         }
 
-        Some((origin, dest, CardReadout { card_id, punches: result }))
+        Some((origin, dest, CardReadout { card_id, punches }))
     }
 }
 
@@ -1084,16 +1117,24 @@ mod tests {
     }
 
     #[test]
-    fn test_punch_payload_rejects_non_punch_text() {
-        assert!(CardReadout::parse_payload("HB").is_none());
-        assert!(CardReadout::parse_payload("hello?").is_none());
+    fn test_punch_payload_rejects_wrong_tag() {
+        let mut bytes = CardReadout { card_id: 1, punches: vec![] }.to_payload(1, 1);
+        bytes[0] = 0x03; // HB's tag, not PUNCH's
+        assert!(CardReadout::parse_payload(&bytes).is_none());
+        assert!(CardReadout::parse_payload(b"hello?").is_none());
+        assert!(CardReadout::parse_payload(&[]).is_none());
     }
 
     #[test]
-    fn test_punch_payload_rejects_legacy_format_missing_dest_field() {
-        // Pre-addressing-filter wire format: "PUNCH <origin> <card_id> ..."
-        // with no <dest> — must not be silently misparsed as if the
-        // card_id were a dest and vice versa.
-        assert!(CardReadout::parse_payload("PUNCH 12 123456 33:36070").is_none());
+    fn test_punch_payload_rejects_truncated_bytes() {
+        let full = CardReadout {
+            card_id: 42,
+            punches: vec![ControlPunch { station: 33, time_s: 36070 }],
+        }.to_payload(12, 1);
+        // Header claims one punch record but the bytes for it are cut off —
+        // must not read past the end of the slice.
+        assert!(CardReadout::parse_payload(&full[..full.len() - 1]).is_none());
+        // Too short to even hold a header.
+        assert!(CardReadout::parse_payload(&full[..9]).is_none());
     }
 }

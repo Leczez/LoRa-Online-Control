@@ -6,6 +6,7 @@ The purpose of this protocol is to send the SPORTident punches from a SPORTident
 ## Protocol Structure
 - ~~Packets should have some form of crc or identifier to make sure that the data received is from one of our own nodes and the data is correct.~~ Identifier: done, see "Network Identification" below — now the radio's own sync word, not an application-layer prefix. CRC: LoRa's own hardware CRC (`crc_on` in `sx127x::Config`, on by default on both ends) already covers over-the-air corruption at the driver level — `receive()` drops a CRC-failed packet before the application ever sees it, so no separate payload-level CRC was needed on top.
 - ~~Heartbeat data should be sent to make sure that the receiver knows that the node is alive, together with the voltage of the battery of the node if it has one and other status data that could be necessary.~~ Done for battery voltage/percentage, see "Heartbeats" below. Other status data (e.g. SI-master-connected state) isn't carried yet — a natural extension of the same `HB` format if needed later.
+- ~~Packets should be as small as possible to maximize range and minimize airtime.~~ Done for the high-frequency frames (PUNCH/PACK/HB), see "Wire Format" below — packed binary instead of decimal text, roughly halving their size. The rare control frames (CMD/ACK/VQUERY/VERSION/CACK) stay plain text on purpose.
 
 ## Network Identification
 
@@ -30,6 +31,57 @@ commonly used default across LoRa projects generally, not unique to this
 one, so leaving it unchanged gives little real protection against a nearby
 deployment of *this* firmware (which also defaults to it) let alone other
 LoRa gear.
+
+## Wire Format
+
+Two encodings coexist on this protocol, split by traffic volume:
+
+- **PUNCH, PACK (punch ack), and HB are packed binary.** These are the
+  frames sent continuously for the life of an event — a heartbeat every
+  `--heartbeat-interval` forever, a punch (and its ack) for every real
+  event. Airtime here compounds across the whole competition, so every byte
+  matters. A leading tag byte (`0x01`=PUNCH, `0x02`=PACK, `0x03`=HB —
+  chosen to never collide with a text frame below, which all start with an
+  ASCII uppercase letter, 0x41+) identifies the frame; every other field is
+  a fixed-width big-endian integer, not decimal text.
+
+  | Frame | Layout | Size |
+  |---|---|---|
+  | PUNCH | `[tag:1][origin:u16][dest:u16][card_id:u32][count:u8]{[station:u8][time_s:u32]}×count` | 10 + 5×count bytes |
+  | PACK | `[tag:1][node:u16][card_id:u32]` | 7 bytes, fixed |
+  | HB | `[tag:1][flags:1][battery_pct:u8][battery_mv:u16]` | 5 bytes, fixed |
+
+  HB's `flags` byte: bit 0 = battery fields are meaningful (both zeroed
+  otherwise), bit 1 = the sender said anything at all about SI-master
+  presence, bit 2 (only meaningful if bit 1 is set) = that presence itself.
+  One fixed shape covers every sender — a mains-powered relay with no
+  battery/SI concept just zeroes those bits, rather than needing the three
+  different text shapes this format used to have.
+
+  A ~30-byte, 2-punch PUNCH frame that took 34 bytes as text now takes 20;
+  a typical HB drops from 12 bytes to 5; a PACK drops from 15 to 7.
+
+- **CMD, ACK, VQUERY, VERSION, and CACK stay plain ASCII text**
+  (`lora-server/src/protocol.rs`'s `Frame` enum). Each of these is sent at
+  most a handful of times per node per session — a boot announcement, an
+  occasional settings change — so the airtime cost of decimal-text framing
+  is negligible in aggregate, and staying human-readable in `lora-tui`'s
+  raw traffic log or a serial console is worth more than the few bytes
+  binary framing would save here.
+
+**Dispatch order matters.** A receiver must check for the three binary tags
+*before* attempting any UTF-8 decode of a payload — `String::from_utf8_lossy`
+silently substitutes invalid byte sequences rather than failing, which would
+corrupt a genuinely binary PUNCH/PACK/HB payload instead of just failing to
+match it. Both `lora-server` (`backend.rs`'s receive loop) and `esp32-node`
+(`main.rs`'s receive loop) check the binary shapes first and only fall back
+to text for whatever's left.
+
+**Logging stays fully readable despite the wire bytes not being.** Every
+log line — journal output, and the dashboard/`lora-tui` traffic log alike —
+shows a decoded human-readable description (`describe_payload` in
+`backend.rs`) rather than the raw bytes, so this efficiency pass costs
+nothing in field debuggability; only the actual over-the-air bytes shrank.
 
 ## Addressing
 
@@ -71,21 +123,23 @@ transmitted. Delivery over the radio link itself works as **stop-and-wait**:
   packet, regardless of what `dest` its sender used.** Nothing at the radio
   layer filters by destination (see `sx127x::Sx127xSpi::send`, whose own
   `dest` argument is unused — purely the caller's bookkeeping). So `PUNCH`
-  carries its intended final destination explicitly in the payload itself —
-  `PUNCH <origin> <dest> <card_id> <station>:<time_s>,...` — and every node
-  that overhears it checks `dest == own_addr` before reacting: only the
+  carries its intended final destination explicitly in the payload itself
+  (see "Wire Format" above for the exact binary layout) and every node that
+  overhears it checks `dest == own_addr` before reacting: only the
   addressed node buffers and acks it. A non-addressed, non-relay node still
-  logs it (full visibility into everything overheard — e.g. `lora-tui`'s
-  packet log or the web dashboard), it just doesn't buffer or ack. A relay
-  forwards the raw payload unchanged, so `dest` stays the true final
-  destination through every hop rather than needing to be rewritten
-  per-hop. (`Frame::Command`/`Frame::Ack`/`Frame::PunchAck` already carried
-  an explicit `target`/`node` field checked the same way — `PUNCH` was the
-  one payload type missing this until now.)
+  logs it — decoded back to a readable description, not the raw wire bytes
+  — in `lora-tui`'s packet log or the web dashboard, full visibility into
+  everything overheard, it just doesn't buffer or ack. A relay forwards the
+  raw bytes unchanged, so `dest` stays the true final destination through
+  every hop rather than needing to be rewritten per-hop. (`Frame::Command`/
+  `Frame::Ack` and the binary `PACK` frame already carried an explicit
+  `target`/`node` field checked the same way — `PUNCH` was the one payload
+  type missing this until now.)
 - The receiver (whoever gets a `PUNCH` payload) buffers it on its own end,
-  then sends back a `PACK` frame naming the sending node and the card
-  involved — e.g. `PACK <node> <card_id>` — so that on a shared channel with
-  multiple nodes, only the node actually waiting for that ack acts on it.
+  then sends back a binary `PACK` frame naming the sending node and the
+  card involved (see "Wire Format" above) — so that on a shared channel
+  with multiple nodes, only the node actually waiting for that ack acts on
+  it.
 - If no ack arrives within a retry window, the node resends the exact same
   payload and keeps waiting — **there's no give-up count for punches**,
   unlike the bounded retry used for command packets below. A punch is real
@@ -153,7 +207,15 @@ host.
   synthetic punch tagged `source="test"` through the real send/retry/ack
   pipeline.
 - `POST /send` (raw text body, not form-encoded — a radio payload can
-  contain `&`/`=`) — sends to the daemon's currently configured `dest`.
+  contain `&`/`=`) — sends to the daemon's currently configured `dest`. For
+  a human operator's manual/test sends; a plain-text body can't carry one
+  of the binary hot-path frames (see "Wire Format" above) without
+  corrupting it.
+- `POST /sendbin` (hex-encoded body) — byte-safe counterpart to `/send`,
+  used internally by `HttpRadio::send` (e.g. `lora-tui` forwarding a
+  directly attached SI reader's punches, or its own heartbeat, through a
+  remote daemon) rather than by a human. A malformed (odd-length or
+  non-hex) body 400s immediately.
 - `POST /setdest` (form: `dest`) — changes the daemon's `dest`.
 - `POST /cmd` (form: `target`, `heartbeat_interval_secs`) — originates a
   Command Packet (see below) toward `target`, tracked with the same
@@ -175,18 +237,20 @@ same underlying commands.
 ## Heartbeats
 
 Uplink, `HB` — plain and untracked, no ack, no retry, just a liveness
-signal. `parse_heartbeat` in `backend.rs` accepts three shapes:
+signal. Binary now (see "Wire Format" above) — one fixed 5-byte shape
+covers every sender via its `flags` byte, replacing what used to be three
+separate text shapes:
 
-- Bare `HB` — no battery, no SI-master status. What `lora-server` itself
-  sends (a relay has neither concept), and older firmware.
-- `HB <battery_pct> <battery_mv>`, e.g. `HB 82 3950` — legacy battery-only
-  shape, kept for backward compatibility though nothing currently emits it.
-- `HB <battery_pct-or-"-"> <battery_mv-or-"-"> <0-or-1>` — what ESP32 punch
-  nodes actually send (`esp32-node/src/main.rs`), e.g. `HB 82 3950 1` or
-  `HB - - 0` if the battery read failed. The trailing field is whether an SI
-  master is currently connected to that node, reported independently of
-  battery data — `-` `-` (not omitting the fields) keeps the count fixed at
-  three so the parser doesn't have to guess which fields are missing.
+- No battery, no SI-master status (`flags` bits 0 and 1 both clear) — what
+  `lora-server` itself sends (a relay has neither concept), and older
+  firmware.
+- Battery only (`flags` bit 0 set, bit 1 clear) — a shape nothing currently
+  emits, kept possible by the format without needing a distinct encoding.
+- Battery and SI-master status (all relevant `flags` bits set) — what ESP32
+  punch nodes actually send (`esp32-node/src/main.rs`), or just SI-master
+  status with no battery reading if the read failed that cycle. SI-master
+  presence is reported independently of battery data — whether or not one
+  is known doesn't affect whether the other is.
 
 Heartbeats and SI-master connectivity are sent from the node's radio/main
 thread, entirely independent of whether an SI master is actually plugged in

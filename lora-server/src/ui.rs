@@ -504,7 +504,7 @@ pub fn run_app(
                 last_heartbeat = Instant::now();
                 let ts = timestamp();
                 let dest = app.dest;
-                match radio.send(dest, b"HB") {
+                match radio.send(dest, &crate::backend::encode_heartbeat(None, None)) {
                     Ok(()) => app.push_log(LogEntry::Heartbeat { timestamp: ts, dest_addr: dest }),
                     Err(e) => app.push_log(LogEntry::Error { timestamp: ts, message: e.to_string() }),
                 }
@@ -514,7 +514,7 @@ pub fn run_app(
         while let Ok(readout) = si_rx.try_recv() {
             let ts = timestamp();
             let payload = readout.to_payload(app.addr, app.dest);
-            if let Err(e) = radio.send(app.dest, payload.as_bytes()) {
+            if let Err(e) = radio.send(app.dest, &payload) {
                 app.push_log(LogEntry::Error {
                     timestamp: ts.clone(),
                     message: format!("SI TX failed: {}", e),
@@ -530,7 +530,11 @@ pub fn run_app(
         if last_tick.elapsed() >= tick_rate {
             match radio.receive() {
                 Ok(Some(pkt)) => {
-                    let payload = String::from_utf8_lossy(&pkt.payload).into_owned();
+                    // describe_payload decodes the binary hot-path frames
+                    // (PUNCH/PACK/HB) into readable text for display — see
+                    // its doc comment in backend.rs. Anything else (the
+                    // plain-text control frames) it just returns as-is.
+                    let payload = crate::backend::describe_payload(&pkt.payload);
                     app.push_log(LogEntry::Rx {
                         timestamp: timestamp(),
                         src_addr: pkt.src_addr,
