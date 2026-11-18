@@ -2,8 +2,8 @@
 //! cell to an ADC1-capable GPIO (GPIO4 — free, not used by SPI/OLED/DIO0,
 //! see the wiring doc).
 //!
-//! **Placeholder divider ratio — the physical circuit isn't built yet** (the
-//! divider is being wired separately, not by this code). Assumes a 2:1
+//! The test node's divider is now wired and reads plausibly (~3.88V on a
+//! partly charged 18650, 2026-11-18) with the 2:1 ratio below. Assumes a 2:1
 //! divider (e.g. two equal resistors, battery+ -> R -> ADC pin -> R -> GND)
 //! so a 4.2V full battery reads ~2.1V at the pin, comfortably inside the
 //! ADC's usable range at 11dB attenuation. Change DIVIDER_RATIO if the
@@ -22,6 +22,13 @@ use esp_idf_hal::gpio::Gpio4;
 
 /// Battery millivolts = ADC-pin millivolts * DIVIDER_RATIO.
 const DIVIDER_RATIO: u32 = 2;
+
+/// ADC samples averaged per `read()`. A single ESP32 ADC sample is noisy
+/// (roughly ±10-20mV at the pin, doubled by the divider), which showed up as
+/// a few % of wobble between heartbeats; averaging N samples cuts that by
+/// ~sqrt(N). 32 oneshot reads take on the order of a millisecond, once per
+/// heartbeat.
+const SAMPLES: u32 = 32;
 
 const EMPTY_MV: u32 = 3000;
 const FULL_MV: u32 = 4200;
@@ -42,7 +49,11 @@ impl<'d> BatteryMonitor<'d> {
     /// corrected for `DIVIDER_RATIO`, i.e. the actual battery voltage, not
     /// the raw ADC-pin reading.
     pub fn read(&mut self) -> anyhow::Result<(u8, u16)> {
-        let pin_mv = self.channel.read()? as u32;
+        let mut sum_mv: u32 = 0;
+        for _ in 0..SAMPLES {
+            sum_mv += self.channel.read()? as u32;
+        }
+        let pin_mv = sum_mv / SAMPLES;
         let battery_mv = (pin_mv * DIVIDER_RATIO).min(u16::MAX as u32);
         let pct = if battery_mv <= EMPTY_MV {
             0
