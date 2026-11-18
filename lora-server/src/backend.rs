@@ -154,6 +154,15 @@ pub trait Radio: Send {
 
 // ── Config builder ────────────────────────────────────────────────────────────
 
+/// `--freq` is decimal MHz (e.g. 433.92); rounded to the nearest Hz so
+/// float noise like 433.92 * 1e6 = 433919999.99… doesn't truncate.
+fn mhz_to_hz(mhz: f64) -> Result<u32> {
+    if !mhz.is_finite() || mhz <= 0.0 || mhz * 1e6 > u32::MAX as f64 {
+        anyhow::bail!("invalid frequency {}MHz", mhz);
+    }
+    Ok((mhz * 1e6).round() as u32)
+}
+
 fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
     use sx127x::{Bandwidth, CodingRate};
 
@@ -166,7 +175,7 @@ fn build_sx127x_config(args: &Args) -> Result<sx127x::Config> {
     }
 
     Ok(sx127x::Config {
-        freq_hz: args.freq * 1_000_000,
+        freq_hz: mhz_to_hz(args.freq)?,
         addr: args.addr,
         spreading_factor: args.sf,
         bandwidth,
@@ -1384,6 +1393,16 @@ pub fn attach(server_url: &str, dest: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_mhz_to_hz_handles_decimal_mhz() {
+        assert_eq!(super::mhz_to_hz(433.92).unwrap(), 433_920_000);
+        assert_eq!(super::mhz_to_hz(433.0).unwrap(), 433_000_000);
+        assert_eq!(super::mhz_to_hz(869.525).unwrap(), 869_525_000);
+        assert!(super::mhz_to_hz(0.0).is_err());
+        assert!(super::mhz_to_hz(f64::NAN).is_err());
+        assert!(super::mhz_to_hz(5000.0).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -30,7 +30,7 @@ const KEY_CR: &str = "cr";
 /// verification window (see main.rs) — deliberately the same values
 /// `default_config()` starts a brand new node with, so there is exactly one
 /// place these can drift out of sync with each other: nowhere.
-pub const STANDARD_FREQ_HZ: u32 = 433_000_000;
+pub const STANDARD_FREQ_HZ: u32 = 433_920_000;
 pub const STANDARD_SYNC_WORD: u8 = 0x12;
 pub const STANDARD_SF: u8 = 11;
 pub const STANDARD_BW_HZ: u32 = 125_000;

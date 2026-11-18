@@ -51,9 +51,11 @@ pub struct Args {
     #[arg(long, env = "LORA_SYNC_WORD", default_value_t = 18)]
     pub sync_word: u8,
 
-    /// Frequency in MHz (410-493 or 850-930)
-    #[arg(long, env = "LORA_FREQ", default_value_t = 868)]
-    pub freq: u32,
+    /// Frequency in MHz, decimals allowed (410-493 or 850-930). Default
+    /// 433.92 sits mid-band in the EU 433.05-434.79MHz SRD band, so a
+    /// 125kHz-wide signal stays inside it (433.0 straddled the lower edge).
+    #[arg(long, env = "LORA_FREQ", default_value_t = 433.92)]
+    pub freq: f64,
 
     /// Node address (0-65535)
     #[arg(long, env = "LORA_ADDR", default_value_t = 0)]
@@ -73,8 +75,10 @@ pub struct Args {
     #[arg(long, env = "LORA_RELAY", default_value_t = false)]
     pub relay: bool,
 
-    /// TX power in dBm (10, 13, 17, or 22)
-    #[arg(long, env = "LORA_POWER", default_value_t = 22)]
+    /// TX power in dBm (2-20; the driver clamps to that range). Default 10
+    /// is the EU limit (10mW ERP) for the 433.05-434.79MHz band — with an
+    /// antenna gain above 0dBd, lower this to stay legal.
+    #[arg(long, env = "LORA_POWER", default_value_t = 10)]
     pub power: u8,
 
     /// Heartbeat interval in seconds (0 to disable)

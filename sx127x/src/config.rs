@@ -135,14 +135,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            freq_hz: 433_000_000,
+            freq_hz: 433_920_000,
             addr: 0,
             spreading_factor: 7,
             bandwidth: Bandwidth::Khz125,
             coding_rate: CodingRate::Cr4_5,
             sync_word: 0x12,
             preamble_len: 8,
-            tx_power_dbm: 17,
+            tx_power_dbm: 10,
             crc_on: true,
         }
     }

@@ -115,10 +115,10 @@ LORA_CR=5
 # deployment, and make sure every node's own sync word (set via its Wi-Fi
 # config portal) matches exactly.
 LORA_SYNC_WORD=18
-LORA_FREQ=433
+LORA_FREQ=433.92
 LORA_ADDR=0
 LORA_DEST=1
-LORA_POWER=22
+LORA_POWER=10
 LORA_HEARTBEAT_INTERVAL=60
 LORA_HEALTH_LISTEN=0.0.0.0:8081
 LORA_HEALTH_CHECK_INTERVAL_SECS=30

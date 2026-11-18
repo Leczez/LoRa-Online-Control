@@ -412,7 +412,7 @@ fastest. LoRa's spreading factor (SF) and bandwidth (BW) both trade bitrate
 for receiver sensitivity — every SF step roughly doubles symbol length and
 meaningfully improves sensitivity; halving the bandwidth does the same.
 
-Applied as the default: **SF11 at 125kHz** (433MHz, CR 4:5) —
+Applied as the default: **SF11 at 125kHz** (433.92MHz, 10dBm, CR 4:5) —
 `LORA_SF`/`SPREADING_FACTOR` on `lora-server` and `esp32-node`
 respectively, both defaulting to 11. Not the absolute extreme (SF12 at
 7.8kHz, or even SF12 at 125kHz), because:

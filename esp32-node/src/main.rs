@@ -230,7 +230,7 @@ const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 // sync_word/addr/dest, which can strand a node if misapplied and so are
 // gated behind settings mode instead (see Setting's doc comment in
 // protocol.rs).
-const DEFAULT_TX_POWER_DBM: i8 = 20;
+const DEFAULT_TX_POWER_DBM: i8 = 10;
 
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
