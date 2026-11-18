@@ -14,6 +14,14 @@ if ! command -v cross &>/dev/null; then
     export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
+# cross picks docker over podman when both are installed; default to podman
+# instead. Override with CROSS_CONTAINER_ENGINE=docker to use docker.
+export CROSS_CONTAINER_ENGINE="${CROSS_CONTAINER_ENGINE:-podman}"
+if ! command -v "$CROSS_CONTAINER_ENGINE" &>/dev/null; then
+    echo "error: container engine '$CROSS_CONTAINER_ENGINE' not found (needed by cross). Install it, or set CROSS_CONTAINER_ENGINE=docker." >&2
+    exit 1
+fi
+
 for cmd in ssh scp; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "error: '$cmd' not found. Install openssh-client." >&2
@@ -39,7 +47,7 @@ esac
 
 echo "Cross-compiling lora-server (daemon) and lora-tui (attach client)..."
 cd "$WORKSPACE_ROOT"
-# Computed here, not inside build.rs, because `cross build` runs in a Docker
+# Computed here, not inside build.rs, because `cross build` runs in a podman
 # container that can't see this worktree's real .git (a worktree's .git is
 # a file pointing at an absolute host path the container doesn't have) —
 # forwarded into the container via Cross.toml's `[build.env] passthrough`.
