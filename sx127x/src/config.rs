@@ -154,6 +154,18 @@ impl Config {
         (((self.freq_hz as u64) << 19) / 32_000_000) as u32
     }
 
+    /// (RegModemConfig1, RegModemConfig2, RegModemConfig3) for this config.
+    /// Shared by `Sx127xSpi::configure` (writes them) and
+    /// `Sx127xSpi::verify_config` (reads them back), so the two can't drift.
+    pub fn modem_config_registers(&self) -> (u8, u8, u8) {
+        let sf = self.spreading_factor.clamp(7, 12);
+        (
+            (self.bandwidth.register_value() << 4) | (self.coding_rate.register_value() << 1),
+            (sf << 4) | if self.crc_on { 0x04 } else { 0x00 },
+            if self.low_data_rate_optimize() { 0x08 } else { 0x00 },
+        )
+    }
+
     /// (RegPaConfig, RegPaDac) for the configured tx_power_dbm, PA_BOOST path.
     /// Pout = 17 - (15 - OutputPower) normally, or up to 20dBm with the PaDac
     /// boost enabled (RegPaDac = 0x87) at OutputPower = 15.

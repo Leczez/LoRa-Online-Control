@@ -81,6 +81,15 @@ pub trait Radio: Send {
     fn send(&mut self, dest: u16, payload: &[u8]) -> Result<()>;
     fn receive(&mut self) -> Result<Option<ReceivedPacket>>;
 
+    /// Periodic hardware self-check, run by `run_daemon_loop` every
+    /// `RADIO_CHECK_INTERVAL`. `Ok(None)`: healthy, or nothing to check
+    /// (the default — e.g. HttpRadio has no hardware of its own).
+    /// `Ok(Some(problem))`: the radio had lost its settings and was
+    /// re-initialized; `problem` describes what was wrong.
+    fn check_and_recover(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Sends a synthetic test punch through the real buffer/send/ack
     /// pipeline (see the TESTPUNCH command in run_daemon_loop, reachable via
     /// POST /testpunch — web.rs — and unsent_local's doc comment in
@@ -202,6 +211,20 @@ where
     }
     fn receive(&mut self) -> Result<Option<ReceivedPacket>> {
         sx127x::LoraRadio::receive(self).map_err(|e| anyhow::anyhow!("{}", e))
+    }
+    /// Catches the silent failure seen 2026-11-19: reception stopped for
+    /// three hours with nothing logged, and a service restart (which
+    /// re-runs configure()) fixed it at once — consistent with the module
+    /// resetting to power-on defaults while receive() kept it in RX on the
+    /// wrong settings. See Sx127xSpi::verify_config.
+    fn check_and_recover(&mut self) -> Result<Option<String>> {
+        match self.verify_config().map_err(|e| anyhow::anyhow!("{}", e))? {
+            None => Ok(None),
+            Some(mismatch) => {
+                self.reconfigure().map_err(|e| anyhow::anyhow!("re-init after {} failed: {}", mismatch, e))?;
+                Ok(Some(mismatch.to_string()))
+            }
+        }
     }
 }
 
@@ -599,6 +622,11 @@ struct DaemonIdentity {
     relay: bool,
 }
 
+/// How often run_daemon_loop calls Radio::check_and_recover — about ten SPI
+/// register reads each time, so cheap; bounds how long the radio can sit
+/// deaf on lost settings before it's re-initialized.
+const RADIO_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 fn run_daemon_loop(
     identity: DaemonIdentity,
     cmd_rx: std::sync::mpsc::Receiver<String>,
@@ -610,6 +638,7 @@ fn run_daemon_loop(
     let DaemonIdentity { own_addr, dest, heartbeat_interval, relay } = identity;
     let mut heartbeat_period = (heartbeat_interval > 0).then(|| Duration::from_secs(heartbeat_interval));
     let mut last_heartbeat = Instant::now();
+    let mut last_radio_check = Instant::now();
     let mut dest = dest;
     let mut pending_commands: Vec<PendingCommand> = Vec::new();
     let mut pending_punch: Option<PendingPunch> = None;
@@ -799,6 +828,21 @@ fn run_daemon_loop(
                             log_event(&state, format!("ERR HB: {}", e));
                         }
                     }
+                }
+            }
+        }
+
+        if last_radio_check.elapsed() >= RADIO_CHECK_INTERVAL {
+            last_radio_check = Instant::now();
+            match radio.check_and_recover() {
+                Ok(None) => {}
+                Ok(Some(problem)) => {
+                    log::warn!("radio had lost its settings ({}), re-initialized it", problem);
+                    log_event(&state, format!("WARN radio re-init: {}", problem));
+                }
+                Err(e) => {
+                    log::error!("radio self-check failed: {}", e);
+                    log_event(&state, format!("ERR radio check: {}", e));
                 }
             }
         }

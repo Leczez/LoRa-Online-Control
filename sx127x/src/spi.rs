@@ -31,6 +31,35 @@ const REG_PA_DAC: u8 = 0x4D;
 const REG_VERSION: u8 = 0x42;
 const REG_DIO_MAPPING1: u8 = 0x40;
 
+/// RegVersion's fixed value on every SX1276/77/78/79.
+const CHIP_VERSION: u8 = 0x12;
+
+/// A register `verify_config` found not holding the value `configure`
+/// wrote — see that method's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterMismatch {
+    pub register: u8,
+    pub expected: u8,
+    pub actual: u8,
+}
+
+impl core::fmt::Display for RegisterMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self.register {
+            REG_VERSION => "RegVersion",
+            REG_OP_MODE => "RegOpMode (LongRangeMode bit)",
+            0x06..=0x08 => "RegFrf",
+            REG_PA_CONFIG => "RegPaConfig",
+            REG_MODEM_CONFIG_1 => "RegModemConfig1",
+            REG_MODEM_CONFIG_2 => "RegModemConfig2",
+            REG_MODEM_CONFIG_3 => "RegModemConfig3",
+            REG_SYNC_WORD => "RegSyncWord",
+            _ => "register",
+        };
+        write!(f, "{} 0x{:02X}: expected 0x{:02X}, read 0x{:02X}", name, self.register, self.expected, self.actual)
+    }
+}
+
 const LONG_RANGE_MODE: u8 = 0x80;
 const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
@@ -258,6 +287,59 @@ where
         self.read_register(REG_VERSION)
     }
 
+    /// Reads back the chip ID, LoRa-mode bit, frequency, modem config, PA
+    /// config and sync word, and returns the first one that doesn't match
+    /// what `configure()` last wrote — `None` if all match. Only meaningful
+    /// after `configure()` has run.
+    ///
+    /// `receive()` only re-enters RX mode when the chip has left it; it
+    /// can't tell that the chip silently reset (supply glitch, loose RST
+    /// wire) and came back on power-on defaults (FSK mode, 434MHz, SF7),
+    /// so the radio would sit in RX on the wrong settings hearing nothing.
+    /// A dead SPI bus (MISO stuck at 0x00/0xFF) also shows up here, via the
+    /// chip ID. For the OpMode entry, only the LongRangeMode bit (0x80) is
+    /// compared — the mode bits legitimately change between RX/TX/CAD/STDBY.
+    pub fn verify_config(&mut self) -> Result<Option<RegisterMismatch>, Sx127xError<SPI::Error>> {
+        let version = self.read_register(REG_VERSION)?;
+        if version != CHIP_VERSION {
+            return Ok(Some(RegisterMismatch { register: REG_VERSION, expected: CHIP_VERSION, actual: version }));
+        }
+        let op_mode = self.read_register(REG_OP_MODE)?;
+        if op_mode & LONG_RANGE_MODE == 0 {
+            return Ok(Some(RegisterMismatch { register: REG_OP_MODE, expected: LONG_RANGE_MODE, actual: op_mode }));
+        }
+
+        let frf = self.config.frf_register();
+        let (pa_config, _) = self.config.pa_config_bytes();
+        let (mc1, mc2, mc3) = self.config.modem_config_registers();
+        let expected = [
+            (REG_FRF_MSB, (frf >> 16) as u8),
+            (REG_FRF_MSB + 1, (frf >> 8) as u8),
+            (REG_FRF_MSB + 2, frf as u8),
+            (REG_PA_CONFIG, pa_config),
+            (REG_MODEM_CONFIG_1, mc1),
+            (REG_MODEM_CONFIG_2, mc2),
+            (REG_MODEM_CONFIG_3, mc3),
+            (REG_SYNC_WORD, self.config.sync_word),
+        ];
+        for (register, expected) in expected {
+            let actual = self.read_register(register)?;
+            if actual != expected {
+                return Ok(Some(RegisterMismatch { register, expected, actual }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Re-runs `configure()` (hardware reset included) with the config it
+    /// was last given — the recovery step after `verify_config` reports a
+    /// mismatch. Leaves the chip in standby; the next `receive()` call puts
+    /// it back into RX.
+    pub fn reconfigure(&mut self) -> Result<(), Sx127xError<SPI::Error>> {
+        let config = self.config.clone();
+        LoraRadio::configure(self, &config)
+    }
+
     fn write_register(&mut self, addr: u8, value: u8) -> Result<(), Sx127xError<SPI::Error>> {
         self.spi.write(&[addr | 0x80, value]).map_err(Sx127xError::Transport)
     }
@@ -342,19 +424,10 @@ where
         self.write_register(REG_PA_CONFIG, pa_config)?;
         self.write_register(REG_PA_DAC, pa_dac)?;
 
-        let sf = config.spreading_factor.clamp(7, 12);
-        self.write_register(
-            REG_MODEM_CONFIG_1,
-            (config.bandwidth.register_value() << 4) | (config.coding_rate.register_value() << 1),
-        )?;
-        self.write_register(
-            REG_MODEM_CONFIG_2,
-            (sf << 4) | if config.crc_on { 0x04 } else { 0x00 },
-        )?;
-        self.write_register(
-            REG_MODEM_CONFIG_3,
-            if config.low_data_rate_optimize() { 0x08 } else { 0x00 },
-        )?;
+        let (mc1, mc2, mc3) = config.modem_config_registers();
+        self.write_register(REG_MODEM_CONFIG_1, mc1)?;
+        self.write_register(REG_MODEM_CONFIG_2, mc2)?;
+        self.write_register(REG_MODEM_CONFIG_3, mc3)?;
 
         self.write_register(REG_PREAMBLE_MSB, (config.preamble_len >> 8) as u8)?;
         self.write_register(REG_PREAMBLE_MSB + 1, config.preamble_len as u8)?;
@@ -480,6 +553,120 @@ mod tests {
         let mut radio = Sx127xSpi::new(spi, reset, NoopDelay);
 
         assert_eq!(radio.read_register(REG_VERSION).unwrap(), 0x12);
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    /// SPI expectations for a sequence of read_register() calls.
+    fn reads(regs: &[(u8, u8)]) -> std::vec::Vec<SpiTx<u8>> {
+        let mut txs = std::vec::Vec::new();
+        for &(reg, value) in regs {
+            txs.push(SpiTx::transaction_start());
+            txs.push(SpiTx::transfer_in_place(std::vec![reg & 0x7F, 0x00], std::vec![0x00, value]));
+            txs.push(SpiTx::transaction_end());
+        }
+        txs
+    }
+
+    /// The deployed base-station settings: 433.92MHz, SF11/125kHz, 10dBm.
+    fn deployed_config() -> Config {
+        Config {
+            freq_hz: 433_920_000,
+            spreading_factor: 11,
+            bandwidth: crate::Bandwidth::Khz125,
+            coding_rate: crate::CodingRate::Cr4_5,
+            sync_word: 0x12,
+            tx_power_dbm: 10,
+            crc_on: true,
+            ..Default::default()
+        }
+    }
+
+    /// What a correctly configured chip reads back, in verify_config's order.
+    fn healthy_registers(cfg: &Config) -> std::vec::Vec<(u8, u8)> {
+        let frf = cfg.frf_register();
+        let (mc1, mc2, mc3) = cfg.modem_config_registers();
+        std::vec![
+            (REG_VERSION, CHIP_VERSION),
+            (REG_OP_MODE, LONG_RANGE_MODE | MODE_RXCONTINUOUS),
+            (REG_FRF_MSB, (frf >> 16) as u8),
+            (REG_FRF_MSB + 1, (frf >> 8) as u8),
+            (REG_FRF_MSB + 2, frf as u8),
+            (REG_PA_CONFIG, cfg.pa_config_bytes().0),
+            (REG_MODEM_CONFIG_1, mc1),
+            (REG_MODEM_CONFIG_2, mc2),
+            (REG_MODEM_CONFIG_3, mc3),
+            (REG_SYNC_WORD, cfg.sync_word),
+        ]
+    }
+
+    #[test]
+    fn test_verify_config_all_registers_match() {
+        let cfg = deployed_config();
+        // Sanity-check the helper against a hand-computed value, so this
+        // test doesn't just compare the code against itself: 433.92MHz ->
+        // Frf = 433.92e6 * 2^19 / 32e6 = 0x6C7AE1.
+        assert_eq!(cfg.frf_register(), 0x6C7AE1);
+        let spi = SpiMock::<u8>::new(&reads(&healthy_registers(&cfg)));
+        let mut radio = Sx127xSpi::new(spi, PinMock::new(&[]), NoopDelay);
+        radio.config = cfg;
+
+        assert_eq!(radio.verify_config().unwrap(), None);
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_verify_config_detects_silent_chip_reset() {
+        // A chip that reset comes back in FSK mode (RegOpMode 0x09 =
+        // standby, LongRangeMode bit clear) — caught before anything else
+        // is read.
+        let spi = SpiMock::<u8>::new(&reads(&[(REG_VERSION, CHIP_VERSION), (REG_OP_MODE, 0x09)]));
+        let mut radio = Sx127xSpi::new(spi, PinMock::new(&[]), NoopDelay);
+        radio.config = deployed_config();
+
+        assert_eq!(
+            radio.verify_config().unwrap(),
+            Some(RegisterMismatch { register: REG_OP_MODE, expected: LONG_RANGE_MODE, actual: 0x09 })
+        );
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_verify_config_detects_wrong_frequency() {
+        // Still in LoRa mode but on the power-on default 434.0MHz
+        // (0x6C8000): the MSB happens to match, the middle byte doesn't.
+        let spi = SpiMock::<u8>::new(&reads(&[
+            (REG_VERSION, CHIP_VERSION),
+            (REG_OP_MODE, LONG_RANGE_MODE | MODE_RXCONTINUOUS),
+            (REG_FRF_MSB, 0x6C),
+            (REG_FRF_MSB + 1, 0x80),
+        ]));
+        let mut radio = Sx127xSpi::new(spi, PinMock::new(&[]), NoopDelay);
+        radio.config = deployed_config();
+
+        let mismatch = radio.verify_config().unwrap().unwrap();
+        assert_eq!(mismatch, RegisterMismatch { register: REG_FRF_MSB + 1, expected: 0x7A, actual: 0x80 });
+        assert_eq!(std::format!("{}", mismatch), "RegFrf 0x07: expected 0x7A, read 0x80");
+
+        radio.spi.done();
+        radio.reset.done();
+    }
+
+    #[test]
+    fn test_verify_config_detects_dead_spi_bus() {
+        let spi = SpiMock::<u8>::new(&reads(&[(REG_VERSION, 0x00)]));
+        let mut radio = Sx127xSpi::new(spi, PinMock::new(&[]), NoopDelay);
+        radio.config = deployed_config();
+
+        assert_eq!(
+            radio.verify_config().unwrap(),
+            Some(RegisterMismatch { register: REG_VERSION, expected: CHIP_VERSION, actual: 0x00 })
+        );
 
         radio.spi.done();
         radio.reset.done();

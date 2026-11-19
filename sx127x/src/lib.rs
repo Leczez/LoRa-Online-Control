@@ -7,7 +7,7 @@ pub mod config;
 pub use config::{Bandwidth, CodingRate, Config};
 
 pub mod spi;
-pub use spi::Sx127xSpi;
+pub use spi::{RegisterMismatch, Sx127xSpi};
 
 use heapless::Vec;
 
