@@ -530,7 +530,20 @@ fn main() -> anyhow::Result<()> {
         if elapsed < USB_HOST_DELAY {
             std::thread::sleep(USB_HOST_DELAY - elapsed);
         }
-        cp210x::install()?;
+        // Last line the serial monitor shows on a normal build: the port
+        // drops off the host PC as soon as install() takes it over, so
+        // log the switch *before* making it. The persisted entries are for
+        // the debug /log page, since nothing after this reaches the console.
+        log::info!(
+            "USB: switching from device (serial console) to host mode for SI master, {}ms after boot; console disconnects now",
+            boot_instant.elapsed().as_millis()
+        );
+        if let Err(e) = cp210x::install() {
+            persistent_log::append(&mut nvs.lock().unwrap(), &format!("usb host mode: err {:?}", e));
+            return Err(e);
+        }
+        log::info!("USB: host mode active, waiting for SI master");
+        persistent_log::append(&mut nvs.lock().unwrap(), "usb host mode: ok");
         spawn_si_reader_thread(punch_tx, Arc::clone(&si_present));
     }
     #[cfg(feature = "debug-console")]
