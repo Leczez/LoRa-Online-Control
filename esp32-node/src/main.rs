@@ -232,6 +232,10 @@ const VERSION: &str = concat!(env!("SEMVER"), "+", env!("GIT_SHA"));
 // protocol.rs).
 const DEFAULT_TX_POWER_DBM: i8 = 10;
 
+/// How often the main loop reads back the radio's settings — see the
+/// self-check right above the heartbeat send.
+const RADIO_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// First-boot defaults. addr=10 is this node's own address; dest=1 targets
 /// lora-base-station directly (its LoRa address, not an IP — see
 /// docs/protocols/lora_online_control_protocol.md). The LoRa mode fields
@@ -493,6 +497,7 @@ fn main() -> anyhow::Result<()> {
     // DEFAULT_HEARTBEAT_INTERVAL on reboot.
     let mut heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL;
     let mut last_heartbeat = Instant::now() - heartbeat_interval; // send one immediately on boot
+    let mut last_radio_check = Instant::now();
     // Settings mode (see main loop's Command dispatch and Setting's doc
     // comment in protocol.rs): `None` = normal operation; `Some(pending)` =
     // staging a config change, `pending` being a working copy of `current`
@@ -755,6 +760,24 @@ fn main() -> anyhow::Result<()> {
                         recover_radio(&mut radio, &radio_config);
                     }
                 }
+            }
+        }
+
+        // Same self-check as lora-server's (see Sx127xSpi::verify_config):
+        // catches the radio having silently lost its settings, which
+        // recover_radio's send-failure path can't — a reset chip still
+        // "sends" fine, just on the wrong frequency/SF. About ten register
+        // reads over SPI, ~100µs once a minute; no measurable power cost.
+        if last_radio_check.elapsed() >= RADIO_CHECK_INTERVAL {
+            last_radio_check = Instant::now();
+            match radio.verify_config() {
+                Ok(None) => {}
+                Ok(Some(mismatch)) => {
+                    log::warn!("radio had lost its settings ({})", mismatch);
+                    persistent_log::append(&mut nvs.lock().unwrap(), &std::format!("radio settings lost: {}", mismatch));
+                    recover_radio(&mut radio, &radio_config);
+                }
+                Err(e) => log::warn!("radio self-check failed: {:?}", e),
             }
         }
 
